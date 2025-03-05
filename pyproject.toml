@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "s3lfs"
+version = "0.1.0"
+description = "A Python-based version control system for large assets using Amazon S3."
+authors = ["Kevin Blackburn-Matzen <matzen@adobe.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.7"
+boto3 = "^1.28.0"
+moto = {extras = ["s3"], version = "^4.0.0"}
+tqdm = "^4.64.0"
+flask = "<3"
+flask-cors = "<3"
+
+[tool.poetry.scripts]
+s3lfs = "s3lfs.cli:main"
+
+[tool.poetry.group.dev.dependencies]
+pytest-cov = "<6.0.0"
+pytest = "^7.0"
+pytest-mock = "^3.7.0"
+coverage = "^6.0"
+black = "^22.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
