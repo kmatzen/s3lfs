@@ -53,6 +53,6 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.xml
+          files: ./coverage.xml
           slug: kmatzen/s3lfs
           fail_ci_if_error: false
