@@ -65,7 +65,7 @@ class S3LFS:
         :param manifest_file: Path to the local manifest (JSON) file
         :param repo_prefix: A unique prefix to isolate this repository's files
         :param encryption: If True, use AES256 server-side encryption
-        :param no_sign_request: If True, use unsigned requests for local testing
+        :param no_sign_request: If True, use unsigned requests
         """
         self.temp_dir = tempfile.mkdtemp()
         self.lock = threading.Lock()
