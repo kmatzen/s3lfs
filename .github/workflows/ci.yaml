@@ -50,9 +50,9 @@ jobs:
         run: poetry run pytest --cov=s3lfs --cov-report=xml
 
       - name: Upload coverage reports to Codecov
-          uses: codecov/codecov-action@v5
-          with:
-            token: ${{ secrets.CODECOV_TOKEN }}
-            file: ./coverage.xml
-            slug: kmatzen/s3lfs
-            fail_ci_if_error: false
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.xml
+          slug: kmatzen/s3lfs
+          fail_ci_if_error: false
