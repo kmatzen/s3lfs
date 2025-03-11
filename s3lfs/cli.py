@@ -47,10 +47,11 @@ def track_modified(bucket, no_sign_request):
 @click.command()
 @click.option("--bucket", help="S3 bucket name")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def download_all(bucket, no_sign_request):
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def download_all(bucket, no_sign_request, verbose):
     """Download all files listed in the manifest"""
     versioner = S3LFS(bucket_name=bucket, no_sign_request=no_sign_request)
-    versioner.parallel_download_all()
+    versioner.parallel_download_all(silence=not verbose)
 
 
 @click.command()
