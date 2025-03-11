@@ -8,6 +8,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from uuid import uuid4
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -229,9 +230,7 @@ class S3LFS:
 
     def compress_file(self, file_path):
         """Compress the file using gzip and return the path of the compressed file in a temp directory."""
-        compressed_path = os.path.join(
-            self.temp_dir, os.path.basename(file_path) + ".gz"
-        )
+        compressed_path = os.path.join(self.temp_dir, f"{uuid4()}.gz")
 
         with open(file_path, "rb") as f_in, gzip.open(compressed_path, "wb") as f_out:
             shutil.copyfileobj(f_in, f_out)
