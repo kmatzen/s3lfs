@@ -315,8 +315,13 @@ class S3LFS:
             return
 
         # If the file exists, check its hash
+        if not silence:
+            print(f"file_path exists?: {file_path.exists()}")
         if file_path.exists():
             current_hash = self.hash_file(file_path)
+            if not silence:
+                print(f"current_hash: {current_hash}")
+                print(f"expected_hash: {expected_hash}")
             if current_hash == expected_hash and not silence:
                 print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
                 return  # Skip download if hashes match
