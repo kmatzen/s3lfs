@@ -206,7 +206,7 @@ class S3LFS:
         """Save the manifest back to disk."""
         with self.lock:
             with open(self.manifest_file, "w") as f:
-                json.dump(self.manifest, f, indent=4)
+                json.dump(self.manifest, f, indent=4, sort_keys=True)
 
     def hash_file(self, file_path):
         """
