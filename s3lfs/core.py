@@ -322,8 +322,9 @@ class S3LFS:
             if not silence:
                 print(f"current_hash: {current_hash}")
                 print(f"expected_hash: {expected_hash}")
-            if current_hash == expected_hash and not silence:
-                print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
+            if current_hash == expected_hash:
+                if not silence:
+                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
                 return  # Skip download if hashes match
 
         # Proceed with download if file is missing or different
