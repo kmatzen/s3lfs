@@ -324,7 +324,7 @@ class S3LFS:
         # Proceed with download if file is missing or different
         s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
 
-        compressed_path = os.path.join(self.temp_dir, str(file_path) + ".gz")
+        compressed_path = os.path.join(self.temp_dir, f"{uuid4()}.gz")
 
         try:
             os.makedirs(os.path.dirname(compressed_path), exist_ok=True)
@@ -481,7 +481,7 @@ class S3LFS:
                     # Handle any other exceptions that may occur
                     print(f"An error occurred: {e}")
 
-    def parallel_download_all(self):
+    def parallel_download_all(self, silence=True):
         """Download all files listed in the manifest in parallel."""
         with self.lock:
             items = list(
@@ -497,7 +497,7 @@ class S3LFS:
         with ThreadPoolExecutor() as executor:
             # Submit all tasks and collect futures
             futures = [
-                executor.submit(self.download, kv[0], silence=True) for kv in items
+                executor.submit(self.download, kv[0], silence=silence) for kv in items
             ]
 
             # Iterate over futures as they complete
