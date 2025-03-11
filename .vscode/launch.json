@@ -11,7 +11,7 @@
                 "PYTHONPATH": "${workspaceFolder}"
             },
             "args": [],
-            "python": "C:\\Users\\matzen\\miniforge\\envs\\unreal\\python.exe"
+            "python": "/Users/matzen/Library/Caches/pypoetry/virtualenvs/s3-asset-versioning-VRCn-LLk-py3.12/bin/python"
         }
     ]
 }
