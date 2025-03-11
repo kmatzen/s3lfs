@@ -218,7 +218,7 @@ class S3LFS:
         file_path = Path(file_path)
 
         # Include the relative file path as a unique identifier
-        relative_path = str(file_path).encode()
+        relative_path = str(file_path.as_posix()).encode()
         hasher.update(relative_path)
 
         # Hash the file content
