@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import boto3
@@ -19,6 +19,7 @@ from botocore.exceptions import (
     PartialCredentialsError,
 )
 from tqdm import tqdm
+from urllib3.exceptions import SSLError
 
 
 def retry(times, exceptions):
@@ -69,9 +70,15 @@ class S3LFS:
         """
         self.temp_dir = tempfile.mkdtemp()
         self.lock = threading.Lock()
-        self.config = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024, max_concurrency=10
-        )
+        if no_sign_request:
+            # If we're not signing, we can't use multipart.  Set the threshold to the max.
+            self.config = TransferConfig(
+                multipart_threshold=5 * 1024 * 1024 * 1024, max_concurrency=10
+            )
+        else:
+            self.config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024, max_concurrency=10
+            )
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
         self.no_sign_request = no_sign_request
@@ -172,19 +179,17 @@ class S3LFS:
         print(f"Tracking {len(files_to_upload)} files in {directory}...")
 
         with ThreadPoolExecutor() as executor:
-            list(
-                tqdm(
-                    executor.map(
-                        lambda f: self.upload(f, silence=True), files_to_upload
-                    ),
-                    total=len(files_to_upload),
-                    desc="Uploading subtree",
-                )
-            )
-        """
-        for file in tqdm(files_to_upload, desc="Uploading subtree"):
-            self.upload(file, silence=True)
-        """
+            futures = [
+                executor.submit(self.upload, f, silence=True) for f in files_to_upload
+            ]
+
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Uploading subtree"
+            ):
+                try:
+                    future.result()  # Will re-raise exceptions from the worker thread
+                except Exception as e:
+                    print(f"An error occurred during upload: {e}")
 
         print(f"✅ Successfully tracked and uploaded all files in {directory}")
 
@@ -250,7 +255,7 @@ class S3LFS:
         )
         return result.stdout.strip()
 
-    @retry(3, (BotoCoreError, ClientError))
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def upload(self, file_path, silence=False):
         """
         Upload a file to S3 and update the manifest using the file path as the key.
@@ -265,7 +270,9 @@ class S3LFS:
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
 
         try:
-            if not self.file_exists_in_s3(s3_key):
+            if not self.file_exists_in_s3(s3_key) or (
+                file_path.as_posix() not in self.manifest["files"]
+            ):
                 extra_args = (
                     {"ServerSideEncryption": "AES256"} if self.encryption else {}
                 )
@@ -294,6 +301,7 @@ class S3LFS:
             except OSError:
                 pass
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def download(self, file_path, silence=False):
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
@@ -322,8 +330,13 @@ class S3LFS:
         try:
             os.makedirs(os.path.dirname(compressed_path), exist_ok=True)
             self._get_s3_client().download_file(
-                self.bucket_name, s3_key, compressed_path
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Filename=compressed_path,
+                Config=self.config,
             )
+            if os.path.dirname(file_path):
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with gzip.open(compressed_path, "rb") as f_in, open(
                 file_path, "wb"
             ) as f_out:
@@ -332,7 +345,7 @@ class S3LFS:
             if not silence:
                 print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
 
-        except ClientError as e:
+        except Exception as e:
             print(f"❌ Error downloading {file_path}: {e}")
 
     def remove_file(self, file_path, keep_in_s3=True):
@@ -456,13 +469,18 @@ class S3LFS:
     def parallel_upload(self, files):
         """Parallel upload of multiple files using ThreadPoolExecutor."""
         with ThreadPoolExecutor() as executor:
-            list(
-                tqdm(
-                    executor.map(lambda f: self.upload(f, silence=True), files),
-                    total=len(files),
-                    desc="Uploading files",
-                )
-            )
+            # Submit each download task; unpack key from matching_files.items()
+            futures = [executor.submit(self.upload, f, silence=True) for f in files]
+
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Uploading files"
+            ):
+                try:
+                    # This will raise the exception if the download failed
+                    future.result()
+                except Exception as e:
+                    # Handle any other exceptions that may occur
+                    print(f"An error occurred: {e}")
 
     def parallel_download_all(self):
         """Download all files listed in the manifest in parallel."""
@@ -478,13 +496,20 @@ class S3LFS:
         print("📥 Starting parallel download of all tracked files...")
 
         with ThreadPoolExecutor() as executor:
-            list(
-                tqdm(
-                    executor.map(lambda kv: self.download(kv[0], silence=True), items),
-                    total=len(items),
-                    desc="Downloading files",
-                )
-            )
+            # Submit all tasks and collect futures
+            futures = [
+                executor.submit(self.download, kv[0], silence=True) for kv in items
+            ]
+
+            # Iterate over futures as they complete
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Downloading files"
+            ):
+                try:
+                    future.result()  # This will re-raise any exceptions from the thread.
+                except Exception as e:
+                    # Handle other exceptions if needed
+                    print(f"An unexpected error occurred: {e}")
 
         print("✅ All files downloaded.")
 
@@ -509,15 +534,20 @@ class S3LFS:
         print(f"📥 Downloading {len(matching_files)} files from '{prefix}'...")
 
         with ThreadPoolExecutor() as executor:
-            list(
-                tqdm(
-                    executor.map(
-                        lambda kv: self.download(kv[0]), matching_files.items()
-                    ),
-                    total=len(matching_files),
-                    desc="Downloading subtree",
-                )
-            )
+            # Submit each download task; unpack key from matching_files.items()
+            futures = [
+                executor.submit(self.download, key) for key, _ in matching_files.items()
+            ]
+
+            for future in tqdm(
+                as_completed(futures), total=len(futures), desc="Downloading subtree"
+            ):
+                try:
+                    # This will raise the exception if the download failed
+                    future.result()
+                except Exception as e:
+                    # Handle any other exceptions that may occur
+                    print(f"An error occurred: {e}")
 
         print(f"✅ Sparse checkout of '{prefix}' completed.")
 
