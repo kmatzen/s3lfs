@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import mmap
 import os
 import shutil
 import subprocess
@@ -40,10 +41,10 @@ def retry(times, exceptions):
             while attempt < times:
                 try:
                     return func(*args, **kwargs)
-                except exceptions:
+                except exceptions as exc:
                     print(
                         "Exception thrown when attempting to run %s, attempt "
-                        "%d of %d" % (func, attempt, times)
+                        "%d of %d: %s" % (func, attempt, times, exc)
                     )
                     attempt += 1
             return func(*args, **kwargs)
@@ -77,9 +78,7 @@ class S3LFS:
                 multipart_threshold=5 * 1024 * 1024 * 1024, max_concurrency=10
             )
         else:
-            self.config = TransferConfig(
-                multipart_threshold=8 * 1024 * 1024, max_concurrency=10
-            )
+            self.config = TransferConfig(max_concurrency=10)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
         self.no_sign_request = no_sign_request
@@ -159,11 +158,12 @@ class S3LFS:
         print(f"   Repo Prefix: {self.repo_prefix}")
         print("Manifest file saved as .s3_manifest.json")
 
-    def track_subtree(self, directory):
+    def track_subtree(self, directory, silence=False):
         """
         Track and upload all files within a given directory (subtree).
 
         :param directory: The directory to recursively scan and upload.
+        :param silence: Silences verbose logging
         """
         directory = Path(directory)
 
@@ -181,7 +181,8 @@ class S3LFS:
 
         with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(self.upload, f, silence=True) for f in files_to_upload
+                executor.submit(self.upload, f, silence=silence)
+                for f in files_to_upload
             ]
 
             for future in tqdm(
@@ -215,7 +216,6 @@ class S3LFS:
         This prevents files with identical contents but different paths from colliding.
         """
         hasher = hashlib.sha256()
-        file_path = Path(file_path)
 
         # Include the relative file path as a unique identifier
         relative_path = str(file_path.as_posix()).encode()
@@ -223,8 +223,8 @@ class S3LFS:
 
         # Hash the file content
         with open(file_path, "rb") as f:
-            while chunk := f.read(8192):
-                hasher.update(chunk)
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                hasher.update(mm)
 
         return hasher.hexdigest()
 
@@ -232,8 +232,13 @@ class S3LFS:
         """Compress the file using gzip and return the path of the compressed file in a temp directory."""
         compressed_path = os.path.join(self.temp_dir, f"{uuid4()}.gz")
 
-        with open(file_path, "rb") as f_in, gzip.open(compressed_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        # Use a larger buffer size (1 MB) for reading/writing.
+        buffer_size = 1024 * 1024  # 1 MB chunks
+        # Lower the compression level for speed (default is 9)
+        with open(file_path, "rb") as f_in, gzip.open(
+            compressed_path, "wb", compresslevel=5
+        ) as f_out:
+            shutil.copyfileobj(f_in, f_out, length=buffer_size)
 
         return compressed_path
 
@@ -265,16 +270,16 @@ class S3LFS:
             return
 
         file_hash = self.hash_file(file_path)
-        compressed_path = self.compress_file(file_path)
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
 
-        try:
-            if not self.file_exists_in_s3(s3_key) or (
-                file_path.as_posix() not in self.manifest["files"]
-            ):
-                extra_args = (
-                    {"ServerSideEncryption": "AES256"} if self.encryption else {}
-                )
+        if not self.file_exists_in_s3(s3_key) or (
+            file_path.as_posix() not in self.manifest["files"]
+        ):
+            extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
+            compressed_path = self.compress_file(file_path)
+            try:
+                if not silence:
+                    print(f"Uploading {file_path}")
                 self._get_s3_client().upload_file(
                     compressed_path,
                     self.bucket_name,
@@ -282,23 +287,24 @@ class S3LFS:
                     ExtraArgs=extra_args,
                     Config=self.config,
                 )
-
-                # Store file path as key, hash as value
-                with self.lock:
-                    self.manifest["files"][str(file_path.as_posix())] = file_hash
-                self.save_manifest()
                 if not silence:
-                    print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
-            elif not silence:
-                print(
-                    f"File {file_path} (hash: {file_hash}) already exists in S3. Skipping."
-                )
+                    print(f"{file_path} uploaded")
+            finally:
+                try:
+                    os.remove(compressed_path)
+                except OSError:
+                    pass
 
-        finally:
-            try:
-                os.remove(compressed_path)
-            except OSError:
-                pass
+            # Store file path as key, hash as value
+            with self.lock:
+                self.manifest["files"][str(file_path.as_posix())] = file_hash
+            self.save_manifest()
+            if not silence:
+                print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
+        elif not silence:
+            print(
+                f"File {file_path} (hash: {file_hash}) already exists in S3. Skipping."
+            )
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def download(self, file_path, silence=False):
@@ -435,7 +441,7 @@ class S3LFS:
 
         print("✅ S3 cleanup completed.")
 
-    def track_modified_files(self):
+    def track_modified_files(self, silence=True):
         """Check manifest for outdated hashes and upload changed files in parallel."""
 
         files_to_upload = []
@@ -464,18 +470,18 @@ class S3LFS:
         # Upload files in parallel if needed
         if files_to_upload:
             print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
-            self.parallel_upload(files_to_upload)
+            self.parallel_upload(files_to_upload, silence=silence)
 
             # Save updated manifest
             self.save_manifest()
         else:
             print("No modified files needing upload.")
 
-    def parallel_upload(self, files):
+    def parallel_upload(self, files, silence=True):
         """Parallel upload of multiple files using ThreadPoolExecutor."""
         with ThreadPoolExecutor() as executor:
             # Submit each download task; unpack key from matching_files.items()
-            futures = [executor.submit(self.upload, f, silence=True) for f in files]
+            futures = [executor.submit(self.upload, f, silence=silence) for f in files]
 
             for future in tqdm(
                 as_completed(futures), total=len(futures), desc="Uploading files"
