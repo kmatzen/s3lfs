@@ -217,6 +217,8 @@ class S3LFS:
         """
         hasher = hashlib.sha256()
 
+        file_path = Path(file_path)
+
         # Include the relative file path as a unique identifier
         relative_path = str(file_path.as_posix()).encode()
         hasher.update(relative_path)
