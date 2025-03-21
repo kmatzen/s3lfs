@@ -158,7 +158,7 @@ class S3LFS:
         print(f"   Repo Prefix: {self.repo_prefix}")
         print("Manifest file saved as .s3_manifest.json")
 
-    def track_subtree(self, directory, silence=False):
+    def track_subtree(self, directory, silence=True):
         """
         Track and upload all files within a given directory (subtree).
 

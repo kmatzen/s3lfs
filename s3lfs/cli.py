@@ -96,12 +96,13 @@ def init(bucket, prefix, no_sign_request):
 @click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
 @click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def track_subtree(directory, bucket, prefix, no_sign_request):
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def track_subtree(directory, bucket, prefix, no_sign_request, verbose):
     """Recursively track and upload all files in a directory"""
     versioner = S3LFS(
         bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
     )
-    versioner.track_subtree(directory)
+    versioner.track_subtree(directory, silence=not verbose)
 
 
 @click.command()
