@@ -526,7 +526,7 @@ class S3LFS:
 
         print("✅ All files downloaded.")
 
-    def sparse_checkout(self, prefix):
+    def sparse_checkout(self, prefix, silence=True):
         """
         Sparse checkout: download only files that match a given directory prefix.
 
@@ -549,7 +549,8 @@ class S3LFS:
         with ThreadPoolExecutor() as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
-                executor.submit(self.download, key) for key, _ in matching_files.items()
+                executor.submit(self.download, key, silence=silence)
+                for key, _ in matching_files.items()
             ]
 
             for future in tqdm(
