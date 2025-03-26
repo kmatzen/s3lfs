@@ -59,12 +59,13 @@ def download_all(bucket, no_sign_request, verbose):
 @click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
 @click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def sparse_checkout(directory, prefix, bucket, no_sign_request):
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def sparse_checkout(directory, prefix, bucket, no_sign_request, verbose):
     """Download all files under a given subtree (prefix)"""
     versioner = S3LFS(
         bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
     )
-    versioner.sparse_checkout(directory)
+    versioner.sparse_checkout(directory, silence=not verbose)
 
 
 @click.command()
