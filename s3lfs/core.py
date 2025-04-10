@@ -127,27 +127,38 @@ class S3LFS:
         self._shutdown_requested = True
         sys.exit(1)  # Exit the program
 
-    def _acquire_lock(self):
+    def _acquire_lock(self, timeout=30, retry_interval=1):
         """
-        Acquire the file-based lock, checking for stale locks.
-        If the lock file exists, verify the PID of the process that created it.
+        Attempt to acquire the lock with a timeout.
+        If the lock file exists and belongs to a dead process, remove it and retry.
         """
-        if self.lock_file.exists():
-            with open(self.lock_file, "r") as f:
+
+        while True:
+            try:
+                # Try to acquire the file-based lock (non-blocking)
+                context = self.lock.acquire(timeout=retry_interval)
+                if context:
+                    # Got the lock, write the current PID
+                    with open(self.lock_file, "w") as f:
+                        f.write(str(os.getpid()))
+                    return context
+            except TimeoutError:
+                pass
+
+            # If lock file exists, check for staleness
+            if self.lock_file.exists():
                 try:
-                    pid = int(f.read().strip())
+                    with open(self.lock_file, "r") as f:
+                        pid = int(f.read().strip())
                     if not psutil.pid_exists(pid):
                         print(f"Stale lock detected (PID {pid}). Removing it.")
-                        self.lock_file.unlink()  # Remove the stale lock file
-                except ValueError:
-                    print("Invalid PID in lock file. Removing it.")
-                    self.lock_file.unlink()  # Remove invalid lock file
-
-        # Acquire the lock and write the current PID to the lock file
-        context = self.lock.acquire()
-        with open(self.lock_file, "w") as f:
-            f.write(str(os.getpid()))
-        return context
+                        self.lock_file.unlink()
+                except (ValueError, OSError):
+                    print("Invalid or unreadable PID in lock file. Removing it.")
+                    try:
+                        self.lock_file.unlink()
+                    except OSError:
+                        pass
 
     def _release_lock(self):
         """
