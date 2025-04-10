@@ -730,23 +730,27 @@ class S3LFS:
         """
         path = Path(path)
 
-        # Resolve files based on the input type
+        # Resolve files based on the input type using the manifest
         with self.lock:
-            if path.is_file():
-                files_to_checkout = [str(path.as_posix())]
-            elif path.is_dir():
-                prefix = str(path.as_posix()) + "/"
-                files_to_checkout = [
-                    file for file in self.manifest["files"] if file.startswith(prefix)
-                ]
-            else:
-                # Treat as a glob pattern (manifest-based resolution)
-                glob_pattern = str(path.as_posix())
+            path_str = str(path.as_posix())
+            if "*" in path_str or "?" in path_str:  # Glob pattern
                 files_to_checkout = [
                     file
                     for file in self.manifest["files"]
-                    if Path(file).match(glob_pattern)
+                    if Path(file).match(path_str)
                 ]
+            else:
+                # Treat as a directory if it matches as a prefix in the manifest
+                prefix = path_str if path_str.endswith("/") else f"{path_str}/"
+                files_to_checkout = [
+                    file for file in self.manifest["files"] if file.startswith(prefix)
+                ]
+
+                # If no files match the prefix, treat it as a single file
+                if not files_to_checkout:
+                    files_to_checkout = [
+                        file for file in self.manifest["files"] if file == path_str
+                    ]
 
         if not files_to_checkout:
             print(f"⚠️ No files found in the manifest for '{path}'.")
