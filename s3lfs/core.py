@@ -5,7 +5,6 @@ import mmap
 import os
 import shutil
 import subprocess
-import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -62,6 +61,7 @@ class S3LFS:
         repo_prefix=None,
         encryption=True,
         no_sign_request=False,
+        temp_dir=None,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -69,11 +69,15 @@ class S3LFS:
         :param repo_prefix: A unique prefix to isolate this repository's files
         :param encryption: If True, use AES256 server-side encryption
         :param no_sign_request: If True, use unsigned requests
+        :param temp_dir: Path to the temporary directory for compression/decompression
         """
-        self.temp_dir = tempfile.mkdtemp()
+        # Set the temporary directory to the base of the repository if not provided
+        self.temp_dir = Path(temp_dir or ".s3lfs_temp")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
+
         self.lock = threading.Lock()
         if no_sign_request:
-            # If we're not signing, we can't use multipart.  Set the threshold to the max.
+            # If we're not signing, we can't use multipart. Set the threshold to the max.
             self.config = TransferConfig(
                 multipart_threshold=5 * 1024 * 1024 * 1024, max_concurrency=10
             )
@@ -179,7 +183,7 @@ class S3LFS:
 
         print(f"Tracking {len(files_to_upload)} files in {directory}...")
 
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [
                 executor.submit(self.upload, f, silence=silence)
                 for f in files_to_upload
@@ -231,8 +235,8 @@ class S3LFS:
         return hasher.hexdigest()
 
     def compress_file(self, file_path):
-        """Compress the file using gzip and return the path of the compressed file in a temp directory."""
-        compressed_path = os.path.join(self.temp_dir, f"{uuid4()}.gz")
+        """Compress the file using gzip and return the path of the compressed file in the temp directory."""
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
 
         # Use a larger buffer size (1 MB) for reading/writing.
         buffer_size = 1024 * 1024  # 1 MB chunks
@@ -338,14 +342,14 @@ class S3LFS:
         # Proceed with download if file is missing or different
         s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
 
-        compressed_path = os.path.join(self.temp_dir, f"{uuid4()}.gz")
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
 
         try:
             os.makedirs(os.path.dirname(compressed_path), exist_ok=True)
             self._get_s3_client().download_file(
                 Bucket=self.bucket_name,
                 Key=s3_key,
-                Filename=compressed_path,
+                Filename=str(compressed_path),
                 Config=self.config,
             )
             if os.path.dirname(file_path):
@@ -453,7 +457,7 @@ class S3LFS:
             )  # Files listed in the manifest
 
         # Compute hashes in parallel
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
 
         # Process results
@@ -481,7 +485,7 @@ class S3LFS:
 
     def parallel_upload(self, files, silence=True):
         """Parallel upload of multiple files using ThreadPoolExecutor."""
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [executor.submit(self.upload, f, silence=silence) for f in files]
 
@@ -508,7 +512,7 @@ class S3LFS:
 
         print("📥 Starting parallel download of all tracked files...")
 
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit all tasks and collect futures
             futures = [
                 executor.submit(self.download, kv[0], silence=silence) for kv in items
@@ -546,7 +550,7 @@ class S3LFS:
 
         print(f"📥 Downloading {len(matching_files)} files from '{prefix}'...")
 
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
                 executor.submit(self.download, key, silence=silence)
