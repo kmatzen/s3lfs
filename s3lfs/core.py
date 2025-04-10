@@ -219,6 +219,9 @@ class S3LFS:
 
         print(f"Tracking {len(files_to_upload)} files in {directory}...")
 
+        # Test S3 credentials once before starting the parallel upload
+        self.test_s3_credentials()
+
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [
                 executor.submit(self.upload, f, silence=silence)
@@ -548,6 +551,9 @@ class S3LFS:
 
         print("📥 Starting parallel download of all tracked files...")
 
+        # Test S3 credentials once before starting the parallel download
+        self.test_s3_credentials()
+
         with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit all tasks and collect futures
             futures = [
@@ -561,7 +567,6 @@ class S3LFS:
                 try:
                     future.result()  # This will re-raise any exceptions from the thread.
                 except Exception as e:
-                    # Handle other exceptions if needed
                     print(f"An unexpected error occurred: {e}")
 
         print("✅ All files downloaded.")
@@ -665,3 +670,28 @@ class S3LFS:
         self.save_manifest()
 
         print(f"🗑 Removed tracking for all files under '{directory}'.")
+
+    def test_s3_credentials(self):
+        """
+        Test the S3 credentials to ensure they are valid.
+        This prevents repeated failures during bulk operations.
+        """
+        try:
+            # Attempt to list buckets to verify credentials
+            self._get_s3_client().list_buckets()
+            print("✅ S3 credentials are valid.")
+        except NoCredentialsError:
+            raise RuntimeError("AWS credentials are missing. Please configure them.")
+        except PartialCredentialsError:
+            raise RuntimeError(
+                "Incomplete AWS credentials. Check your AWS configuration."
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] in [
+                "InvalidAccessKeyId",
+                "SignatureDoesNotMatch",
+            ]:
+                raise RuntimeError(
+                    "Invalid AWS credentials. Please verify your access key and secret key."
+                )
+            raise RuntimeError(f"Error testing S3 credentials: {e}")
