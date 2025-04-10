@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import boto3
+import psutil
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.exceptions import (
@@ -19,6 +20,7 @@ from botocore.exceptions import (
     NoCredentialsError,
     PartialCredentialsError,
 )
+from filelock import FileLock
 from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
@@ -75,7 +77,10 @@ class S3LFS:
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
-        self.lock = threading.Lock()
+        # Use a file-based lock for cross-process synchronization
+        self.lock_file = self.temp_dir / ".s3lfs.lock"
+        self.lock = FileLock(self.lock_file)
+
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
             self.config = TransferConfig(
@@ -89,7 +94,7 @@ class S3LFS:
         self.load_manifest()
 
         # Use the stored bucket name if none is provided
-        with self.lock:
+        with self._acquire_lock():
             if bucket_name:
                 self.bucket_name = bucket_name
                 self.manifest["bucket_name"] = bucket_name
@@ -99,7 +104,7 @@ class S3LFS:
         if not self.bucket_name:
             raise ValueError("Bucket name must be provided or stored in the manifest.")
 
-        with self.lock:
+        with self._acquire_lock():
             if repo_prefix:
                 self.repo_prefix = repo_prefix
                 self.manifest["repo_prefix"] = repo_prefix
@@ -108,6 +113,37 @@ class S3LFS:
 
         self.encryption = encryption
         self.save_manifest()
+
+    def _acquire_lock(self):
+        """
+        Acquire the file-based lock, checking for stale locks.
+        If the lock file exists, verify the PID of the process that created it.
+        """
+        if self.lock_file.exists():
+            with open(self.lock_file, "r") as f:
+                try:
+                    pid = int(f.read().strip())
+                    if not psutil.pid_exists(pid):
+                        print(f"Stale lock detected (PID {pid}). Removing it.")
+                        self.lock_file.unlink()  # Remove the stale lock file
+                except ValueError:
+                    print("Invalid PID in lock file. Removing it.")
+                    self.lock_file.unlink()  # Remove invalid lock file
+
+        # Acquire the lock and write the current PID to the lock file
+        context = self.lock.acquire()
+        with open(self.lock_file, "w") as f:
+            f.write(str(os.getpid()))
+        return context
+
+    def _release_lock(self):
+        """
+        Release the file-based lock and remove the PID from the lock file.
+        """
+        if self.lock.is_locked:
+            self.lock.release()
+        if self.lock_file.exists():
+            self.lock_file.unlink()
 
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
@@ -201,7 +237,7 @@ class S3LFS:
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
-        with self.lock:
+        with self._acquire_lock():
             if self.manifest_file.exists():
                 with open(self.manifest_file, "r") as f:
                     self.manifest = json.load(f)
@@ -210,7 +246,7 @@ class S3LFS:
 
     def save_manifest(self):
         """Save the manifest back to disk."""
-        with self.lock:
+        with self._acquire_lock():
             with open(self.manifest_file, "w") as f:
                 json.dump(self.manifest, f, indent=4, sort_keys=True)
 
