@@ -55,20 +55,6 @@ def download_all(bucket, no_sign_request, verbose):
 
 
 @click.command()
-@click.argument("directory", required=True)
-@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
-@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
-@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-@click.option("--verbose", is_flag=True, help="Print download progress")
-def sparse_checkout(directory, prefix, bucket, no_sign_request, verbose):
-    """Download all files under a given subtree (prefix)"""
-    versioner = S3LFS(
-        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
-    )
-    versioner.sparse_checkout(directory, silence=not verbose)
-
-
-@click.command()
 @click.option("--bucket", help="S3 bucket name")
 @click.option("--prefix", help="Repo-specific prefix")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
@@ -90,20 +76,6 @@ def init(bucket, prefix, no_sign_request):
         bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
     )
     versioner.initialize_repo()
-
-
-@click.command()
-@click.argument("directory", required=True)
-@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
-@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
-@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-@click.option("--verbose", is_flag=True, help="Print download progress")
-def track_subtree(directory, bucket, prefix, no_sign_request, verbose):
-    """Recursively track and upload all files in a directory"""
-    versioner = S3LFS(
-        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
-    )
-    versioner.track_subtree(directory, silence=not verbose)
 
 
 @click.command()
@@ -147,6 +119,66 @@ def remove_subtree(directory, purge_from_s3, bucket, prefix, no_sign_request):
     versioner.remove_subtree(directory, keep_in_s3=not purge_from_s3)
 
 
+@cli.command()
+@click.argument("path")
+@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
+@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def track(path, bucket, prefix, no_sign_request, verbose):
+    """Track files, directories, or globs."""
+    s3lfs = S3LFS(
+        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
+    )
+    s3lfs.track(path, silence=not verbose)
+
+
+@cli.command()
+@click.argument("path")
+@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
+@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def checkout(path, bucket, prefix, no_sign_request, verbose):
+    """Checkout files, directories, or globs."""
+    s3lfs = S3LFS(
+        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
+    )
+    s3lfs.checkout(path, silence=not verbose)
+
+
+@cli.command()
+@click.argument("directory")
+@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
+@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def track_subtree(directory, bucket, prefix, no_sign_request, verbose):
+    """Deprecated: Track all files in a directory."""
+    print("⚠️ `track_subtree` is deprecated. Use `track` instead.")
+    s3lfs = S3LFS(
+        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
+    )
+    s3lfs.track(directory, silence=not verbose)
+
+
+@cli.command()
+@click.argument("path")
+@click.option("--bucket", help="S3 bucket name (optional if stored in manifest)")
+@click.option("--prefix", help="Repo-specific prefix (optional if stored in manifest)")
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option("--verbose", is_flag=True, help="Print download progress")
+def sparse_checkout(path, bucket, prefix, no_sign_request, verbose):
+    """Deprecated: Checkout files matching a prefix."""
+    print("⚠️ `sparse_checkout` is deprecated. Use `checkout` instead.")
+    s3lfs = S3LFS(
+        bucket_name=bucket, repo_prefix=prefix, no_sign_request=no_sign_request
+    )
+    s3lfs.checkout(path, silence=not verbose)
+
+
+cli.add_command(checkout)
+cli.add_command(track)
 cli.add_command(remove_subtree)
 cli.add_command(remove)
 cli.add_command(cleanup)
