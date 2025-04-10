@@ -213,53 +213,10 @@ class S3LFS:
 
     def track_subtree(self, directory, silence=True):
         """
-        Track and upload all files within a given directory (subtree).
-
-        :param directory: The directory to recursively scan and upload.
-        :param silence: Silences verbose logging
+        Deprecated: Use `track` instead.
         """
-        directory = Path(directory)
-
-        if not directory.is_dir():
-            print(f"Error: {directory} is not a valid directory.")
-            return
-
-        files_to_upload = [f for f in directory.rglob("*") if f.is_file()]
-
-        if not files_to_upload:
-            print(f"No files found in {directory} to track.")
-            return
-
-        print(f"Tracking {len(files_to_upload)} files in {directory}...")
-
-        # Test S3 credentials once before starting the parallel upload
-        self.test_s3_credentials()
-
-        try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [
-                    executor.submit(self.upload, f, silence=silence)
-                    for f in files_to_upload
-                ]
-
-                for future in tqdm(
-                    as_completed(futures), total=len(futures), desc="Uploading subtree"
-                ):
-                    if self._shutdown_requested:
-                        print("⚠️ Shutdown requested. Cancelling remaining uploads...")
-                        break
-
-                    try:
-                        future.result()  # Will re-raise exceptions from the worker thread
-                    except CancelledError:
-                        print("⚠️ Task was cancelled.")
-                    except Exception as e:
-                        print(f"An error occurred during upload: {e}")
-
-        except KeyboardInterrupt:
-            print("\n⚠️ Upload interrupted by user.")
-        finally:
-            print(f"✅ Successfully tracked and uploaded all files in {directory}")
+        print("⚠️ `track_subtree` is deprecated. Use `track` instead.")
+        self.track(directory, silence=silence)
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
@@ -609,42 +566,10 @@ class S3LFS:
 
     def sparse_checkout(self, prefix, silence=True):
         """
-        Sparse checkout: download only files that match a given directory prefix.
-
-        :param prefix: The directory prefix to match.
+        Deprecated: Use `checkout` instead.
         """
-        prefix = str(Path(prefix).as_posix()) + "/"  # Ensure trailing slash
-        with self.lock:
-            matching_files = {
-                path: hash
-                for path, hash in self.manifest["files"].items()
-                if path.startswith(prefix)
-            }
-
-        if not matching_files:
-            print(f"⚠️ No files found for prefix '{prefix}' in the manifest.")
-            return
-
-        print(f"📥 Downloading {len(matching_files)} files from '{prefix}'...")
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            # Submit each download task; unpack key from matching_files.items()
-            futures = [
-                executor.submit(self.download, key, silence=silence)
-                for key, _ in matching_files.items()
-            ]
-
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Downloading subtree"
-            ):
-                try:
-                    # This will raise the exception if the download failed
-                    future.result()
-                except Exception as e:
-                    # Handle any other exceptions that may occur
-                    print(f"An error occurred: {e}")
-
-        print(f"✅ Sparse checkout of '{prefix}' completed.")
+        print("⚠️ `sparse_checkout` is deprecated. Use `checkout` instead.")
+        self.checkout(prefix, silence=silence)
 
     def integrate_with_git(self):
         """
@@ -731,3 +656,115 @@ class S3LFS:
                     "Invalid AWS credentials. Please verify your access key and secret key."
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
+
+    def track(self, path, silence=True):
+        """
+        Track and upload files, directories, or globs.
+
+        :param path: A file, directory, or glob pattern to track.
+        :param silence: Silences verbose logging.
+        """
+        path = Path(path)
+
+        # Resolve files based on the input type
+        if path.is_file():
+            files_to_track = [path]
+        elif path.is_dir():
+            files_to_track = [f for f in path.rglob("*") if f.is_file()]
+        else:
+            # Treat as a glob pattern
+            files_to_track = [
+                Path(f) for f in path.parent.glob(path.name) if Path(f).is_file()
+            ]
+
+        if not files_to_track:
+            print(f"⚠️ No files found to track for '{path}'.")
+            return
+
+        print(f"Tracking {len(files_to_track)} files for '{path}'...")
+
+        # Test S3 credentials once before starting the parallel upload
+        self.test_s3_credentials()
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(self.upload, f, silence=silence)
+                    for f in files_to_track
+                ]
+
+                for future in tqdm(
+                    as_completed(futures), total=len(futures), desc="Uploading files"
+                ):
+                    if self._shutdown_requested:
+                        print("⚠️ Shutdown requested. Cancelling remaining uploads...")
+                        break
+
+                    try:
+                        future.result()  # Will re-raise exceptions from the worker thread
+                    except Exception as e:
+                        print(f"An error occurred during upload: {e}")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Upload interrupted by user.")
+        finally:
+            print(f"✅ Successfully tracked and uploaded files for '{path}'.")
+
+    def checkout(self, path, silence=True):
+        """
+        Checkout files, directories, or globs from the manifest.
+
+        :param path: A file, directory, or glob pattern to checkout.
+        :param silence: Silences verbose logging.
+        """
+        path = Path(path)
+
+        # Resolve files based on the input type
+        with self.lock:
+            if path.is_file():
+                files_to_checkout = [str(path.as_posix())]
+            elif path.is_dir():
+                prefix = str(path.as_posix()) + "/"
+                files_to_checkout = [
+                    file for file in self.manifest["files"] if file.startswith(prefix)
+                ]
+            else:
+                # Treat as a glob pattern (manifest-based resolution)
+                glob_pattern = str(path.as_posix())
+                files_to_checkout = [
+                    file
+                    for file in self.manifest["files"]
+                    if Path(file).match(glob_pattern)
+                ]
+
+        if not files_to_checkout:
+            print(f"⚠️ No files found in the manifest for '{path}'.")
+            return
+
+        print(f"📥 Checking out {len(files_to_checkout)} files for '{path}'...")
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(self.download, f, silence=silence)
+                    for f in files_to_checkout
+                ]
+
+                for future in tqdm(
+                    as_completed(futures), total=len(futures), desc="Downloading files"
+                ):
+                    if self._shutdown_requested:
+                        print(
+                            "⚠️ Shutdown requested. Cancelling remaining downloads..."
+                        )
+                        break
+
+                    try:
+                        future.result()  # Will re-raise exceptions from the worker thread
+                    except Exception as e:
+                        print(f"An error occurred during download: {e}")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Download interrupted by user.")
+        finally:
+            print(f"✅ Successfully checked out files for '{path}'.")
