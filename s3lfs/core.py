@@ -181,10 +181,6 @@ class S3LFS:
                 else:
                     self.thread_local.s3 = session.client("s3")
 
-                # Check if credentials are valid by attempting to list buckets
-                if not self.no_sign_request:
-                    self.thread_local.s3.list_buckets()
-
             except NoCredentialsError:
                 raise RuntimeError(
                     "AWS credentials are missing. Please configure them or use --no-sign-request."
@@ -645,13 +641,15 @@ class S3LFS:
 
     def test_s3_credentials(self):
         """
-        Test the S3 credentials to ensure they are valid.
+        Test the S3 credentials to ensure they are valid for the target bucket.
         This prevents repeated failures during bulk operations.
         """
         try:
-            # Attempt to list buckets to verify credentials
-            self._get_s3_client().list_buckets()
-            print("✅ S3 credentials are valid.")
+            # Attempt to list objects in the target bucket with a minimal prefix
+            self._get_s3_client().list_objects_v2(
+                Bucket=self.bucket_name, MaxKeys=1, Prefix=""
+            )
+            print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
         except NoCredentialsError:
             raise RuntimeError("AWS credentials are missing. Please configure them.")
         except PartialCredentialsError:
@@ -662,9 +660,10 @@ class S3LFS:
             if e.response["Error"]["Code"] in [
                 "InvalidAccessKeyId",
                 "SignatureDoesNotMatch",
+                "AccessDenied",
             ]:
                 raise RuntimeError(
-                    "Invalid AWS credentials. Please verify your access key and secret key."
+                    f"Invalid or insufficient AWS credentials for bucket '{self.bucket_name}'."
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
 
