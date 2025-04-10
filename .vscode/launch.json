@@ -3,7 +3,7 @@
     "configurations": [
         {
             "name": "Python: Debug Pytest with Poetry",
-            "type": "debugpy",
+            "type": "python",
             "request": "launch",
             "module": "pytest",
             "console": "integratedTerminal",
@@ -11,7 +11,7 @@
                 "PYTHONPATH": "${workspaceFolder}"
             },
             "args": [],
-            "python": "/Users/matzen/Library/Caches/pypoetry/virtualenvs/s3-asset-versioning-VRCn-LLk-py3.12/bin/python"
+            "python": "${command:python.interpreterPath}" // Dynamically resolves the interpreter
         }
     ]
 }
