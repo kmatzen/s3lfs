@@ -4,9 +4,11 @@ import json
 import mmap
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from uuid import uuid4
 
@@ -113,6 +115,17 @@ class S3LFS:
 
         self.encryption = encryption
         self.save_manifest()
+
+        self._shutdown_requested = False  # Flag to track shutdown requests
+        signal.signal(signal.SIGINT, self._handle_sigint)  # Register signal handler
+
+    def _handle_sigint(self, signum, frame):
+        """
+        Handle SIGINT (Ctrl+C) to gracefully shut down parallel operations.
+        """
+        print("\n⚠️ Interrupt received. Shutting down...")
+        self._shutdown_requested = True
+        sys.exit(1)  # Exit the program
 
     def _acquire_lock(self):
         """
@@ -222,21 +235,31 @@ class S3LFS:
         # Test S3 credentials once before starting the parallel upload
         self.test_s3_credentials()
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(self.upload, f, silence=silence)
-                for f in files_to_upload
-            ]
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(self.upload, f, silence=silence)
+                    for f in files_to_upload
+                ]
 
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Uploading subtree"
-            ):
-                try:
-                    future.result()  # Will re-raise exceptions from the worker thread
-                except Exception as e:
-                    print(f"An error occurred during upload: {e}")
+                for future in tqdm(
+                    as_completed(futures), total=len(futures), desc="Uploading subtree"
+                ):
+                    if self._shutdown_requested:
+                        print("⚠️ Shutdown requested. Cancelling remaining uploads...")
+                        break
 
-        print(f"✅ Successfully tracked and uploaded all files in {directory}")
+                    try:
+                        future.result()  # Will re-raise exceptions from the worker thread
+                    except CancelledError:
+                        print("⚠️ Task was cancelled.")
+                    except Exception as e:
+                        print(f"An error occurred during upload: {e}")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Upload interrupted by user.")
+        finally:
+            print(f"✅ Successfully tracked and uploaded all files in {directory}")
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
@@ -554,22 +577,35 @@ class S3LFS:
         # Test S3 credentials once before starting the parallel download
         self.test_s3_credentials()
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            # Submit all tasks and collect futures
-            futures = [
-                executor.submit(self.download, kv[0], silence=silence) for kv in items
-            ]
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # Submit all tasks and collect futures
+                futures = [
+                    executor.submit(self.download, kv[0], silence=silence)
+                    for kv in items
+                ]
 
-            # Iterate over futures as they complete
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Downloading files"
-            ):
-                try:
-                    future.result()  # This will re-raise any exceptions from the thread.
-                except Exception as e:
-                    print(f"An unexpected error occurred: {e}")
+                # Iterate over futures as they complete
+                for future in tqdm(
+                    as_completed(futures), total=len(futures), desc="Downloading files"
+                ):
+                    if self._shutdown_requested:
+                        print(
+                            "⚠️ Shutdown requested. Cancelling remaining downloads..."
+                        )
+                        break
 
-        print("✅ All files downloaded.")
+                    try:
+                        future.result()  # This will re-raise any exceptions from the thread.
+                    except CancelledError:
+                        print("⚠️ Task was cancelled.")
+                    except Exception as e:
+                        print(f"An unexpected error occurred: {e}")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Download interrupted by user.")
+        finally:
+            print("✅ All files downloaded.")
 
     def sparse_checkout(self, prefix, silence=True):
         """
