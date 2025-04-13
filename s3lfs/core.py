@@ -646,7 +646,8 @@ class S3LFS:
         """
         path = Path(path)
 
-        # Resolve files based on the input type
+        # Phase 1: Compute hashes for files on the filesystem in parallel
+        print("🔍 Computing hashes for files on the filesystem...")
         if path.is_file():
             files_to_track = [path]
         elif path.is_dir():
@@ -661,16 +662,37 @@ class S3LFS:
             print(f"⚠️ No files found to track for '{path}'.")
             return
 
-        print(f"Tracking {len(files_to_track)} files for '{path}'...")
+        # Compute hashes in parallel
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            file_hashes = {
+                str(file.as_posix()): hash_result
+                for file, hash_result in zip(
+                    files_to_track, executor.map(self.hash_file, files_to_track)
+                )
+            }
 
-        # Test S3 credentials once before starting the parallel upload
-        self.test_s3_credentials()
+        # Phase 2: Lock the manifest and determine which files need updates
+        print("🔒 Locking manifest to determine files needing updates...")
+        with self._lock_context():
+            files_to_upload = []
+            for file_path, current_hash in file_hashes.items():
+                stored_hash = self.manifest["files"].get(file_path)
+                if current_hash != stored_hash:
+                    files_to_upload.append((file_path, current_hash))
 
+        if not files_to_upload:
+            print("✅ All files are up-to-date. No uploads needed.")
+            return
+
+        print(f"📤 {len(files_to_upload)} files need to be uploaded.")
+
+        # Phase 3: Upload files needing updates
+        print("🚀 Uploading files...")
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
-                    executor.submit(self.upload, f, silence=silence)
-                    for f in files_to_track
+                    executor.submit(self.upload, file_path, silence=silence)
+                    for file_path, _ in files_to_upload
                 ]
 
                 for future in tqdm(
@@ -687,8 +709,14 @@ class S3LFS:
 
         except KeyboardInterrupt:
             print("\n⚠️ Upload interrupted by user.")
-        finally:
-            print(f"✅ Successfully tracked and uploaded files for '{path}'.")
+            return
+
+        # Phase 4: Lock the manifest and update it
+        for file_path, file_hash in files_to_upload:
+            self.manifest["files"][file_path] = file_hash
+        self.save_manifest()
+
+        print(f"✅ Successfully tracked and uploaded files for '{path}'.")
 
     def checkout(self, path, silence=True):
         """
