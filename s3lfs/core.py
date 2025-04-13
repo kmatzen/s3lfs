@@ -205,10 +205,22 @@ class S3LFS:
                 self.manifest = {"files": {}}  # Use file paths as keys
 
     def save_manifest(self):
-        """Save the manifest back to disk."""
+        """Save the manifest back to disk atomically."""
         with self._lock_context():
-            with open(self.manifest_file, "w") as f:
-                json.dump(self.manifest, f, indent=4, sort_keys=True)
+            temp_file = self.manifest_file.with_suffix(
+                ".tmp"
+            )  # Temporary file in the same directory
+            try:
+                # Write the manifest to a temporary file
+                with open(temp_file, "w") as f:
+                    json.dump(self.manifest, f, indent=4, sort_keys=True)
+
+                # Atomically move the temporary file to the target location
+                temp_file.replace(self.manifest_file)
+            except Exception as e:
+                print(f"❌ Failed to save manifest: {e}")
+                if temp_file.exists():
+                    temp_file.unlink()  # Clean up the temporary file
 
     def hash_file(self, file_path, method="auto"):
         """
