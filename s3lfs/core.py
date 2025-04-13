@@ -280,17 +280,66 @@ class S3LFS:
         )
         return result.stdout.split()[0]  # Extract the hash from the output
 
-    def compress_file(self, file_path):
-        """Compress the file using gzip and return the path of the compressed file in the temp directory."""
-        compressed_path = self.temp_dir / f"{uuid4()}.gz"
+    def compress_file(self, file_path, method="auto"):
+        """
+        Compress the file using gzip and return the path of the compressed file in the temp directory.
 
-        # Use a larger buffer size (1 MB) for reading/writing.
+        :param file_path: Path to the file to compress.
+        :param method: Compression method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "python": Use Python's gzip module (default).
+                    - "cli": Use the `gzip` CLI utility (POSIX only).
+        :return: The path to the compressed file.
+        """
+        file_path = Path(file_path)
+
+        # Ensure the file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if sys.platform.startswith("linux") and shutil.which("gzip"):
+                method = "cli"
+            else:
+                method = "python"
+
+        # Use the selected compression method
+        if method == "python":
+            return self._compress_file_python(file_path)
+        elif method == "cli":
+            return self._compress_file_cli(file_path)
+        else:
+            raise ValueError(f"Unsupported compression method: {method}")
+
+    def _compress_file_python(self, file_path):
+        """
+        Compress the file using Python's gzip module and return the path of the compressed file.
+        """
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
         buffer_size = 1024 * 1024  # 1 MB chunks
-        # Lower the compression level for speed (default is 9)
+
         with open(file_path, "rb") as f_in, gzip.open(
             compressed_path, "wb", compresslevel=5
         ) as f_out:
             shutil.copyfileobj(f_in, f_out, length=buffer_size)
+
+        return compressed_path
+
+    def _compress_file_cli(self, file_path):
+        """
+        Compress the file using the `gzip` CLI utility and return the path of the compressed file.
+        """
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
+
+        result = subprocess.run(
+            ["gzip", "-c", "-5", str(file_path)],
+            stdout=open(compressed_path, "wb"),
+            check=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to compress file using gzip CLI: {file_path}")
 
         return compressed_path
 
@@ -358,6 +407,70 @@ class S3LFS:
                 f"File {file_path} (hash: {file_hash}) already exists in S3. Skipping."
             )
 
+    def decompress_file(self, compressed_path, output_path=None, method="auto"):
+        """
+        Decompress a file using gzip and return the path of the decompressed file.
+
+        :param compressed_path: Path to the compressed file.
+        :param output_path: Path to save the decompressed file. If None, use the same name without the `.gz` extension.
+        :param method: Decompression method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "python": Use Python's gzip module (default).
+                    - "cli": Use the `gzip` CLI utility (POSIX only).
+        :return: The path to the decompressed file.
+        """
+        compressed_path = Path(compressed_path)
+
+        # Ensure the compressed file exists
+        if not compressed_path.exists():
+            raise FileNotFoundError(f"Compressed file not found: {compressed_path}")
+
+        # Determine the output path
+        if output_path is None:
+            output_path = compressed_path.with_suffix("")  # Remove the `.gz` extension
+        output_path = Path(output_path)
+
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if sys.platform.startswith("linux") and shutil.which("gzip"):
+                method = "cli"
+            else:
+                method = "python"
+
+        # Use the selected decompression method
+        if method == "python":
+            return self._decompress_file_python(compressed_path, output_path)
+        elif method == "cli":
+            return self._decompress_file_cli(compressed_path, output_path)
+        else:
+            raise ValueError(f"Unsupported decompression method: {method}")
+
+    def _decompress_file_python(self, compressed_path, output_path):
+        """
+        Decompress the file using Python's gzip module and save it to the output path.
+        """
+        with gzip.open(compressed_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+        return output_path
+
+    def _decompress_file_cli(self, compressed_path, output_path):
+        """
+        Decompress the file using the `gzip` CLI utility and save it to the output path.
+        """
+        result = subprocess.run(
+            ["gzip", "-d", "-c", str(compressed_path)],
+            stdout=open(output_path, "wb"),
+            check=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to decompress file using gzip CLI: {compressed_path}"
+            )
+
+        return output_path
+
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def download(self, file_path, silence=False):
         """
@@ -400,10 +513,7 @@ class S3LFS:
             )
             if os.path.dirname(file_path):
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with gzip.open(compressed_path, "rb") as f_in, open(
-                file_path, "wb"
-            ) as f_out:
-                shutil.copyfileobj(f_in, f_out)
+            self.decompress_file(compressed_path, file_path)
             os.remove(compressed_path)  # Ensure temp file is deleted
             if not silence:
                 print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
