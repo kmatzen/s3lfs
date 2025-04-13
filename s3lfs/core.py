@@ -210,25 +210,75 @@ class S3LFS:
             with open(self.manifest_file, "w") as f:
                 json.dump(self.manifest, f, indent=4, sort_keys=True)
 
-    def hash_file(self, file_path):
+    def hash_file(self, file_path, method="auto"):
         """
         Compute a unique SHA-256 hash of the file using its content and relative path.
-        This prevents files with identical contents but different paths from colliding.
-        """
-        hasher = hashlib.sha256()
+        Supports multiple hashing methods for performance optimization.
 
+        :param file_path: Path to the file to hash.
+        :param method: Hashing method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "mmap": Use memory-mapped files (default for non-empty files).
+                    - "iter": Use an iterative read approach (fallback for empty files).
+                    - "cli": Use the `sha256sum` CLI utility (POSIX only).
+        :return: The computed SHA-256 hash as a hexadecimal string.
+        """
         file_path = Path(file_path)
 
-        # Include the relative file path as a unique identifier
-        relative_path = str(file_path.as_posix()).encode()
-        hasher.update(relative_path)
+        # Ensure the file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
 
-        # Hash the file content
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if file_path.stat().st_size == 0:  # Empty file
+                method = "iter"
+            elif sys.platform.startswith("linux") and shutil.which("sha256sum"):
+                method = "cli"
+            else:
+                method = "mmap"
+
+        # Use the selected hashing method
+        if method == "mmap":
+            return self._hash_file_mmap(file_path)
+        elif method == "iter":
+            return self._hash_file_iter(file_path)
+        elif method == "cli":
+            return self._hash_file_cli(file_path)
+        else:
+            raise ValueError(f"Unsupported hashing method: {method}")
+
+    def _hash_file_mmap(self, file_path):
+        """
+        Compute the SHA-256 hash using memory-mapped files.
+        """
+        hasher = hashlib.sha256()
         with open(file_path, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 hasher.update(mm)
-
         return hasher.hexdigest()
+
+    def _hash_file_iter(self, file_path, chunk_size=1024 * 1024):
+        """
+        Compute the SHA-256 hash by iteratively reading the file in chunks.
+        """
+        hasher = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _hash_file_cli(self, file_path):
+        """
+        Compute the SHA-256 hash using the `sha256sum` CLI utility (POSIX only).
+        """
+        result = subprocess.run(
+            ["sha256sum", str(file_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.split()[0]  # Extract the hash from the output
 
     def compress_file(self, file_path):
         """Compress the file using gzip and return the path of the compressed file in the temp directory."""
