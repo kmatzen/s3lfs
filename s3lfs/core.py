@@ -887,39 +887,78 @@ class S3LFS:
         """
         path = Path(path)
 
-        # Resolve files based on the input type using the manifest
+        # Phase 1: Lock the manifest and read contents
+        print("🔒 Locking manifest to read contents...")
         with self._lock_context():
             path_str = str(path.as_posix())
             if "*" in path_str or "?" in path_str:  # Glob pattern
-                files_to_checkout = [
-                    file
+                files_to_checkout = {
+                    file: self.manifest["files"][file]
                     for file in self.manifest["files"]
                     if Path(file).match(path_str)
-                ]
+                }
             else:
                 # Treat as a directory if it matches as a prefix in the manifest
                 prefix = path_str if path_str.endswith("/") else f"{path_str}/"
-                files_to_checkout = [
-                    file for file in self.manifest["files"] if file.startswith(prefix)
-                ]
+                files_to_checkout = {
+                    file: self.manifest["files"][file]
+                    for file in self.manifest["files"]
+                    if file.startswith(prefix)
+                }
 
                 # If no files match the prefix, treat it as a single file
                 if not files_to_checkout:
-                    files_to_checkout = [
-                        file for file in self.manifest["files"] if file == path_str
-                    ]
+                    files_to_checkout = {
+                        file: self.manifest["files"][file]
+                        for file in self.manifest["files"]
+                        if file == path_str
+                    }
 
         if not files_to_checkout:
             print(f"⚠️ No files found in the manifest for '{path}'.")
             return
 
-        print(f"📥 Checking out {len(files_to_checkout)} files for '{path}'...")
+        print(f"🔍 Found {len(files_to_checkout)} files to check out.")
 
+        # Phase 2: Hash files to determine which need to be downloaded
+        print("🔍 Hashing files to determine which need to be downloaded...")
+        files_to_download = []
+        file_hashes = {}
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_file = {
+                executor.submit(self.hash_file, Path(file)): file
+                for file in files_to_checkout.keys()
+                if Path(file).exists()  # Only hash files that exist on disk
+            }
+
+            for future in as_completed(future_to_file):
+                file = future_to_file[future]
+                try:
+                    file_hashes[file] = future.result()
+                except Exception as exc:
+                    print(f"Error hashing file {file}: {exc}")
+
+        # Add files that don't exist on disk to the download list
+        for file in files_to_checkout.keys():
+            if not Path(file).exists():
+                files_to_download.append(file)
+            elif file_hashes.get(file) != files_to_checkout[file]:
+                files_to_download.append(file)
+
+        if not files_to_download:
+            print("✅ All files are up-to-date. No downloads needed.")
+            return
+
+        print(f"📥 {len(files_to_download)} files need to be downloaded.")
+
+        # Phase 3: Download files that need updates
+        print("🚀 Downloading files...")
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
-                    executor.submit(self.download, f, silence=silence)
-                    for f in files_to_checkout
+                    executor.submit(self.download, file, silence=silence)
+                    for file in files_to_download
                 ]
 
                 for future in tqdm(
