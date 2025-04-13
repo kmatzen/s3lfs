@@ -9,11 +9,12 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
 import boto3
-import psutil
+import portalocker
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.exceptions import (
@@ -22,7 +23,6 @@ from botocore.exceptions import (
     NoCredentialsError,
     PartialCredentialsError,
 )
-from filelock import FileLock
 from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
@@ -80,8 +80,7 @@ class S3LFS:
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
         # Use a file-based lock for cross-process synchronization
-        self.lock_file = self.temp_dir / ".s3lfs.lock"
-        self.lock = FileLock(self.lock_file)
+        self._lock_file = self.temp_dir / ".s3lfs.lock"
 
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
@@ -96,7 +95,7 @@ class S3LFS:
         self.load_manifest()
 
         # Use the stored bucket name if none is provided
-        with self._acquire_lock():
+        with self._lock_context():
             if bucket_name:
                 self.bucket_name = bucket_name
                 self.manifest["bucket_name"] = bucket_name
@@ -106,7 +105,7 @@ class S3LFS:
         if not self.bucket_name:
             raise ValueError("Bucket name must be provided or stored in the manifest.")
 
-        with self._acquire_lock():
+        with self._lock_context():
             if repo_prefix:
                 self.repo_prefix = repo_prefix
                 self.manifest["repo_prefix"] = repo_prefix
@@ -127,47 +126,18 @@ class S3LFS:
         self._shutdown_requested = True
         sys.exit(1)  # Exit the program
 
-    def _acquire_lock(self, timeout=30, retry_interval=1):
+    @contextmanager
+    def _lock_context(self):
         """
-        Attempt to acquire the lock with a timeout.
-        If the lock file exists and belongs to a dead process, remove it and retry.
+        Context manager for acquiring and releasing the file-based lock using portalocker.
         """
-
-        while True:
-            try:
-                # Try to acquire the file-based lock (non-blocking)
-                context = self.lock.acquire(timeout=retry_interval)
-                if context:
-                    # Got the lock, write the current PID
-                    with open(self.lock_file, "w") as f:
-                        f.write(str(os.getpid()))
-                    return context
-            except TimeoutError:
-                pass
-
-            # If lock file exists, check for staleness
-            if self.lock_file.exists():
-                try:
-                    with open(self.lock_file, "r") as f:
-                        pid = int(f.read().strip())
-                    if not psutil.pid_exists(pid):
-                        print(f"Stale lock detected (PID {pid}). Removing it.")
-                        self.lock_file.unlink()
-                except (ValueError, OSError):
-                    print("Invalid or unreadable PID in lock file. Removing it.")
-                    try:
-                        self.lock_file.unlink()
-                    except OSError:
-                        pass
-
-    def _release_lock(self):
-        """
-        Release the file-based lock and remove the PID from the lock file.
-        """
-        if self.lock.is_locked:
-            self.lock.release()
-        if self.lock_file.exists():
-            self.lock_file.unlink()
+        lock = open(self._lock_file, "w")  # Open the lock file in write mode
+        try:
+            portalocker.lock(lock, portalocker.LOCK_EX)  # Acquire an exclusive lock
+            yield lock  # Provide the lock to the context
+        finally:
+            portalocker.unlock(lock)  # Release the lock
+            lock.close()  # Close the file handle
 
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
@@ -208,7 +178,7 @@ class S3LFS:
         :param bucket_name: Name of the S3 bucket to use
         :param repo_prefix: A unique prefix for this repository in the bucket
         """
-        with self.lock:
+        with self._lock_context():
             self.manifest["bucket_name"] = self.bucket_name
             self.manifest["repo_prefix"] = self.repo_prefix
         self.save_manifest()
@@ -227,7 +197,7 @@ class S3LFS:
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
-        with self._acquire_lock():
+        with self._lock_context():
             if self.manifest_file.exists():
                 with open(self.manifest_file, "r") as f:
                     self.manifest = json.load(f)
@@ -236,7 +206,7 @@ class S3LFS:
 
     def save_manifest(self):
         """Save the manifest back to disk."""
-        with self._acquire_lock():
+        with self._lock_context():
             with open(self.manifest_file, "w") as f:
                 json.dump(self.manifest, f, indent=4, sort_keys=True)
 
@@ -328,7 +298,7 @@ class S3LFS:
                     pass
 
             # Store file path as key, hash as value
-            with self.lock:
+            with self._lock_context():
                 self.manifest["files"][str(file_path.as_posix())] = file_hash
             self.save_manifest()
             if not silence:
@@ -346,7 +316,7 @@ class S3LFS:
         file_path = Path(file_path)
 
         # Get the expected hash for the file
-        with self.lock:
+        with self._lock_context():
             expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
         if not expected_hash:
             print(f"⚠️ File '{file_path}' is not in the manifest.")
@@ -403,7 +373,7 @@ class S3LFS:
         file_path = Path(file_path)
         file_path_str = str(file_path.as_posix())
 
-        with self.lock:
+        with self._lock_context():
             if file_path_str not in self.manifest["files"]:
                 print(f"⚠️ File '{file_path}' is not currently tracked.")
                 return
@@ -429,7 +399,7 @@ class S3LFS:
 
         :param force: If True, bypass confirmation (for automated tests).
         """
-        with self.lock:
+        with self._lock_context():
             current_hashes = set(self.manifest["files"].values())
 
         paginator = self._get_s3_client().get_paginator("list_objects_v2")
@@ -477,7 +447,7 @@ class S3LFS:
         """Check manifest for outdated hashes and upload changed files in parallel."""
 
         files_to_upload = []
-        with self.lock:
+        with self._lock_context():
             files_to_check = list(
                 self.manifest["files"].keys()
             )  # Files listed in the manifest
@@ -488,7 +458,7 @@ class S3LFS:
 
         # Process results
         for file, current_hash in results:
-            with self.lock:
+            with self._lock_context():
                 stored_hash = self.manifest.get(file)
 
             if current_hash is None:
@@ -527,7 +497,7 @@ class S3LFS:
 
     def parallel_download_all(self, silence=True):
         """Download all files listed in the manifest in parallel."""
-        with self.lock:
+        with self._lock_context():
             items = list(
                 self.manifest["files"].items()
             )  # File paths as keys, hashes as values
@@ -617,7 +587,7 @@ class S3LFS:
         directory = Path(directory)
         directory_str = str(directory.as_posix())
 
-        with self.lock:
+        with self._lock_context():
             files_to_remove = [
                 path
                 for path in self.manifest["files"]
@@ -730,7 +700,7 @@ class S3LFS:
         path = Path(path)
 
         # Resolve files based on the input type using the manifest
-        with self.lock:
+        with self._lock_context():
             path_str = str(path.as_posix())
             if "*" in path_str or "?" in path_str:  # Glob pattern
                 files_to_checkout = [
