@@ -883,9 +883,11 @@ class S3LFS:
             print("\n⚠️ Upload interrupted by user.")
             return
 
-        # Phase 4: Lock the manifest and update it
-        for file_path, file_hash in files_to_upload:
-            self.manifest["files"][file_path] = file_hash
+        self.load_manifest()
+        with self._lock_context():
+            # Phase 4: Lock the manifest and update it
+            for file_path, file_hash in files_to_upload:
+                self.manifest["files"][file_path] = file_hash
         self.save_manifest()
 
         print(f"✅ Successfully tracked and uploaded files for '{path}'.")
