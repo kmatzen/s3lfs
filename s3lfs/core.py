@@ -111,9 +111,9 @@ class S3LFS:
                 self.manifest["repo_prefix"] = repo_prefix
             else:
                 self.repo_prefix = self.manifest.get("repo_prefix", "s3lfs")
+            self.save_manifest()
 
         self.encryption = encryption
-        self.save_manifest()
 
         self._shutdown_requested = False  # Flag to track shutdown requests
         signal.signal(signal.SIGINT, self._handle_sigint)  # Register signal handler
@@ -181,7 +181,7 @@ class S3LFS:
         with self._lock_context():
             self.manifest["bucket_name"] = self.bucket_name
             self.manifest["repo_prefix"] = self.repo_prefix
-        self.save_manifest()
+            self.save_manifest()
 
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
@@ -197,30 +197,28 @@ class S3LFS:
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
-        with self._lock_context():
-            if self.manifest_file.exists():
-                with open(self.manifest_file, "r") as f:
-                    self.manifest = json.load(f)
-            else:
-                self.manifest = {"files": {}}  # Use file paths as keys
+        if self.manifest_file.exists():
+            with open(self.manifest_file, "r") as f:
+                self.manifest = json.load(f)
+        else:
+            self.manifest = {"files": {}}  # Use file paths as keys
 
     def save_manifest(self):
         """Save the manifest back to disk atomically."""
-        with self._lock_context():
-            temp_file = self.manifest_file.with_suffix(
-                ".tmp"
-            )  # Temporary file in the same directory
-            try:
-                # Write the manifest to a temporary file
-                with open(temp_file, "w") as f:
-                    json.dump(self.manifest, f, indent=4, sort_keys=True)
+        temp_file = self.manifest_file.with_suffix(
+            ".tmp"
+        )  # Temporary file in the same directory
+        try:
+            # Write the manifest to a temporary file
+            with open(temp_file, "w") as f:
+                json.dump(self.manifest, f, indent=4, sort_keys=True)
 
-                # Atomically move the temporary file to the target location
-                temp_file.replace(self.manifest_file)
-            except Exception as e:
-                print(f"❌ Failed to save manifest: {e}")
-                if temp_file.exists():
-                    temp_file.unlink()  # Clean up the temporary file
+            # Atomically move the temporary file to the target location
+            temp_file.replace(self.manifest_file)
+        except Exception as e:
+            print(f"❌ Failed to save manifest: {e}")
+            if temp_file.exists():
+                temp_file.unlink()  # Clean up the temporary file
 
     def hash_file(self, file_path, method="auto"):
         """
@@ -373,7 +371,7 @@ class S3LFS:
         return result.stdout.strip()
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
-    def upload(self, file_path, silence=False):
+    def upload(self, file_path, silence=False, needs_immediate_update=True):
         """
         Upload a file to S3 and update the manifest using the file path as the key.
         """
@@ -409,9 +407,11 @@ class S3LFS:
                     pass
 
             # Store file path as key, hash as value
-            with self._lock_context():
-                self.manifest["files"][str(file_path.as_posix())] = file_hash
-            self.save_manifest()
+            if needs_immediate_update:
+                with self._lock_context():
+                    self.load_manifest()
+                    self.manifest["files"][str(file_path.as_posix())] = file_hash
+                    self.save_manifest()
             if not silence:
                 print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
         elif not silence:
@@ -552,7 +552,7 @@ class S3LFS:
 
             # Retrieve the file hash before removal
             file_hash = self.manifest["files"].pop(file_path_str, None)
-        self.save_manifest()
+            self.save_manifest()
 
         print(f"🗑 Removed tracking for '{file_path}'.")
 
@@ -647,7 +647,8 @@ class S3LFS:
             self.parallel_upload(files_to_upload, silence=silence)
 
             # Save updated manifest
-            self.save_manifest()
+            with self._lock_context():
+                self.save_manifest()
         else:
             print("No modified files needing upload.")
 
@@ -655,7 +656,12 @@ class S3LFS:
         """Parallel upload of multiple files using ThreadPoolExecutor."""
         with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit each download task; unpack key from matching_files.items()
-            futures = [executor.submit(self.upload, f, silence=silence) for f in files]
+            futures = [
+                executor.submit(
+                    self.upload, f, silence=silence, needs_immediate_update=False
+                )
+                for f in files
+            ]
 
             for future in tqdm(
                 as_completed(futures), total=len(futures), desc="Uploading files"
@@ -777,7 +783,8 @@ class S3LFS:
                 self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
                 print(f"🗑 File removed from S3: s3://{self.bucket_name}/{s3_key}")
 
-        self.save_manifest()
+        with self._lock_context():
+            self.save_manifest()
 
         print(f"🗑 Removed tracking for all files under '{directory}'.")
 
@@ -863,7 +870,12 @@ class S3LFS:
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
-                    executor.submit(self.upload, file_path, silence=silence)
+                    executor.submit(
+                        self.upload,
+                        file_path,
+                        silence=silence,
+                        needs_immediate_update=False,
+                    )
                     for file_path, _ in files_to_upload
                 ]
 
@@ -883,10 +895,12 @@ class S3LFS:
             print("\n⚠️ Upload interrupted by user.")
             return
 
-        # Phase 4: Lock the manifest and update it
-        for file_path, file_hash in files_to_upload:
-            self.manifest["files"][file_path] = file_hash
-        self.save_manifest()
+        with self._lock_context():
+            self.load_manifest()
+            # Phase 4: Lock the manifest and update it
+            for file_path, file_hash in files_to_upload:
+                self.manifest["files"][file_path] = file_hash
+            self.save_manifest()
 
         print(f"✅ Successfully tracked and uploaded files for '{path}'.")
 
