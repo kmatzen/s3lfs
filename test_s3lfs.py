@@ -99,6 +99,9 @@ class TestS3LFS(unittest.TestCase):
         self.versioner.upload(self.test_file)
         self.versioner.upload(self.another_test_file)
 
+        os.remove(self.test_file)
+        os.remove(self.another_test_file)
+
         # Download both
         self.versioner.download(self.test_file)
         self.versioner.download(self.another_test_file)
@@ -111,6 +114,26 @@ class TestS3LFS(unittest.TestCase):
 
         self.assertEqual(content1, "This is a test file.")
         self.assertEqual(content2, "Another test file content.")
+
+    def test_chunked_upload_and_download(self):
+        chunk_size = self.versioner.chunk_size
+        self.versioner.chunk_size = 4
+
+        try:
+            self.versioner.upload(self.test_file)
+
+            os.remove(self.test_file)
+
+            self.versioner.download(self.test_file)
+
+            # Verify contents
+            with open(self.test_file, "r") as f:
+                content1 = f.read()
+
+            self.assertEqual(content1, "This is a test file.")
+        finally:
+            # Reset chunk size to default
+            self.versioner.chunk_size = chunk_size
 
     # -------------------------------------------------
     # 3. Sparse Checkout
@@ -175,6 +198,33 @@ class TestS3LFS(unittest.TestCase):
         self.assertFalse(
             "Contents" in response or len(response.get("Contents", [])) > 0
         )
+
+    def test_cleanup_chunked_s3(self):
+        """Test if cleanup removes files from S3 that are no longer in the manifest."""
+        chunk_size = self.versioner.chunk_size
+        self.versioner.chunk_size = 4
+        try:
+            # Upload the file first
+            self.versioner.upload(self.test_file)
+            file_hash = self.versioner.hash_file(self.test_file)
+
+            # Remove file entry from manifest to simulate a stale object
+            del self.versioner.manifest["files"][self.test_file]
+            self.versioner.save_manifest()
+
+            # Cleanup should remove it from S3
+            self.versioner.cleanup_s3(force=True)
+
+            s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+            response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
+
+            # Ensure object was deleted (no contents in the response)
+            self.assertFalse(
+                "Contents" in response or len(response.get("Contents", [])) > 0
+            )
+        finally:
+            # Reset chunk size to default
+            self.versioner.chunk_size = chunk_size
 
     # -------------------------------------------------
     # 6. Parallel Upload/Download
