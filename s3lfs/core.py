@@ -66,6 +66,7 @@ class S3LFS:
         encryption=True,
         no_sign_request=False,
         temp_dir=None,
+        chunk_size=5 * 1024 * 1024 * 1024,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -75,6 +76,8 @@ class S3LFS:
         :param no_sign_request: If True, use unsigned requests
         :param temp_dir: Path to the temporary directory for compression/decompression
         """
+        self.chunk_size = chunk_size
+
         # Set the temporary directory to the base of the repository if not provided
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
@@ -382,29 +385,45 @@ class S3LFS:
 
         file_hash = self.hash_file(file_path)
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
+        s3_chunked_key = f"{s3_key}.chunk0"
 
-        if not self.file_exists_in_s3(s3_key) or (
-            file_path.as_posix() not in self.manifest["files"]
-        ):
+        if not (
+            self.file_exists_in_s3(s3_key) or self.file_exists_in_s3(s3_chunked_key)
+        ) or (file_path.as_posix() not in self.manifest["files"]):
             extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
             compressed_path = self.compress_file(file_path)
-            try:
-                if not silence:
-                    print(f"Uploading {file_path}")
-                self._get_s3_client().upload_file(
-                    compressed_path,
-                    self.bucket_name,
-                    s3_key,
-                    ExtraArgs=extra_args,
-                    Config=self.config,
-                )
-                if not silence:
-                    print(f"{file_path} uploaded")
-            finally:
+
+            chunked = False
+            if compressed_path.stat().st_size > self.chunk_size:
+                paths = self.split_file(compressed_path)
+                chunked = True
+            else:
+                paths = [compressed_path]
+
+            for chunk_idx, path in enumerate(paths):
                 try:
-                    os.remove(compressed_path)
-                except OSError:
-                    pass
+                    if not silence:
+                        print(f"Uploading {path}")
+                    self._get_s3_client().upload_file(
+                        path,
+                        self.bucket_name,
+                        s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
+                        ExtraArgs=extra_args,
+                        Config=self.config,
+                    )
+                    if not silence:
+                        print(f"{path} uploaded")
+                finally:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+            print(f"Compressed file removed: {compressed_path}")
+            try:
+                os.remove(compressed_path)  # Ensure temp file is deleted
+            except OSError:
+                pass
 
             # Store file path as key, hash as value
             if needs_immediate_update:
@@ -515,23 +534,50 @@ class S3LFS:
 
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
 
-        try:
-            os.makedirs(os.path.dirname(compressed_path), exist_ok=True)
-            self._get_s3_client().download_file(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                Filename=str(compressed_path),
-                Config=self.config,
-            )
-            if os.path.dirname(file_path):
-                os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            self.decompress_file(compressed_path, file_path)
-            os.remove(compressed_path)  # Ensure temp file is deleted
-            if not silence:
-                print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+        chunk_keys = self._get_s3_client().list_objects_v2(
+            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
+        )
+        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
+        chunk_keys_sorted = []
+        for i in range(len(chunk_keys)):
+            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
+        chunk_keys = chunk_keys_sorted
 
-        except Exception as e:
-            print(f"❌ Error downloading {file_path}: {e}")
+        if chunk_keys:
+            keys = chunk_keys
+        else:
+            keys = [s3_key]
+
+        base_directrory = os.path.dirname(compressed_path)
+        os.makedirs(base_directrory, exist_ok=True)
+
+        target_paths = []
+        for key in keys:
+            try:
+                target_path = os.path.join(base_directrory, os.path.basename(key))
+                target_paths.append(target_path)
+                self._get_s3_client().download_file(
+                    Bucket=self.bucket_name,
+                    Key=key,
+                    Filename=target_path,
+                    Config=self.config,
+                )
+            except Exception as e:
+                print(f"❌ Error downloading {key}: {e}")
+
+        if chunk_keys:
+            compressed_path = self.merge_files(compressed_path, target_paths)
+            for path in target_paths:
+                os.remove(path)
+        else:
+            compressed_path = os.path.join(base_directrory, os.path.basename(s3_key))
+
+        if os.path.dirname(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        self.decompress_file(compressed_path, file_path)
+        os.remove(compressed_path)  # Ensure temp file is deleted
+        if not silence:
+            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
 
     def remove_file(self, file_path, keep_in_s3=True):
         """
@@ -1005,3 +1051,45 @@ class S3LFS:
             print("\n⚠️ Download interrupted by user.")
         finally:
             print(f"✅ Successfully checked out files for '{path}'.")
+
+    def merge_files(self, output_path, chunk_paths):
+        """
+        Merge multiple chunk files into a single file.
+
+        :param output_path: Path to the output file.
+        :param chunk_paths: List of chunk file paths to merge.
+        :return: Path to the merged file.
+        """
+        with open(output_path, "wb") as output_file:
+            for chunk_path in chunk_paths:
+                with open(chunk_path, "rb") as chunk_file:
+                    shutil.copyfileobj(chunk_file, output_file)
+
+        return output_path
+
+    def split_file(self, file_path):
+        """
+        Split a file into smaller chunks.
+
+        :param file_path: Path to the file to split.
+        :param chunk_size: Size of each chunk in bytes (default: 5 GB).
+        :return: List of chunk file paths.
+        """
+        file_path = Path(file_path)
+        chunk_paths = []
+
+        with open(file_path, "rb") as f:
+            chunk_index = 0
+            while True:
+                chunk_data = f.read(self.chunk_size)
+                if not chunk_data:
+                    break
+
+                chunk_path = file_path.with_suffix(f".chunk{chunk_index}")
+                with open(chunk_path, "wb") as chunk_file:
+                    chunk_file.write(chunk_data)
+
+                chunk_paths.append(chunk_path)
+                chunk_index += 1
+
+        return chunk_paths
