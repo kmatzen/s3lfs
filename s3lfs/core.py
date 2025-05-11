@@ -67,6 +67,7 @@ class S3LFS:
         no_sign_request=False,
         temp_dir=None,
         chunk_size=5 * 1024 * 1024 * 1024,
+        s3_factory=None,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -75,8 +76,21 @@ class S3LFS:
         :param encryption: If True, use AES256 server-side encryption
         :param no_sign_request: If True, use unsigned requests
         :param temp_dir: Path to the temporary directory for compression/decompression
+        :param chunk_size: Size of chunks for multipart uploads (default: 5 GB)
+        :param s3_factory: Custom S3 client factory function (for testing)
         """
         self.chunk_size = chunk_size
+        self.s3_factory = (
+            (
+                lambda no_sign_request: boto3.session.Session().client(
+                    "s3", config=boto3.session.Config(signature_version=UNSIGNED)
+                )
+                if no_sign_request
+                else boto3.session.Session().client("s3")
+            )
+            if s3_factory is None
+            else s3_factory
+        )
 
         # Set the temporary directory to the base of the repository if not provided
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
@@ -145,15 +159,8 @@ class S3LFS:
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
         if not hasattr(self.thread_local, "s3"):
-            session = boto3.session.Session()
             try:
-                if self.no_sign_request:
-                    self.thread_local.s3 = session.client(
-                        "s3", config=boto3.session.Config(signature_version=UNSIGNED)
-                    )
-                else:
-                    self.thread_local.s3 = session.client("s3")
-
+                self.thread_local.s3 = self.s3_factory(self.no_sign_request)
             except NoCredentialsError:
                 raise RuntimeError(
                     "AWS credentials are missing. Please configure them or use --no-sign-request."
@@ -930,12 +937,13 @@ class S3LFS:
                 ):
                     if self._shutdown_requested:
                         print("⚠️ Shutdown requested. Cancelling remaining uploads...")
-                        break
+                        return
 
                     try:
                         future.result()  # Will re-raise exceptions from the worker thread
                     except Exception as e:
                         print(f"An error occurred during upload: {e}")
+                        raise
 
         except KeyboardInterrupt:
             print("\n⚠️ Upload interrupted by user.")

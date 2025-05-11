@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import boto3
+from botocore.exceptions import ClientError
 from moto import mock_s3
 
 from s3lfs import S3LFS
@@ -434,6 +435,64 @@ class TestS3LFS(unittest.TestCase):
         # Check that the file was uploaded to S3
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertTrue("Contents" in response and len(response["Contents"]) == 1)
+
+    @mock_s3
+    def test_incorrect_credentials(self):
+        """Test behavior when incorrect credentials are provided."""
+        # Mock the upload_file method to raise a ClientError
+        with patch("boto3.client") as mock_boto_client:
+            mock_s3_client = MagicMock()
+            mock_s3_client.upload_file.side_effect = ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "InvalidAccessKeyId",
+                        "Message": "The AWS Access Key Id you provided does not exist in our records.",
+                    }
+                },
+                operation_name="UploadFile",
+            )
+            mock_boto_client.return_value = mock_s3_client
+
+            # Create an S3LFS instance with the mocked client
+            versioner = S3LFS(
+                bucket_name=self.bucket_name, s3_factory=lambda _: mock_s3_client
+            )
+
+            # Attempt to upload a file
+            with self.assertRaises(ClientError) as context:
+                versioner.upload(self.test_file)
+
+            # Verify the error is related to authentication
+            self.assertIn("InvalidAccessKeyId", str(context.exception))
+
+    @mock_s3
+    def test_incorrect_credentials_parallel(self):
+        """Test behavior when incorrect credentials are provided."""
+        # Mock the upload_file method to raise a ClientError
+        with patch("boto3.client") as mock_boto_client:
+            mock_s3_client = MagicMock()
+            mock_s3_client.upload_file.side_effect = ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "InvalidAccessKeyId",
+                        "Message": "The AWS Access Key Id you provided does not exist in our records.",
+                    }
+                },
+                operation_name="UploadFile",
+            )
+            mock_boto_client.return_value = mock_s3_client
+
+            # Create an S3LFS instance with the mocked client
+            versioner = S3LFS(
+                bucket_name=self.bucket_name, s3_factory=lambda _: mock_s3_client
+            )
+
+            # Attempt to upload a file
+            with self.assertRaises(ClientError) as context:
+                versioner.track(self.test_file)
+
+            # Verify the error is related to authentication
+            self.assertIn("InvalidAccessKeyId", str(context.exception))
 
 
 if __name__ == "__main__":
