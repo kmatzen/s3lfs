@@ -943,7 +943,7 @@ class S3LFS:
                         future.result()  # Will re-raise exceptions from the worker thread
                     except Exception as e:
                         print(f"An error occurred during upload: {e}")
-                        return
+                        raise
 
         except KeyboardInterrupt:
             print("\n⚠️ Upload interrupted by user.")
