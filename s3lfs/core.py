@@ -426,7 +426,8 @@ class S3LFS:
                     except OSError:
                         pass
 
-            print(f"Compressed file removed: {compressed_path}")
+            if not silence:
+                print(f"Compressed file removed: {compressed_path}")
             try:
                 os.remove(compressed_path)  # Ensure temp file is deleted
             except OSError:
