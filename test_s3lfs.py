@@ -442,7 +442,7 @@ class TestS3LFS(unittest.TestCase):
         # Mock the upload_file method to raise a ClientError
         with patch("boto3.client") as mock_boto_client:
             mock_s3_client = MagicMock()
-            mock_s3_client.upload_file.side_effect = ClientError(
+            mock_s3_client.upload_fileobj.side_effect = ClientError(
                 error_response={
                     "Error": {
                         "Code": "InvalidAccessKeyId",
@@ -471,7 +471,7 @@ class TestS3LFS(unittest.TestCase):
         # Mock the upload_file method to raise a ClientError
         with patch("boto3.client") as mock_boto_client:
             mock_s3_client = MagicMock()
-            mock_s3_client.upload_file.side_effect = ClientError(
+            mock_s3_client.upload_fileobj.side_effect = ClientError(
                 error_response={
                     "Error": {
                         "Code": "InvalidAccessKeyId",
