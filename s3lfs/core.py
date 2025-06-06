@@ -1101,7 +1101,7 @@ class S3LFS:
         for file in files_to_checkout.keys():
             if not Path(file).exists():
                 files_to_download.append(file)
-            elif file_hashes.get(file) != files_to_checkout[file] or True:
+            elif file_hashes.get(file) != files_to_checkout[file]:
                 files_to_download.append(file)
 
         if not files_to_download:
