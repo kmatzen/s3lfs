@@ -171,4 +171,3 @@ MIT License
 
 ## Contributing
 Pull requests are welcome! Please submit issues and suggestions via GitHub.
-

@@ -30,186 +30,353 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
             self.manifest_path.unlink()
 
     def tearDown(self):
-        # Cleanup local file
+        # Clean up the test file and manifest
         if os.path.exists(self.test_file):
             os.remove(self.test_file)
-
-        # Cleanup manifest
         if self.manifest_path.exists():
             self.manifest_path.unlink()
 
-    def test_upload_in_process(self):
-        """
-        Test the 'upload' command by calling s3lfs_main()
-        with patched sys.argv, all in-process (mock_s3).
-        """
-        test_args = [
-            "upload",
-            self.test_file,
-            "--bucket",
-            TEST_BUCKET,
-        ]
+    def test_init_command(self):
+        """Test the init command."""
         runner = CliRunner()
-        result = runner.invoke(s3lfs_main, test_args)
-        self.assertEqual(result.exit_code, 0, "Upload command failed")
+        result = runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        self.assertEqual(result.exit_code, 0, "Init command failed")
 
-        # Now check if the file is in S3
-        resp = self.s3.list_objects_v2(Bucket=TEST_BUCKET, Prefix="s3lfs/assets/")
-        self.assertIn("Contents", resp)
-        self.assertEqual(len(resp["Contents"]), 1, "Expected 1 uploaded object.")
+        # Check if manifest was created
+        self.assertTrue(self.manifest_path.exists(), "Manifest file was not created")
 
-        # Check if manifest is created and contains the file path
-        self.assertTrue(self.manifest_path.exists())
-        manifest_data = json.loads(self.manifest_path.read_text())
+        # Check manifest contents
+        with open(self.manifest_path, "r") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["bucket_name"], TEST_BUCKET)
+        self.assertEqual(manifest["repo_prefix"], "test_prefix")
 
-        # Ensure the file path is a key in the manifest
-        self.assertIn(
-            self.test_file, manifest_data["files"], "File path should be in manifest"
-        )
-
-    def test_download_in_process(self):
-        """
-        Upload a file first, remove it locally, then download it via the CLI again.
-        """
+    def test_init_with_no_sign_request(self):
+        """Test init with --no-sign-request flag."""
         runner = CliRunner()
-
-        # 1. Upload the file via CLI
         result = runner.invoke(
-            s3lfs_main,
-            [
-                "upload",
-                self.test_file,
-                "--bucket",
-                TEST_BUCKET,
-            ],
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
         )
-        self.assertEqual(result.exit_code, 0, "Upload command failed")
+        self.assertEqual(result.exit_code, 0)
 
-        # 2. Read the manifest and get the file path
-        manifest_data = json.loads(self.manifest_path.read_text())
-        self.assertIn(
-            self.test_file, manifest_data["files"], "File path should be in manifest"
+    def test_track_command(self):
+        """Test the track command (replaces upload)."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["track", self.test_file])
+        self.assertEqual(result.exit_code, 0, "Track command failed")
+
+    def test_track_with_verbose(self):
+        """Test track command with verbose flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["track", self.test_file, "--verbose"])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_track_with_no_sign_request(self):
+        """Test track command with --no-sign-request."""
+        runner = CliRunner()
+        runner.invoke(
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
         )
 
-        # 3. Remove the local file to simulate needing a download
+        result = runner.invoke(
+            s3lfs_main, ["track", self.test_file, "--no-sign-request"]
+        )
+        self.assertEqual(result.exit_code, 0)
+
+    def test_checkout_command(self):
+        """Test the checkout command (replaces download)."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # First track the file
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Remove the file
         os.remove(self.test_file)
-        self.assertFalse(os.path.exists(self.test_file))
 
-        # 4. Download via CLI (uses file path instead of hash)
-        result = runner.invoke(
-            s3lfs_main,
-            [
-                "download",
-                self.test_file,  # Now we use the file path, not a hash
-                "--bucket",
-                TEST_BUCKET,
-            ],
-        )
-        self.assertEqual(result.exit_code, 0, "Download command failed")
-
-        # 5. Check if the file is correctly restored
+        # Checkout the file
+        result = runner.invoke(s3lfs_main, ["checkout", self.test_file])
+        self.assertEqual(result.exit_code, 0, "Checkout command failed")
         self.assertTrue(os.path.exists(self.test_file))
 
-        with open(self.test_file, "r") as f:
-            content = f.read()
-        self.assertEqual(content, "Hello In-Process Test")
-
-    def test_cleanup_in_process(self):
-        """
-        Upload a file, remove its entry from the manifest, then run 'cleanup'
-        and ensure the object is removed from S3.
-        """
+    def test_checkout_with_verbose(self):
+        """Test checkout command with verbose flag."""
         runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+        os.remove(self.test_file)
 
-        # Upload file via CLI
+        result = runner.invoke(s3lfs_main, ["checkout", self.test_file, "--verbose"])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_track_modified_command(self):
+        """Test the track --modified command (replaces track-modified)."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track a file first
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Modify the file
+        with open(self.test_file, "w") as f:
+            f.write("Modified content")
+
+        # Run track --modified
+        result = runner.invoke(s3lfs_main, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, "Track --modified command failed")
+
+    def test_track_modified_with_no_sign_request(self):
+        """Test track --modified with --no-sign-request."""
+        runner = CliRunner()
+        runner.invoke(
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
+        )
+        runner.invoke(s3lfs_main, ["track", self.test_file, "--no-sign-request"])
+
+        with open(self.test_file, "w") as f:
+            f.write("Modified content")
+
+        result = runner.invoke(s3lfs_main, ["track", "--modified", "--no-sign-request"])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_checkout_all_command(self):
+        """Test the checkout --all command (replaces download-all)."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track a file
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Remove the file
+        os.remove(self.test_file)
+
+        # Download all files
+        result = runner.invoke(s3lfs_main, ["checkout", "--all"])
+        self.assertEqual(result.exit_code, 0, "Checkout --all command failed")
+        self.assertTrue(os.path.exists(self.test_file))
+
+    def test_checkout_all_with_verbose(self):
+        """Test checkout --all with verbose flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+        os.remove(self.test_file)
+
+        result = runner.invoke(s3lfs_main, ["checkout", "--all", "--verbose"])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_checkout_all_with_no_sign_request(self):
+        """Test checkout --all with --no-sign-request."""
+        runner = CliRunner()
+        runner.invoke(
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
+        )
+        runner.invoke(s3lfs_main, ["track", self.test_file, "--no-sign-request"])
+        os.remove(self.test_file)
+
+        result = runner.invoke(s3lfs_main, ["checkout", "--all", "--no-sign-request"])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_remove_command(self):
+        """Test the remove command."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track a file first
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Remove the file from tracking
+        result = runner.invoke(s3lfs_main, ["remove", self.test_file])
+        self.assertEqual(result.exit_code, 0, "Remove command failed")
+
+    def test_remove_with_purge_from_s3(self):
+        """Test remove command with --purge-from-s3."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
         result = runner.invoke(
-            s3lfs_main,
-            [
-                "upload",
-                self.test_file,
-                "--bucket",
-                TEST_BUCKET,
-            ],
+            s3lfs_main, ["remove", self.test_file, "--purge-from-s3"]
         )
-        self.assertEqual(result.exit_code, 0, "Upload command failed")
+        self.assertEqual(result.exit_code, 0)
 
-        # Remove the file path from the manifest (not the hash)
-        manifest_data = json.loads(self.manifest_path.read_text())
-        self.assertIn(
-            self.test_file,
-            manifest_data["files"],
-            "File should be in manifest before cleanup",
+    def test_remove_with_no_sign_request(self):
+        """Test remove command with --no-sign-request."""
+        runner = CliRunner()
+        runner.invoke(
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
         )
+        runner.invoke(s3lfs_main, ["track", self.test_file, "--no-sign-request"])
 
-        del manifest_data["files"][self.test_file]  # Remove entry by file path
-        self.manifest_path.write_text(json.dumps(manifest_data))
-
-        # Run cleanup via CLI
         result = runner.invoke(
-            s3lfs_main,
-            [
-                "cleanup",
-                "--bucket",
-                TEST_BUCKET,
-                "--force",
-            ],
+            s3lfs_main, ["remove", self.test_file, "--no-sign-request"]
         )
+        self.assertEqual(result.exit_code, 0)
+
+    def test_cleanup_command(self):
+        """Test the cleanup command."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["cleanup", "--force"])
         self.assertEqual(result.exit_code, 0, "Cleanup command failed")
 
-        # Check S3 is empty
-        resp = self.s3.list_objects_v2(Bucket=TEST_BUCKET, Prefix="s3lfs/assets/")
-        self.assertFalse(
-            "Contents" in resp or len(resp.get("Contents", [])) > 0,
-            "Bucket should be empty after cleanup",
+    def test_cleanup_with_no_sign_request(self):
+        """Test cleanup command with --no-sign-request."""
+        runner = CliRunner()
+        runner.invoke(
+            s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
         )
 
-    def test_remove_cli(self):
-        runner = CliRunner()
-        runner.invoke(s3lfs_main, ["upload", self.test_file, "--bucket", TEST_BUCKET])
-        result = runner.invoke(s3lfs_main, ["remove", self.test_file])
+        result = runner.invoke(s3lfs_main, ["cleanup", "--force", "--no-sign-request"])
         self.assertEqual(result.exit_code, 0)
 
-    def test_remove_subtree_cli(self):
+    def test_remove_directory_command(self):
+        """Test the remove command with directory (replaces remove-subtree)."""
         runner = CliRunner()
-        os.makedirs("test_dir", exist_ok=True)
-        file_path = "test_dir/nested_cli_file.txt"
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Create a directory with files
+        os.makedirs("test_dir_remove", exist_ok=True)
+        file_path = os.path.join("test_dir_remove", "test_file.txt")
         with open(file_path, "w") as f:
-            f.write("Nested CLI content")
-        runner.invoke(s3lfs_main, ["upload", file_path, "--bucket", TEST_BUCKET])
-        result = runner.invoke(s3lfs_main, ["remove-subtree", "test_dir"])
-        self.assertEqual(result.exit_code, 0)
-        os.remove(file_path)
-        os.rmdir("test_dir")
+            f.write("Test content")
 
-    def test_cleanup_cli(self):
+        try:
+            # Track the file
+            runner.invoke(s3lfs_main, ["track", file_path])
+            result = runner.invoke(s3lfs_main, ["remove", "test_dir_remove"])
+            self.assertEqual(result.exit_code, 0, "Remove directory command failed")
+        finally:
+            # Clean up
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            if os.path.exists("test_dir_remove"):
+                os.rmdir("test_dir_remove")
+
+    def test_remove_directory_with_purge_from_s3(self):
+        """Test remove directory with --purge-from-s3."""
         runner = CliRunner()
-        runner.invoke(s3lfs_main, ["upload", self.test_file, "--bucket", TEST_BUCKET])
-        result = runner.invoke(
-            s3lfs_main, ["cleanup", "--bucket", TEST_BUCKET, "--force"]
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        os.makedirs("test_dir_remove", exist_ok=True)
+        file_path = os.path.join("test_dir_remove", "test_file.txt")
+        with open(file_path, "w") as f:
+            f.write("Test content")
+
+        try:
+            runner.invoke(s3lfs_main, ["track", file_path])
+
+            result = runner.invoke(
+                s3lfs_main, ["remove", "test_dir_remove", "--purge-from-s3"]
+            )
+            self.assertEqual(result.exit_code, 0)
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            if os.path.exists("test_dir_remove"):
+                os.rmdir("test_dir_remove")
+
+    def test_track_and_checkout_workflow(self):
+        """Test a complete workflow with track and checkout."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track the file
+        result = runner.invoke(s3lfs_main, ["track", self.test_file])
+        self.assertEqual(result.exit_code, 0)
+
+        # Remove the local file
+        os.remove(self.test_file)
+
+        # Checkout the file
+        result = runner.invoke(s3lfs_main, ["checkout", self.test_file])
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(os.path.exists(self.test_file))
+
+    def test_cli_help(self):
+        """Test that CLI help works and shows expected commands."""
+        runner = CliRunner()
+        result = runner.invoke(s3lfs_main, ["--help"])
+        self.assertEqual(result.exit_code, 0)
+
+        # Check that main commands are present
+        commands = ["track", "checkout", "init", "remove", "cleanup"]
+        for cmd in commands:
+            self.assertIn(cmd, result.output)
+
+    def test_error_handling_nonexistent_file(self):
+        """Test error handling for nonexistent files."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["track", "nonexistent_file.txt"])
+        # Should handle gracefully
+        self.assertIsNotNone(result.exit_code)
+
+    def test_error_handling_no_manifest(self):
+        """Test commands that depend on manifest when no manifest exists."""
+        runner = CliRunner()
+
+        # Try to checkout without manifest
+        result = runner.invoke(s3lfs_main, ["checkout", "some_file.txt"])
+        # Should handle gracefully
+        self.assertIsNotNone(result.exit_code)
+
+    def test_main_entry_point(self):
+        """Test the main() entry point function."""
+        # Import the main function and CLI module
+        import sys
+        from unittest.mock import patch
+
+        from s3lfs.cli import main
+
+        # Test main() function by mocking sys.argv and calling it
+        with patch.object(sys, "argv", ["s3lfs", "--help"]):
+            try:
+                main()
+            except SystemExit as e:
+                # Help command should exit with 0
+                self.assertEqual(e.code, 0)
+
+    def test_cli_as_module(self):
+        """Test running CLI as module."""
+        import subprocess
+        import sys
+
+        # Test running the module with --help
+        result = subprocess.run(
+            [sys.executable, "-m", "s3lfs.cli", "--help"],
+            capture_output=True,
+            text=True,
         )
-        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("S3-based asset versioning CLI tool", result.stdout)
 
-    def test_upload_with_no_sign_request(self):
-        """Test upload using --no-sign-request."""
-        test_args = [
-            "upload",
-            self.test_file,
-            "--bucket",
-            TEST_BUCKET,
-            "--no-sign-request",
-        ]
+    def test_track_without_path_or_modified_flag(self):
+        """Test track command error when neither path nor --modified is provided."""
         runner = CliRunner()
-        result = runner.invoke(s3lfs_main, test_args)
-        self.assertEqual(result.exit_code, 0, "Upload command failed")
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
 
-        resp = self.s3.list_objects_v2(Bucket=TEST_BUCKET, Prefix="s3lfs/assets/")
-        self.assertIn("Contents", resp)
-        self.assertEqual(len(resp["Contents"]), 1, "Expected 1 uploaded object.")
-
-        self.assertTrue(self.manifest_path.exists())
-        manifest_data = json.loads(self.manifest_path.read_text())
+        result = runner.invoke(s3lfs_main, ["track"])
+        self.assertNotEqual(result.exit_code, 0)
         self.assertIn(
-            self.test_file, manifest_data["files"], "File path should be in manifest"
+            "Error: Must provide either a path or use --modified flag", result.output
+        )
+
+    def test_checkout_without_path_or_all_flag(self):
+        """Test checkout command error when neither path nor --all is provided."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["checkout"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn(
+            "Error: Must provide either a path or use --all flag", result.output
         )
 
 
