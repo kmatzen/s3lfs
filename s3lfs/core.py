@@ -313,6 +313,91 @@ class S3LFS:
         )
         return result.stdout.split()[0]  # Extract the hash from the output
 
+    def md5_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
+        """
+        Compute an MD5 hash of the file using its content.
+        Supports multiple hashing methods for performance optimization.
+
+        :param file_path: Path to the file to hash.
+        :param method: Hashing method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "mmap": Use memory-mapped files (default for non-empty files).
+                    - "iter": Use an iterative read approach (fallback for empty files).
+                    - "cli": Use the `md5sum` CLI utility (POSIX only).
+        :return: The computed MD5 hash as a hexadecimal string.
+        """
+        file_path = Path(file_path)
+
+        # Ensure the file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if file_path.stat().st_size == 0:  # Empty file
+                method = "iter"
+            elif sys.platform.startswith("linux") and shutil.which("md5sum"):
+                method = "cli"
+            elif sys.platform.startswith("darwin") and shutil.which("md5"):
+                method = "cli"
+            else:
+                method = "mmap"
+
+        # Use the selected hashing method
+        if method == "mmap":
+            return self._md5_file_mmap(file_path)
+        elif method == "iter":
+            return self._md5_file_iter(file_path)
+        elif method == "cli":
+            return self._md5_file_cli(file_path)
+        else:
+            raise ValueError(f"Unsupported MD5 hashing method: {method}")
+
+    def _md5_file_mmap(self, file_path):
+        """
+        Compute the MD5 hash using memory-mapped files.
+        """
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                hasher.update(mm)
+        return hasher.hexdigest()
+
+    def _md5_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
+        """
+        Compute the MD5 hash by iteratively reading the file in chunks.
+        """
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _md5_file_cli(self, file_path):
+        """
+        Compute the MD5 hash using the appropriate CLI utility (md5sum on Linux, md5 on macOS).
+        """
+        if sys.platform.startswith("linux") and shutil.which("md5sum"):
+            # Linux: use md5sum
+            result = subprocess.run(
+                ["md5sum", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.split()[0]  # Extract the hash from the output
+        elif sys.platform.startswith("darwin") and shutil.which("md5"):
+            # macOS: use md5 -r (for raw output similar to md5sum)
+            result = subprocess.run(
+                ["md5", "-r", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.split()[0]  # Extract the hash from the output
+        else:
+            raise RuntimeError("No suitable MD5 CLI utility found (md5sum or md5)")
+
     def compress_file(self, file_path, method="auto"):
         """
         Compress the file using gzip and return the path of the compressed file in the temp directory.
@@ -379,22 +464,78 @@ class S3LFS:
 
         return compressed_path
 
-    def file_exists_in_s3(self, s3_key):
-        """Check if a file exists in the S3 bucket."""
-        try:
-            self._get_s3_client().head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                return False
-            raise
+    def decompress_file(self, compressed_path, output_path=None, method="auto"):
+        """
+        Decompress a file using gzip and return the path of the decompressed file.
 
-    def get_git_commit(self):
-        """Retrieve the current Git commit hash to use for tagging in S3."""
+        :param compressed_path: Path to the compressed file.
+        :param output_path: Path to save the decompressed file. If None, use the same name without the `.gz` extension.
+        :param method: Decompression method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "python": Use Python's gzip module (default).
+                    - "cli": Use the `gzip` CLI utility (POSIX only).
+        :return: The path to the decompressed file.
+        """
+        compressed_path = Path(compressed_path)
+
+        # Ensure the compressed file exists
+        if not compressed_path.exists():
+            raise FileNotFoundError(f"Compressed file not found: {compressed_path}")
+
+        # Determine the output path
+        if output_path is None:
+            output_path = compressed_path.with_suffix("")  # Remove the `.gz` extension
+        output_path = Path(output_path)
+
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if sys.platform.startswith("linux") and shutil.which("gzip"):
+                method = "cli"
+            else:
+                method = "python"
+
+        # Use the selected decompression method
+        if method == "python":
+            return self._decompress_file_python(compressed_path, output_path)
+        elif method == "cli":
+            return self._decompress_file_cli(compressed_path, output_path)
+        else:
+            raise ValueError(f"Unsupported decompression method: {method}")
+
+    def _decompress_file_python(self, compressed_path, output_path):
+        """
+        Decompress the file using Python's gzip module and save it to the output path.
+        """
+        with gzip.open(compressed_path, "rb") as f_in:
+            with open(output_path, "wb") as f_out:
+                # Use manual chunked copy to avoid type issues
+                while True:
+                    chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                    if not chunk:
+                        break
+                    # Ensure we have bytes for writing
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    f_out.write(chunk)
+
+        return output_path
+
+    def _decompress_file_cli(self, compressed_path, output_path):
+        """
+        Decompress the file using the `gzip` CLI utility and save it to the output path.
+        """
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+            ["gzip", "-d", "-c", str(compressed_path)],
+            stdout=open(output_path, "wb"),
+            check=True,
         )
-        return result.stdout.strip()
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to decompress file using gzip CLI: {compressed_path}"
+            )
+
+        return output_path
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def upload(
@@ -518,181 +659,6 @@ class S3LFS:
                 self.save_manifest()
         if not silence:
             print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
-
-    def decompress_file(self, compressed_path, output_path=None, method="auto"):
-        """
-        Decompress a file using gzip and return the path of the decompressed file.
-
-        :param compressed_path: Path to the compressed file.
-        :param output_path: Path to save the decompressed file. If None, use the same name without the `.gz` extension.
-        :param method: Decompression method to use. Options are:
-                    - "auto": Automatically select the best method.
-                    - "python": Use Python's gzip module (default).
-                    - "cli": Use the `gzip` CLI utility (POSIX only).
-        :return: The path to the decompressed file.
-        """
-        compressed_path = Path(compressed_path)
-
-        # Ensure the compressed file exists
-        if not compressed_path.exists():
-            raise FileNotFoundError(f"Compressed file not found: {compressed_path}")
-
-        # Determine the output path
-        if output_path is None:
-            output_path = compressed_path.with_suffix("")  # Remove the `.gz` extension
-        output_path = Path(output_path)
-
-        # Automatically select the best method if "auto" is specified
-        if method == "auto":
-            if sys.platform.startswith("linux") and shutil.which("gzip"):
-                method = "cli"
-            else:
-                method = "python"
-
-        # Use the selected decompression method
-        if method == "python":
-            return self._decompress_file_python(compressed_path, output_path)
-        elif method == "cli":
-            return self._decompress_file_cli(compressed_path, output_path)
-        else:
-            raise ValueError(f"Unsupported decompression method: {method}")
-
-    def _decompress_file_python(self, compressed_path, output_path):
-        """
-        Decompress the file using Python's gzip module and save it to the output path.
-        """
-        with gzip.open(compressed_path, "rb") as f_in:
-            with open(output_path, "wb") as f_out:
-                # Use manual chunked copy to avoid type issues
-                while True:
-                    chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
-                    if not chunk:
-                        break
-                    # Ensure we have bytes for writing
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8")
-                    f_out.write(chunk)
-
-        return output_path
-
-    def _decompress_file_cli(self, compressed_path, output_path):
-        """
-        Decompress the file using the `gzip` CLI utility and save it to the output path.
-        """
-        result = subprocess.run(
-            ["gzip", "-d", "-c", str(compressed_path)],
-            stdout=open(output_path, "wb"),
-            check=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to decompress file using gzip CLI: {compressed_path}"
-            )
-
-        return output_path
-
-    @retry(3, (BotoCoreError, ClientError, SSLError))
-    def download(
-        self,
-        file_path: Union[str, Path],
-        silence: bool = False,
-        progress_callback: Optional[Callable[[int], None]] = None,
-    ) -> Optional[int]:
-        """
-        Download a file from S3 by its recorded hash, but skip if it already exists and matches.
-        """
-        file_path = Path(file_path)
-
-        # Get the expected hash for the file
-        with self._lock_context():
-            expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
-        if not expected_hash:
-            print(f"⚠️ File '{file_path}' is not in the manifest.")
-            return None
-
-        # If the file exists, check its hash
-        if not silence:
-            print(f"file_path exists?: {file_path.exists()}")
-        if file_path.exists():
-            current_hash = self.hash_file(file_path)
-            if not silence:
-                print(f"current_hash: {current_hash}")
-                print(f"expected_hash: {expected_hash}")
-            if current_hash == expected_hash:
-                if not silence:
-                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
-                return 0  # Skip download if hashes match
-
-        # Proceed with download if file is missing or different
-        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
-
-        compressed_path = self.temp_dir / f"{uuid4()}.gz"
-
-        chunk_keys = self._get_s3_client().list_objects_v2(
-            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
-        )
-        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
-        chunk_keys_sorted = []
-        for i in range(len(chunk_keys)):
-            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
-        chunk_keys = chunk_keys_sorted
-
-        if chunk_keys:
-            keys = chunk_keys
-        else:
-            keys = [s3_key]
-
-        base_directrory = os.path.dirname(compressed_path)
-        os.makedirs(base_directrory, exist_ok=True)
-
-        target_paths = []
-        for idx, key in enumerate(keys):
-            try:
-                target_path = self.temp_dir / f"{uuid4()}.gz"
-                target_paths.append(target_path)
-                obj = self._get_s3_client().head_object(
-                    Bucket=self.bucket_name, Key=key
-                )
-                file_size = obj["ContentLength"]
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(key)}",
-                    leave=False,
-                ) as progress_bar:
-                    print(f"Downloading {key} to {target_path}")
-                    with open(target_path, "wb") as f:
-                        self._get_s3_client().download_fileobj(
-                            Bucket=self.bucket_name,
-                            Key=key,
-                            Fileobj=f,
-                            Callback=progress_bar.update,
-                        )
-            except Exception as e:
-                print(f"❌ Error downloading {key}: {e}")
-
-        if chunk_keys:
-            compressed_path = self.merge_files(compressed_path, target_paths)
-            for path in target_paths:
-                os.remove(path)
-        else:
-            compressed_path = target_paths[0]
-
-        if os.path.dirname(file_path):
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        try:
-            self.decompress_file(compressed_path, file_path)
-        except Exception as e:
-            print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
-            raise
-        os.remove(compressed_path)  # Ensure temp file is deleted
-        if not silence:
-            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
-
-        # Return bytes transferred for progress tracking
-        return file_path.stat().st_size if file_path.exists() else 0
 
     def remove_file(self, file_path, keep_in_s3=True):
         """
@@ -884,34 +850,6 @@ class S3LFS:
             print("\n⚠️ Download interrupted by user.")
         finally:
             print("✅ All files downloaded.")
-
-    def integrate_with_git(self):
-        """
-        Set up Git hooks for a more seamless S3-based large file workflow.
-        """
-        hook_path = ".git/hooks/pre-commit"
-        new_command = "s3lfs track-modified\n"
-
-        # Ensure the hooks directory exists
-        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
-
-        # Check if the pre-commit hook already exists
-        if os.path.exists(hook_path):
-            with open(hook_path, "r") as f:
-                existing_content = f.readlines()
-
-            # Avoid duplicate entries
-            if new_command not in existing_content:
-                with open(hook_path, "a") as f:
-                    f.write("\n" + new_command)
-        else:
-            # Create a new pre-commit hook
-            with open(hook_path, "w") as f:
-                f.write("#!/bin/sh\n" + new_command)
-
-        # Ensure the hook is executable
-        os.chmod(hook_path, 0o755)
-        print("Git integration setup completed.")
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
@@ -1627,3 +1565,105 @@ class S3LFS:
             print(
                 f"✅ Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
             )
+
+    @retry(3, (BotoCoreError, ClientError, SSLError))
+    def download(
+        self,
+        file_path: Union[str, Path],
+        silence: bool = False,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> Optional[int]:
+        """
+        Download a file from S3 by its recorded hash, but skip if it already exists and matches.
+        """
+        file_path = Path(file_path)
+
+        # Get the expected hash for the file
+        with self._lock_context():
+            expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
+        if not expected_hash:
+            print(f"⚠️ File '{file_path}' is not in the manifest.")
+            return None
+
+        # If the file exists, check its hash
+        if not silence:
+            print(f"file_path exists?: {file_path.exists()}")
+        if file_path.exists():
+            current_hash = self.hash_file(file_path)
+            if not silence:
+                print(f"current_hash: {current_hash}")
+                print(f"expected_hash: {expected_hash}")
+            if current_hash == expected_hash:
+                if not silence:
+                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
+                return 0  # Skip download if hashes match
+
+        # Proceed with download if file is missing or different
+        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
+
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
+
+        chunk_keys = self._get_s3_client().list_objects_v2(
+            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
+        )
+        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
+        chunk_keys_sorted = []
+        for i in range(len(chunk_keys)):
+            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
+        chunk_keys = chunk_keys_sorted
+
+        if chunk_keys:
+            keys = chunk_keys
+        else:
+            keys = [s3_key]
+
+        base_directrory = os.path.dirname(compressed_path)
+        os.makedirs(base_directrory, exist_ok=True)
+
+        target_paths = []
+        for idx, key in enumerate(keys):
+            try:
+                target_path = self.temp_dir / f"{uuid4()}.gz"
+                target_paths.append(target_path)
+                obj = self._get_s3_client().head_object(
+                    Bucket=self.bucket_name, Key=key
+                )
+                file_size = obj["ContentLength"]
+                with tqdm(
+                    total=file_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=f"Downloading {os.path.basename(key)}",
+                    leave=False,
+                ) as progress_bar:
+                    print(f"Downloading {key} to {target_path}")
+                    with open(target_path, "wb") as f:
+                        self._get_s3_client().download_fileobj(
+                            Bucket=self.bucket_name,
+                            Key=key,
+                            Fileobj=f,
+                            Callback=progress_bar.update,
+                        )
+            except Exception as e:
+                print(f"❌ Error downloading {key}: {e}")
+
+        if chunk_keys:
+            compressed_path = self.merge_files(compressed_path, target_paths)
+            for path in target_paths:
+                os.remove(path)
+        else:
+            compressed_path = target_paths[0]
+
+        if os.path.dirname(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        try:
+            self.decompress_file(compressed_path, file_path)
+        except Exception as e:
+            print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
+            raise
+        os.remove(compressed_path)  # Ensure temp file is deleted
+        if not silence:
+            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+
+        # Return bytes transferred for progress tracking
+        return file_path.stat().st_size if file_path.exists() else 0

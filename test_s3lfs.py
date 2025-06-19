@@ -370,22 +370,6 @@ class TestS3LFS(unittest.TestCase):
         if os.path.exists(fourth_file):
             os.remove(fourth_file)
 
-    # -------------------------------------------------
-    # 12. Git Integration (basic test)
-    # -------------------------------------------------
-    @patch("subprocess.run")
-    def test_git_integration(self, mock_subproc):
-        """
-        Just ensure no exceptions occur. We won't deeply verify the git config calls.
-        """
-        mock_subproc.return_value = MagicMock(stdout="")
-
-        try:
-            self.versioner.integrate_with_git()
-        except Exception as e:
-            self.fail(f"git-integration raised an unexpected exception: {e}")
-        # If it runs without error, assume success.
-
     def test_remove_file_updates_manifest(self):
         self.versioner.remove_file(self.test_file, keep_in_s3=True)
         self.assertNotIn(self.test_file, self.versioner.manifest["files"])
@@ -508,7 +492,7 @@ class TestS3LFS(unittest.TestCase):
         files_created = []
 
         # Root level files
-        for fname in ["file1.txt", "file2.txt", "config.json", "readme.md"]:
+        for fname in ["file1.txt", "file2.txt", "config.json", "test_readme.md"]:
             with open(fname, "w") as f:
                 f.write(f"Content of {fname}")
             files_created.append(fname)
@@ -1486,6 +1470,109 @@ class TestS3LFS(unittest.TestCase):
                     len(completion_calls) > 0,
                     "Finally block completion message should be printed",
                 )
+
+    # -------------------------------------------------
+    # 17. MD5 Hashing Tests
+    # -------------------------------------------------
+    def test_md5_file_methods(self):
+        """Test all MD5 hashing methods produce the same result."""
+        # Test with the existing test file
+        md5_auto = self.versioner.md5_file(self.test_file, method="auto")
+        md5_mmap = self.versioner.md5_file(self.test_file, method="mmap")
+        md5_iter = self.versioner.md5_file(self.test_file, method="iter")
+
+        # All methods should produce the same hash
+        self.assertEqual(md5_auto, md5_mmap)
+        self.assertEqual(md5_auto, md5_iter)
+
+        # MD5 should be 32 characters long
+        self.assertEqual(len(md5_auto), 32)
+
+        # Should be valid hex
+        try:
+            int(md5_auto, 16)
+        except ValueError:
+            self.fail("MD5 hash is not valid hexadecimal")
+
+    def test_md5_cli_method(self):
+        """Test MD5 CLI method if available."""
+        try:
+            md5_cli = self.versioner.md5_file(self.test_file, method="cli")
+            md5_mmap = self.versioner.md5_file(self.test_file, method="mmap")
+
+            # CLI and mmap should produce the same result
+            self.assertEqual(md5_cli, md5_mmap)
+        except RuntimeError as e:
+            # CLI method not available on this system
+            self.assertIn("No suitable MD5 CLI utility found", str(e))
+
+    def test_md5_empty_file(self):
+        """Test MD5 of empty file."""
+        empty_file = "empty_test.txt"
+        try:
+            # Create empty file
+            with open(empty_file, "w") as _:
+                pass
+
+            md5_empty = self.versioner.md5_file(empty_file, method="auto")
+
+            # MD5 of empty file should be d41d8cd98f00b204e9800998ecf8427e
+            expected_empty_md5 = "d41d8cd98f00b204e9800998ecf8427e"
+            self.assertEqual(md5_empty, expected_empty_md5)
+
+        finally:
+            if os.path.exists(empty_file):
+                os.remove(empty_file)
+
+    def test_md5_vs_sha256(self):
+        """Test that MD5 and SHA-256 produce different hashes for the same file."""
+        md5_hash = self.versioner.md5_file(self.test_file)
+        sha256_hash = self.versioner.hash_file(self.test_file)
+
+        # Should be different algorithms producing different hashes
+        self.assertNotEqual(md5_hash, sha256_hash)
+
+        # Different lengths
+        self.assertEqual(len(md5_hash), 32)  # MD5 is 128 bits = 32 hex chars
+        self.assertEqual(len(sha256_hash), 64)  # SHA-256 is 256 bits = 64 hex chars
+
+    def test_md5_nonexistent_file(self):
+        """Test MD5 with non-existent file."""
+        with self.assertRaises(FileNotFoundError):
+            self.versioner.md5_file("nonexistent_file.txt")
+
+    def test_md5_invalid_method(self):
+        """Test MD5 with invalid method."""
+        with self.assertRaises(ValueError) as context:
+            self.versioner.md5_file(self.test_file, method="invalid")
+
+        self.assertIn("Unsupported MD5 hashing method", str(context.exception))
+
+    def test_md5_large_file_chunks(self):
+        """Test MD5 with iterative method on a larger file to test chunking."""
+        large_file = "large_test.txt"
+        try:
+            # Create a larger file (multiple chunks)
+            with open(large_file, "w") as f:
+                for i in range(1000):
+                    f.write(f"Line {i}: This is some test content for MD5 hashing.\n")
+
+            # Test iterative method with different chunk sizes
+            md5_iter_default = self.versioner._md5_file_iter(large_file)
+            md5_iter_small = self.versioner._md5_file_iter(large_file, chunk_size=64)
+            md5_iter_large = self.versioner._md5_file_iter(large_file, chunk_size=8192)
+
+            # All should produce the same result regardless of chunk size
+            self.assertEqual(md5_iter_default, md5_iter_small)
+            self.assertEqual(md5_iter_default, md5_iter_large)
+
+            # Should match mmap method too
+            md5_mmap = self.versioner._md5_file_mmap(large_file)
+            self.assertEqual(md5_iter_default, md5_mmap)
+
+        finally:
+            if os.path.exists(large_file):
+                os.remove(large_file)
 
 
 if __name__ == "__main__":
