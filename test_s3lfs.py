@@ -2092,6 +2092,363 @@ class TestS3LFS(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 self.versioner._compress_file_cli("nonexistent_file.txt")
 
+    # -------------------------------------------------
+    # 20. Additional Coverage Improvements
+    # -------------------------------------------------
+    def test_retry_decorator_success_first_try(self):
+        """Test retry decorator when function succeeds on first try."""
+        from s3lfs.core import retry
+
+        call_count = 0
+
+        @retry(3, (ValueError,))
+        def success_function():
+            nonlocal call_count
+            call_count += 1
+            return "success"
+
+        result = success_function()
+        self.assertEqual(result, "success")
+        self.assertEqual(call_count, 1)
+
+    def test_retry_decorator_with_different_exceptions(self):
+        """Test retry decorator with different exception types."""
+        from s3lfs.core import retry
+
+        @retry(2, (ValueError, RuntimeError))
+        def multi_exception_function():
+            raise ValueError("Test error")
+
+        with self.assertRaises(ValueError):
+            multi_exception_function()
+
+    def test_hash_file_iter_method(self):
+        """Test hash_file with iter method specifically."""
+        hash_result = self.versioner.hash_file(self.test_file, method="iter")
+        self.assertIsInstance(hash_result, str)
+        self.assertEqual(len(hash_result), 64)  # SHA256 length
+
+    def test_compress_file_python_method(self):
+        """Test compress_file with python method specifically."""
+        compressed = self.versioner.compress_file(self.test_file, method="python")
+        try:
+            self.assertTrue(compressed.exists())
+            self.assertGreater(compressed.stat().st_size, 0)
+        finally:
+            if compressed.exists():
+                compressed.unlink()
+
+    def test_decompress_file_python_method(self):
+        """Test decompress_file with python method."""
+        # First compress a file
+        compressed = self.versioner.compress_file(self.test_file, method="python")
+
+        try:
+            # Then decompress it
+            decompressed = "decompressed_test.txt"
+            self.versioner.decompress_file(compressed, decompressed, method="python")
+
+            # Verify content
+            with open(self.test_file, "r") as original:
+                original_content = original.read()
+            with open(decompressed, "r") as restored:
+                restored_content = restored.read()
+
+            self.assertEqual(original_content, restored_content)
+
+        finally:
+            if compressed.exists():
+                compressed.unlink()
+            if os.path.exists("decompressed_test.txt"):
+                os.remove("decompressed_test.txt")
+
+    def test_upload_with_no_encryption(self):
+        """Test upload when encryption is disabled."""
+        versioner_no_encrypt = S3LFS(bucket_name=self.bucket_name, encryption=False)
+
+        # Should upload without encryption parameters
+        versioner_no_encrypt.upload(self.test_file)
+
+        # Verify file exists in S3
+        file_hash = versioner_no_encrypt.hash_file(self.test_file)
+        s3_key = (
+            f"{versioner_no_encrypt.repo_prefix}/assets/{file_hash}/{self.test_file}.gz"
+        )
+        response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
+        self.assertTrue("Contents" in response)
+
+    def test_download_with_progress_callback(self):
+        """Test download with progress callback."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+
+        # Remove and re-create to ensure download happens
+        os.remove(self.test_file)
+
+        # Track callback calls
+        callback_calls = []
+
+        def progress_callback(bytes_chunk, **kwargs):
+            callback_calls.append({"bytes": bytes_chunk, "kwargs": kwargs})
+
+        # Download with callback
+        self.versioner.download(self.test_file, progress_callback=progress_callback)
+
+        # Should have received callback calls
+        self.assertGreater(len(callback_calls), 0)
+
+    def test_cleanup_s3_force_flag(self):
+        """Test cleanup_s3 with force flag."""
+        # Upload a file and then remove from manifest
+        self.versioner.upload(self.test_file)
+
+        # Remove from manifest to make it unreferenced
+        if self.test_file in self.versioner.manifest["files"]:
+            del self.versioner.manifest["files"][self.test_file]
+
+        # Cleanup with force should remove unreferenced files
+        self.versioner.cleanup_s3(force=True)
+
+    def test_resolve_filesystem_paths_with_existing_file(self):
+        """Test _resolve_filesystem_paths with existing file."""
+        result = self.versioner._resolve_filesystem_paths(self.test_file)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(str(result[0]), self.test_file)
+
+    def test_resolve_manifest_paths_exact_match(self):
+        """Test _resolve_manifest_paths with exact file match."""
+        # Add file to manifest
+        self.versioner.manifest["files"]["exact_test.txt"] = "test_hash"
+
+        result = self.versioner._resolve_manifest_paths("exact_test.txt")
+        self.assertEqual(len(result), 1)
+
+    def test_hash_and_upload_worker_basic(self):
+        """Test _hash_and_upload_worker basic functionality."""
+        result = self.versioner._hash_and_upload_worker(self.test_file, silence=True)
+
+        file_path, file_hash, uploaded, bytes_transferred = result
+        self.assertEqual(file_path, self.test_file)
+        self.assertIsInstance(file_hash, str)
+        self.assertTrue(uploaded)
+        self.assertGreater(bytes_transferred, 0)
+
+    def test_hash_and_download_worker_basic(self):
+        """Test _hash_and_download_worker basic functionality."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+        file_hash = self.versioner.hash_file(self.test_file)
+
+        # Remove local file
+        os.remove(self.test_file)
+
+        result = self.versioner._hash_and_download_worker(
+            (self.test_file, file_hash), silence=True
+        )
+
+        file_path, downloaded, bytes_transferred = result
+        self.assertEqual(file_path, self.test_file)
+        self.assertTrue(downloaded)
+        self.assertGreater(bytes_transferred, 0)
+
+    def test_md5_file_iter_basic(self):
+        """Test _md5_file_iter method."""
+        md5_hash = self.versioner._md5_file_iter(self.test_file)
+        self.assertIsInstance(md5_hash, str)
+        self.assertEqual(len(md5_hash), 32)  # MD5 length
+
+    def test_hash_with_progress_basic(self):
+        """Test _hash_with_progress method."""
+        from unittest.mock import Mock
+
+        mock_pbar = Mock()
+
+        result = self.versioner._hash_with_progress(self.test_file, mock_pbar)
+        expected_hash = self.versioner.hash_file(self.test_file)
+
+        self.assertEqual(result, expected_hash)
+        self.assertTrue(mock_pbar.update.called)
+
+    def test_initialization_with_different_chunk_sizes(self):
+        """Test initialization with different chunk sizes."""
+        chunk_sizes = [1024, 2048, 4096]
+
+        for chunk_size in chunk_sizes:
+            versioner = S3LFS(bucket_name=self.bucket_name, chunk_size=chunk_size)
+            self.assertEqual(versioner.chunk_size, chunk_size)
+
+    def test_initialization_with_custom_s3_factory(self):
+        """Test initialization with custom S3 factory."""
+        from unittest.mock import Mock
+
+        mock_client = Mock()
+
+        def custom_factory(no_sign_request):
+            return mock_client
+
+        versioner = S3LFS(bucket_name=self.bucket_name, s3_factory=custom_factory)
+
+        # Should use custom client
+        client = versioner._get_s3_client()
+        self.assertEqual(client, mock_client)
+
+    def test_error_messages_constants(self):
+        """Test ERROR_MESSAGES constants are defined."""
+        from s3lfs.core import ERROR_MESSAGES
+
+        expected_keys = [
+            "no_credentials",
+            "partial_credentials",
+            "invalid_credentials",
+            "s3_access_denied",
+        ]
+
+        for key in expected_keys:
+            self.assertIn(key, ERROR_MESSAGES)
+            self.assertIsInstance(ERROR_MESSAGES[key], str)
+            self.assertGreater(len(ERROR_MESSAGES[key]), 0)
+
+    def test_upload_with_s3_error(self):
+        """Test upload behavior with S3 error."""
+        # Mock S3 client to raise error
+        with patch.object(
+            self.versioner._get_s3_client(), "upload_fileobj"
+        ) as mock_upload:
+            mock_upload.side_effect = ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "Access denied"}},
+                "UploadFileobj",
+            )
+
+            with self.assertRaises(ClientError):
+                self.versioner.upload(self.test_file)
+
+    def test_thread_local_s3_client_isolation(self):
+        """Test that S3 clients are isolated per thread."""
+        import threading
+
+        clients = {}
+
+        def get_client(thread_id):
+            clients[thread_id] = self.versioner._get_s3_client()
+
+        # Create threads
+        threads = []
+        for i in range(3):
+            thread = threading.Thread(target=get_client, args=(i,))
+            threads.append(thread)
+            thread.start()
+
+        # Wait for completion
+        for thread in threads:
+            thread.join()
+
+        # Should have different client instances
+        self.assertEqual(len(clients), 3)
+        client_ids = [id(client) for client in clients.values()]
+        self.assertEqual(len(set(client_ids)), 3)
+
+    def test_save_manifest_basic(self):
+        """Test save_manifest basic functionality."""
+        # Add data to manifest
+        self.versioner.manifest["files"]["test_save.txt"] = "test_hash"
+
+        # Save manifest
+        self.versioner.save_manifest()
+
+        # Verify file exists
+        self.assertTrue(os.path.exists(self.versioner.manifest_file))
+
+        # Verify content
+        with open(self.versioner.manifest_file, "r") as f:
+            loaded_manifest = json.load(f)
+
+        self.assertIn("test_save.txt", loaded_manifest["files"])
+        self.assertEqual(loaded_manifest["files"]["test_save.txt"], "test_hash")
+
+    def test_load_manifest_basic(self):
+        """Test load_manifest basic functionality."""
+        # Create manifest file
+        test_manifest = {
+            "bucket_name": self.bucket_name,
+            "repo_prefix": "test-prefix",
+            "files": {"test_load.txt": "test_hash"},
+        }
+
+        manifest_file = Path(".test_manifest.json")
+
+        with open(manifest_file, "w") as f:
+            json.dump(test_manifest, f)
+
+        try:
+            # Create new S3LFS instance to trigger load
+            versioner = S3LFS(
+                bucket_name=self.bucket_name, manifest_file=str(manifest_file)
+            )
+
+            # Should have loaded the manifest
+            self.assertIn("test_load.txt", versioner.manifest["files"])
+            self.assertEqual(versioner.manifest["files"]["test_load.txt"], "test_hash")
+
+        finally:
+            if manifest_file.exists():
+                manifest_file.unlink()
+
+    def test_split_file_basic(self):
+        """Test split_file basic functionality."""
+        # Create a larger file
+        large_file = "large_test.txt"
+        original_chunk_size = self.versioner.chunk_size
+
+        try:
+            # Set small chunk size
+            self.versioner.chunk_size = 50
+
+            # Create content larger than chunk size
+            content = "This is test content for splitting operations.\n" * 5
+            with open(large_file, "w") as f:
+                f.write(content)
+
+            # Split file
+            chunks = self.versioner.split_file(large_file)
+
+            # Should have multiple chunks
+            self.assertGreater(len(chunks), 1)
+
+            # All chunks should exist
+            for chunk in chunks:
+                self.assertTrue(chunk.exists())
+
+        finally:
+            self.versioner.chunk_size = original_chunk_size
+            if os.path.exists(large_file):
+                os.remove(large_file)
+            if "chunks" in locals():
+                for chunk in chunks:
+                    if chunk.exists():
+                        chunk.unlink()
+
+    def test_track_interleaved_basic(self):
+        """Test track_interleaved basic functionality."""
+        # Should upload the file
+        self.versioner.track_interleaved(self.test_file)
+
+        # File should be in manifest
+        self.assertIn(self.test_file, self.versioner.manifest["files"])
+
+    def test_checkout_interleaved_basic(self):
+        """Test checkout_interleaved basic functionality."""
+        # First upload file
+        self.versioner.upload(self.test_file)
+
+        # Remove local file
+        os.remove(self.test_file)
+
+        # Checkout should restore it
+        self.versioner.checkout_interleaved(self.test_file)
+
+        # File should exist
+        self.assertTrue(os.path.exists(self.test_file))
+
 
 if __name__ == "__main__":
     unittest.main()
