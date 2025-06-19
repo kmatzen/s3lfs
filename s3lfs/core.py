@@ -14,12 +14,14 @@ import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Optional, Union
 from uuid import uuid4
 
 import boto3
 import portalocker
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
+from botocore.config import Config
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -29,18 +31,20 @@ from botocore.exceptions import (
 from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
-"""
-import logging
+# Constants
+DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
+DEFAULT_BUFFER_SIZE = 1024 * 1024  # 1 MB
+DEFAULT_THREAD_POOL_SIZE = 8
+DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
+DEFAULT_MAX_CONCURRENCY = 10
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-
-# Set botocore and boto3 loggers to debug
-logging.getLogger('boto3').setLevel(logging.DEBUG)
-logging.getLogger('botocore').setLevel(logging.DEBUG)
-logging.getLogger('s3transfer').setLevel(logging.DEBUG)
-logging.getLogger('urllib3').setLevel(logging.DEBUG)
-"""
+# Common error messages
+ERROR_MESSAGES = {
+    "no_credentials": "AWS credentials are missing. Please configure them or use --no-sign-request.",
+    "partial_credentials": "Incomplete AWS credentials. Check your AWS configuration.",
+    "invalid_credentials": "Invalid AWS credentials. Please verify your access key and secret key.",
+    "s3_access_denied": "Invalid or insufficient AWS credentials for bucket '{bucket_name}'.",
+}
 
 
 def retry(times, exceptions):
@@ -62,8 +66,8 @@ def retry(times, exceptions):
                     return func(*args, **kwargs)
                 except exceptions as exc:
                     print(
-                        "Exception thrown when attempting to run %s, attempt "
-                        "%d of %d: %s" % (func, attempt, times, exc)
+                        f"Exception thrown when attempting to run {func}, attempt "
+                        f"{attempt} of {times}: {exc}"
                     )
                     attempt += 1
             return func(*args, **kwargs)
@@ -82,7 +86,7 @@ class S3LFS:
         encryption=True,
         no_sign_request=False,
         temp_dir=None,
-        chunk_size=5 * 1024 * 1024 * 1024,
+        chunk_size=DEFAULT_CHUNK_SIZE,
         s3_factory=None,
     ):
         """
@@ -96,19 +100,16 @@ class S3LFS:
         :param s3_factory: Custom S3 client factory function (for testing)
         """
         self.chunk_size = chunk_size
-        self.s3_factory = (
-            (
-                lambda no_sign_request: (
-                    boto3.session.Session().client(
-                        "s3", config=boto3.session.Config(signature_version=UNSIGNED)
-                    )
-                    if no_sign_request
-                    else boto3.session.Session().client("s3")
-                )
-            )
-            if s3_factory is None
-            else s3_factory
-        )
+
+        def default_s3_factory(no_sign_request):
+            """Default S3 client factory with proper boto3 usage."""
+            if no_sign_request:
+                config = Config(signature_version=UNSIGNED)
+                return boto3.client("s3", config=config)
+            else:
+                return boto3.client("s3")
+
+        self.s3_factory = s3_factory if s3_factory is not None else default_s3_factory
 
         # Set the temporary directory to the base of the repository if not provided
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
@@ -120,10 +121,11 @@ class S3LFS:
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
             self.config = TransferConfig(
-                multipart_threshold=5 * 1024 * 1024 * 1024, max_concurrency=10
+                multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
+                max_concurrency=DEFAULT_MAX_CONCURRENCY,
             )
         else:
-            self.config = TransferConfig(max_concurrency=10)
+            self.config = TransferConfig(max_concurrency=DEFAULT_MAX_CONCURRENCY)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
         self.no_sign_request = no_sign_request
@@ -138,7 +140,10 @@ class S3LFS:
                 self.bucket_name = self.manifest.get("bucket_name")
 
         if not self.bucket_name:
-            raise ValueError("Bucket name must be provided or stored in the manifest.")
+            raise ValueError(
+                "Bucket name must be provided either as a parameter or stored in the manifest. "
+                "Use 'initialize_repo()' to set up the repository configuration."
+            )
 
         with self._lock_context():
             if repo_prefix:
@@ -180,21 +185,15 @@ class S3LFS:
             try:
                 self.thread_local.s3 = self.s3_factory(self.no_sign_request)
             except NoCredentialsError:
-                raise RuntimeError(
-                    "AWS credentials are missing. Please configure them or use --no-sign-request."
-                )
+                raise RuntimeError(ERROR_MESSAGES["no_credentials"])
             except PartialCredentialsError:
-                raise RuntimeError(
-                    "Incomplete AWS credentials. Check your AWS configuration."
-                )
+                raise RuntimeError(ERROR_MESSAGES["partial_credentials"])
             except ClientError as e:
                 if e.response["Error"]["Code"] in [
                     "InvalidAccessKeyId",
                     "SignatureDoesNotMatch",
                 ]:
-                    raise RuntimeError(
-                        "Invalid AWS credentials. Please verify your access key and secret key."
-                    )
+                    raise RuntimeError(ERROR_MESSAGES["invalid_credentials"])
                 raise RuntimeError(f"Error initializing S3 client: {e}")
 
         return self.thread_local.s3
@@ -207,21 +206,17 @@ class S3LFS:
         :param repo_prefix: A unique prefix for this repository in the bucket
         """
         with self._lock_context():
-            self.manifest["bucket_name"] = self.bucket_name
-            self.manifest["repo_prefix"] = self.repo_prefix
+            # Store configuration in manifest
+            if self.bucket_name is not None:
+                self.manifest["bucket_name"] = str(self.bucket_name)
+            if self.repo_prefix is not None:
+                self.manifest["repo_prefix"] = str(self.repo_prefix)
             self.save_manifest()
 
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         print("Manifest file saved as .s3_manifest.json")
-
-    def track_subtree(self, directory, silence=True):
-        """
-        Deprecated: Use `track` instead.
-        """
-        print("⚠️ `track_subtree` is deprecated. Use `track` instead.")
-        self.track(directory, silence=silence)
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
@@ -248,7 +243,7 @@ class S3LFS:
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
-    def hash_file(self, file_path, method="auto"):
+    def hash_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
         """
         Compute a unique SHA-256 hash of the file using its content and relative path.
         Supports multiple hashing methods for performance optimization.
@@ -296,7 +291,7 @@ class S3LFS:
                 hasher.update(mm)
         return hasher.hexdigest()
 
-    def _hash_file_iter(self, file_path, chunk_size=1024 * 1024):
+    def _hash_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
         """
         Compute the SHA-256 hash by iteratively reading the file in chunks.
         """
@@ -355,7 +350,7 @@ class S3LFS:
         Compress the file deterministically using Python's gzip module.
         """
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
-        buffer_size = 1024 * 1024  # 1 MB chunks
+        buffer_size = DEFAULT_BUFFER_SIZE
 
         with open(file_path, "rb") as f_in, open(compressed_path, "wb") as f_out:
             with gzip.GzipFile(
@@ -404,11 +399,11 @@ class S3LFS:
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def upload(
         self,
-        file_path,
-        silence=False,
-        needs_immediate_update=True,
-        progress_callback=None,
-    ):
+        file_path: Union[str, Path],
+        silence: bool = False,
+        needs_immediate_update: bool = True,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         """
         Upload a file to S3 and update the manifest using the file path as the key.
         """
@@ -435,9 +430,10 @@ class S3LFS:
                 if not silence:
                     print(f"Uploading {path}")
                 file_size = path.stat().st_size
+                # Set up progress callback and context manager
                 if progress_callback:
                     # Use the provided callback for progress updates
-                    callback = progress_callback
+                    upload_callback = progress_callback
                     context_manager = contextlib.nullcontext()
                 elif not silence:
                     # Create individual progress bar only if not silenced
@@ -448,12 +444,14 @@ class S3LFS:
                         desc=f"Uploading {path.name}",
                         leave=False,
                     )
-                    callback = progress_bar.update
+
+                    def upload_callback(bytes_transferred):
+                        progress_bar.update(bytes_transferred)
+
                     context_manager = progress_bar
                 else:
                     # No progress display
-                    def callback(x):
-                        """No-op callback for when progress display is disabled."""
+                    def upload_callback(bytes_transferred):
                         pass
 
                     context_manager = contextlib.nullcontext()
@@ -495,7 +493,7 @@ class S3LFS:
                             s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
                             ExtraArgs=extra_args,
                             Config=self.config,
-                            Callback=callback,
+                            Callback=upload_callback,
                         )
                 if not silence:
                     print(f"{path} uploaded")
@@ -563,8 +561,17 @@ class S3LFS:
         """
         Decompress the file using Python's gzip module and save it to the output path.
         """
-        with gzip.open(compressed_path, "rb") as f_in, open(output_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        with gzip.open(compressed_path, "rb") as f_in:
+            with open(output_path, "wb") as f_out:
+                # Use manual chunked copy to avoid type issues
+                while True:
+                    chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                    if not chunk:
+                        break
+                    # Ensure we have bytes for writing
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    f_out.write(chunk)
 
         return output_path
 
@@ -586,7 +593,12 @@ class S3LFS:
         return output_path
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
-    def download(self, file_path, silence=False, progress_callback=None):
+    def download(
+        self,
+        file_path: Union[str, Path],
+        silence: bool = False,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> Optional[int]:
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
         """
@@ -597,7 +609,7 @@ class S3LFS:
             expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
         if not expected_hash:
             print(f"⚠️ File '{file_path}' is not in the manifest.")
-            return
+            return None
 
         # If the file exists, check its hash
         if not silence:
@@ -610,7 +622,7 @@ class S3LFS:
             if current_hash == expected_hash:
                 if not silence:
                     print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
-                return  # Skip download if hashes match
+                return 0  # Skip download if hashes match
 
         # Proceed with download if file is missing or different
         s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
@@ -734,7 +746,7 @@ class S3LFS:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    parts = key.replace(self.repo_prefix + "/", "").split("/")
+                    parts = key.replace(f"{self.repo_prefix}/", "").split("/")
                     if len(parts) < 3:
                         continue
 
@@ -774,7 +786,7 @@ class S3LFS:
             )  # Files listed in the manifest
 
         # Compute hashes in parallel
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
             results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
 
         # Process results
@@ -808,7 +820,7 @@ class S3LFS:
             print("🔐 Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
                 executor.submit(
@@ -844,7 +856,7 @@ class S3LFS:
         self.test_s3_credentials()
 
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 # Submit all tasks and collect futures
                 futures = [
                     executor.submit(self.download, kv[0], silence=silence)
@@ -872,13 +884,6 @@ class S3LFS:
             print("\n⚠️ Download interrupted by user.")
         finally:
             print("✅ All files downloaded.")
-
-    def sparse_checkout(self, prefix, silence=True):
-        """
-        Deprecated: Use `checkout` instead.
-        """
-        print("⚠️ `sparse_checkout` is deprecated. Use `checkout` instead.")
-        self.checkout(prefix, silence=silence)
 
     def integrate_with_git(self):
         """
@@ -957,11 +962,9 @@ class S3LFS:
             if not silence:
                 print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
         except NoCredentialsError:
-            raise RuntimeError("AWS credentials are missing. Please configure them.")
+            raise RuntimeError(ERROR_MESSAGES["no_credentials"])
         except PartialCredentialsError:
-            raise RuntimeError(
-                "Incomplete AWS credentials. Check your AWS configuration."
-            )
+            raise RuntimeError(ERROR_MESSAGES["partial_credentials"])
         except ClientError as e:
             if e.response["Error"]["Code"] in [
                 "InvalidAccessKeyId",
@@ -969,7 +972,9 @@ class S3LFS:
                 "AccessDenied",
             ]:
                 raise RuntimeError(
-                    f"Invalid or insufficient AWS credentials for bucket '{self.bucket_name}'."
+                    ERROR_MESSAGES["s3_access_denied"].format(
+                        bucket_name=self.bucket_name
+                    )
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
 
@@ -1138,7 +1143,7 @@ class S3LFS:
 
         # Compute hashes in parallel with a progress bar
         with tqdm(total=len(files_to_track), desc="Hashing files", unit="file") as pbar:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 file_hashes = {
                     str(file.as_posix()): hash_result
                     for file, hash_result in zip(
@@ -1172,7 +1177,7 @@ class S3LFS:
         # Phase 3: Upload files needing updates
         print("🚀 Uploading files...")
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 futures = [
                     executor.submit(
                         self.upload,
@@ -1247,7 +1252,7 @@ class S3LFS:
         with tqdm(
             total=len(files_to_checkout), desc="Hashing files", unit="file"
         ) as pbar:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 future_to_file = {
                     executor.submit(self._hash_with_progress, Path(file), pbar): file
                     for file in files_to_checkout.keys()
@@ -1277,7 +1282,7 @@ class S3LFS:
         # Phase 3: Download files that need updates
         print("🚀 Downloading files...")
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 futures = [
                     executor.submit(self.download, file, silence=silence)
                     for file in files_to_download
@@ -1456,7 +1461,9 @@ class S3LFS:
                     """Callback to update the bytes progress bar"""
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                with ThreadPoolExecutor(
+                    max_workers=DEFAULT_THREAD_POOL_SIZE
+                ) as executor:
                     # Submit all hash-and-upload tasks
                     future_to_file = {
                         executor.submit(
@@ -1567,7 +1574,9 @@ class S3LFS:
                     """Callback to update the bytes progress bar"""
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                with ThreadPoolExecutor(
+                    max_workers=DEFAULT_THREAD_POOL_SIZE
+                ) as executor:
                     # Submit all hash-and-download tasks
                     future_to_file = {
                         executor.submit(

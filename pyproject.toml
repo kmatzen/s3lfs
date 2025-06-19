@@ -24,6 +24,33 @@ coverage = "^6.0"
 black = "^22.0"
 pre-commit = "^4.2.0"
 moto = {extras = ["s3"], version = "^4.0.0"}
+mypy = "^1.0.0"
+types-boto3 = "^1.0.0"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = false  # Start lenient
+warn_unused_configs = true
+disallow_untyped_defs = false  # Start lenient, can be made stricter later
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false  # Allow unused ignores for now
+warn_no_return = false  # Allow missing returns for now
+warn_unreachable = false  # Allow unreachable code for now
+strict_equality = true
+ignore_missing_imports = true
+
+# Specific module configurations
+[[tool.mypy.overrides]]
+module = [
+    "moto.*",
+    "portalocker.*",
+    "tqdm.*",
+]
+ignore_missing_imports = true
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

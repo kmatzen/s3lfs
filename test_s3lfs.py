@@ -149,8 +149,8 @@ class TestS3LFS(unittest.TestCase):
         os.remove(self.test_file)
         self.assertFalse(os.path.exists(self.test_file))
 
-        # Use sparse_checkout with the directory prefix, not the file hash
-        self.versioner.sparse_checkout(test_directory)
+        # Use checkout with the directory prefix, not the file hash
+        self.versioner.checkout(test_directory)
 
         # Ensure the file has been restored
         self.assertTrue(os.path.exists(self.test_file))
