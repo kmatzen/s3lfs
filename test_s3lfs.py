@@ -1091,11 +1091,14 @@ class TestS3LFS(unittest.TestCase):
 
         # Test the worker function directly - it should return False for uploaded since file is up-to-date
         result = self.versioner._hash_and_upload_worker(self.test_file, silence=True)
-        file_path, file_hash, uploaded = result
+        file_path, file_hash, uploaded, bytes_transferred = result
 
         self.assertEqual(file_path, self.test_file)
         self.assertIsNotNone(file_hash)
         self.assertFalse(uploaded)  # Should be False since no upload was needed
+        self.assertEqual(
+            bytes_transferred, 0
+        )  # No bytes transferred since no upload needed
 
     def test_hash_and_download_worker_no_download_needed(self):
         """Test _hash_and_download_worker when no download is needed (file already exists and correct)."""
@@ -1107,10 +1110,13 @@ class TestS3LFS(unittest.TestCase):
         result = self.versioner._hash_and_download_worker(
             (self.test_file, expected_hash), silence=True
         )
-        file_path, downloaded = result
+        file_path, downloaded, bytes_transferred = result
 
         self.assertEqual(file_path, self.test_file)
         self.assertFalse(downloaded)  # Should be False since no download was needed
+        self.assertEqual(
+            bytes_transferred, 0
+        )  # No bytes transferred since no download needed
 
     def test_hash_and_upload_worker_error_handling(self):
         """Test _hash_and_upload_worker error handling."""
@@ -1195,10 +1201,12 @@ class TestS3LFS(unittest.TestCase):
             # Mock the shutdown flag to be True during processing
             original_shutdown = self.versioner._shutdown_requested
 
-            def mock_worker(file_path, silence):
+            def mock_worker(file_path, silence, progress_callback=None):
                 # Set shutdown flag during first call
                 self.versioner._shutdown_requested = True
-                return self.versioner._hash_and_upload_worker(file_path, silence)
+                return self.versioner._hash_and_upload_worker(
+                    file_path, silence, progress_callback
+                )
 
             with patch.object(
                 self.versioner, "_hash_and_upload_worker", side_effect=mock_worker
@@ -1241,10 +1249,12 @@ class TestS3LFS(unittest.TestCase):
             # Mock the shutdown flag to be True during processing
             original_shutdown = self.versioner._shutdown_requested
 
-            def mock_worker(file_info, silence):
+            def mock_worker(file_info, silence, progress_callback=None):
                 # Set shutdown flag during first call
                 self.versioner._shutdown_requested = True
-                return self.versioner._hash_and_download_worker(file_info, silence)
+                return self.versioner._hash_and_download_worker(
+                    file_info, silence, progress_callback
+                )
 
             with patch.object(
                 self.versioner, "_hash_and_download_worker", side_effect=mock_worker
@@ -1349,7 +1359,7 @@ class TestS3LFS(unittest.TestCase):
 
         try:
             # Mock worker to raise an exception
-            def mock_worker(file_path, silence):
+            def mock_worker(file_path, silence, progress_callback=None):
                 raise RuntimeError(f"Processing error for {file_path}")
 
             with patch.object(
@@ -1396,7 +1406,7 @@ class TestS3LFS(unittest.TestCase):
                 os.remove(fname)
 
             # Mock worker to raise an exception
-            def mock_worker(file_info, silence):
+            def mock_worker(file_info, silence, progress_callback=None):
                 file_path, expected_hash = file_info
                 raise RuntimeError(f"Processing error for {file_path}")
 

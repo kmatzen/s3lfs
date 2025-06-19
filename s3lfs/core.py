@@ -1,3 +1,4 @@
+import contextlib
 import fnmatch
 import glob
 import gzip
@@ -401,7 +402,13 @@ class S3LFS:
         return result.stdout.strip()
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
-    def upload(self, file_path, silence=False, needs_immediate_update=True):
+    def upload(
+        self,
+        file_path,
+        silence=False,
+        needs_immediate_update=True,
+        progress_callback=None,
+    ):
         """
         Upload a file to S3 and update the manifest using the file path as the key.
         """
@@ -428,13 +435,30 @@ class S3LFS:
                 if not silence:
                     print(f"Uploading {path}")
                 file_size = path.stat().st_size
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Uploading {path.name}",
-                    leave=False,
-                ) as progress_bar:
+                if progress_callback:
+                    # Use the provided callback for progress updates
+                    callback = progress_callback
+                    context_manager = contextlib.nullcontext()
+                elif not silence:
+                    # Create individual progress bar only if not silenced
+                    progress_bar = tqdm(
+                        total=file_size,
+                        unit="B",
+                        unit_scale=True,
+                        desc=f"Uploading {path.name}",
+                        leave=False,
+                    )
+                    callback = progress_bar.update
+                    context_manager = progress_bar
+                else:
+                    # No progress display
+                    def callback(x):
+                        """No-op callback for when progress display is disabled."""
+                        pass
+
+                    context_manager = contextlib.nullcontext()
+
+                with context_manager:
                     # Compute the local MD5 checksum
                     with open(path, "rb") as f:
                         local_md5 = hashlib.md5(f.read()).hexdigest()
@@ -471,7 +495,7 @@ class S3LFS:
                             s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
                             ExtraArgs=extra_args,
                             Config=self.config,
-                            Callback=progress_bar.update,
+                            Callback=callback,
                         )
                 if not silence:
                     print(f"{path} uploaded")
@@ -562,7 +586,7 @@ class S3LFS:
         return output_path
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
-    def download(self, file_path, silence=False):
+    def download(self, file_path, silence=False, progress_callback=None):
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
         """
@@ -654,6 +678,9 @@ class S3LFS:
         os.remove(compressed_path)  # Ensure temp file is deleted
         if not silence:
             print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+
+        # Return bytes transferred for progress tracking
+        return file_path.stat().st_size if file_path.exists() else 0
 
     def remove_file(self, file_path, keep_in_s3=True):
         """
@@ -1318,10 +1345,14 @@ class S3LFS:
 
         return chunk_paths
 
-    def _hash_and_upload_worker(self, file_path, silence=True):
+    def _hash_and_upload_worker(self, file_path, silence=True, progress_callback=None):
         """
         Worker function that hashes a file and uploads it if needed.
-        Returns (file_path, hash, uploaded) tuple.
+        Returns (file_path, hash, uploaded, bytes_transferred) tuple.
+
+        :param file_path: Path to the file to process
+        :param silence: Whether to suppress individual file progress bars
+        :param progress_callback: Optional callback function for progress updates
         """
         try:
             current_hash = self.hash_file(file_path)
@@ -1333,21 +1364,35 @@ class S3LFS:
                 )
 
             if current_hash == stored_hash:
-                return (file_path, current_hash, False)  # No upload needed
+                return (file_path, current_hash, False, 0)  # No upload needed
 
-            # Upload the file
-            self.upload(file_path, silence=silence, needs_immediate_update=False)
-            return (file_path, current_hash, True)  # Upload completed
+            # Get file size for progress tracking
+            file_size = Path(file_path).stat().st_size
+
+            # Upload the file with progress callback
+            self.upload(
+                file_path,
+                silence=True,
+                needs_immediate_update=False,
+                progress_callback=progress_callback,
+            )
+            return (file_path, current_hash, True, file_size)  # Upload completed
 
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
             raise
 
-    def _hash_and_download_worker(self, file_info, silence=True):
+    def _hash_and_download_worker(
+        self, file_info, silence=True, progress_callback=None
+    ):
         """
         Worker function that checks if a file needs download and downloads it if needed.
         file_info is (file_path, expected_hash) tuple.
-        Returns (file_path, downloaded) tuple.
+        Returns (file_path, downloaded, bytes_transferred) tuple.
+
+        :param file_info: Tuple of (file_path, expected_hash)
+        :param silence: Whether to suppress individual file progress bars
+        :param progress_callback: Optional callback function for progress updates
         """
         file_path, expected_hash = file_info
         try:
@@ -1355,11 +1400,13 @@ class S3LFS:
             if Path(file_path).exists():
                 current_hash = self.hash_file(file_path)
                 if current_hash == expected_hash:
-                    return (file_path, False)  # No download needed
+                    return (file_path, False, 0)  # No download needed
 
-            # Download the file
-            self.download(file_path, silence=silence)
-            return (file_path, True)  # Download completed
+            # Download the file with progress callback
+            bytes_transferred = self.download(
+                file_path, silence=True, progress_callback=progress_callback
+            )
+            return (file_path, True, bytes_transferred or 0)  # Download completed
 
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
@@ -1392,21 +1439,36 @@ class S3LFS:
         # Phase 2: Process files with interleaved hashing and uploading
         files_uploaded = []
         files_processed = 0
+        total_bytes_transferred = 0
 
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                # Submit all hash-and-upload tasks
-                future_to_file = {
-                    executor.submit(
-                        self._hash_and_upload_worker, str(file.as_posix()), silence
-                    ): file
-                    for file in files_to_track
-                }
+            # Create unified progress bars
+            with tqdm(
+                total=len(files_to_track),
+                desc="Files processed",
+                unit="file",
+                position=0,
+            ) as file_pbar, tqdm(
+                total=0, desc="Data transferred", unit="B", unit_scale=True, position=1
+            ) as bytes_pbar:
 
-                # Process results as they complete
-                with tqdm(
-                    total=len(files_to_track), desc="Processing files", unit="file"
-                ) as pbar:
+                def progress_callback(bytes_chunk):
+                    """Callback to update the bytes progress bar"""
+                    bytes_pbar.update(bytes_chunk)
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    # Submit all hash-and-upload tasks
+                    future_to_file = {
+                        executor.submit(
+                            self._hash_and_upload_worker,
+                            str(file.as_posix()),
+                            True,
+                            progress_callback,
+                        ): file
+                        for file in files_to_track
+                    }
+
+                    # Process results as they complete
                     for future in as_completed(future_to_file):
                         if self._shutdown_requested:
                             print(
@@ -1415,13 +1477,30 @@ class S3LFS:
                             return
 
                         try:
-                            file_path, file_hash, uploaded = future.result()
+                            (
+                                file_path,
+                                file_hash,
+                                uploaded,
+                                bytes_transferred,
+                            ) = future.result()
                             files_processed += 1
+                            total_bytes_transferred += bytes_transferred
 
                             if uploaded:
                                 files_uploaded.append((file_path, file_hash))
+                                # Update the bytes progress bar total for uploaded files
+                                bytes_pbar.total = (
+                                    bytes_pbar.total or 0
+                                ) + bytes_transferred
+                                bytes_pbar.refresh()
 
-                            pbar.update(1)
+                            file_pbar.update(1)
+                            file_pbar.set_postfix(
+                                {
+                                    "uploaded": len(files_uploaded),
+                                    "skipped": files_processed - len(files_uploaded),
+                                }
+                            )
 
                         except Exception as e:
                             print(f"An error occurred during processing: {e}")
@@ -1471,23 +1550,36 @@ class S3LFS:
         # Phase 2: Process files with interleaved hashing and downloading
         files_downloaded = 0
         files_processed = 0
+        total_bytes_transferred = 0
 
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                # Submit all hash-and-download tasks
-                future_to_file = {
-                    executor.submit(
-                        self._hash_and_download_worker,
-                        (file_path, expected_hash),
-                        silence,
-                    ): file_path
-                    for file_path, expected_hash in files_to_checkout.items()
-                }
+            # Create unified progress bars
+            with tqdm(
+                total=len(files_to_checkout),
+                desc="Files processed",
+                unit="file",
+                position=0,
+            ) as file_pbar, tqdm(
+                total=0, desc="Data downloaded", unit="B", unit_scale=True, position=1
+            ) as bytes_pbar:
 
-                # Process results as they complete
-                with tqdm(
-                    total=len(files_to_checkout), desc="Processing files", unit="file"
-                ) as pbar:
+                def progress_callback(bytes_chunk):
+                    """Callback to update the bytes progress bar"""
+                    bytes_pbar.update(bytes_chunk)
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    # Submit all hash-and-download tasks
+                    future_to_file = {
+                        executor.submit(
+                            self._hash_and_download_worker,
+                            (file_path, expected_hash),
+                            True,
+                            progress_callback,
+                        ): file_path
+                        for file_path, expected_hash in files_to_checkout.items()
+                    }
+
+                    # Process results as they complete
                     for future in as_completed(future_to_file):
                         if self._shutdown_requested:
                             print(
@@ -1496,13 +1588,25 @@ class S3LFS:
                             break
 
                         try:
-                            file_path, downloaded = future.result()
+                            file_path, downloaded, bytes_transferred = future.result()
                             files_processed += 1
+                            total_bytes_transferred += bytes_transferred
 
                             if downloaded:
                                 files_downloaded += 1
+                                # Update the bytes progress bar total for downloaded files
+                                bytes_pbar.total = (
+                                    bytes_pbar.total or 0
+                                ) + bytes_transferred
+                                bytes_pbar.refresh()
 
-                            pbar.update(1)
+                            file_pbar.update(1)
+                            file_pbar.set_postfix(
+                                {
+                                    "downloaded": files_downloaded,
+                                    "skipped": files_processed - files_downloaded,
+                                }
+                            )
 
                         except Exception as e:
                             print(f"An error occurred during processing: {e}")
