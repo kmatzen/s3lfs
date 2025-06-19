@@ -24,7 +24,9 @@ def init(bucket, prefix, no_sign_request):
 @cli.command()
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-@click.option("--verbose", is_flag=True, help="Print progress")
+@click.option(
+    "--verbose", is_flag=True, help="Show detailed progress and upload information"
+)
 @click.option(
     "--modified", is_flag=True, help="Track only modified files from manifest"
 )
@@ -46,7 +48,11 @@ def track(path, no_sign_request, verbose, modified):
 @cli.command()
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-@click.option("--verbose", is_flag=True, help="Print progress")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed progress and download size information",
+)
 @click.option("--all", is_flag=True, help="Checkout all files from manifest")
 def checkout(path, no_sign_request, verbose, all):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
