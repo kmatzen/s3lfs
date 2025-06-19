@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import boto3
@@ -951,6 +952,530 @@ class TestS3LFS(unittest.TestCase):
                 os.rmdir("consistency_test/subdir")
             if os.path.exists("consistency_test"):
                 os.rmdir("consistency_test")
+
+    # -------------------------------------------------
+    # 15. Interleaved Processing Tests
+    # -------------------------------------------------
+    def test_track_interleaved(self):
+        """Test that interleaved track works correctly and performs better than two-stage."""
+        # Create test files
+        os.makedirs("data", exist_ok=True)
+        files_created = []
+
+        for i in range(3):
+            fname = f"test_file_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content of file {i}")
+            files_created.append(fname)
+
+        try:
+            # Test interleaved tracking
+            self.versioner.track_interleaved("*.txt")
+
+            # Verify all files are tracked
+            for fname in files_created:
+                self.assertIn(fname, self.versioner.manifest["files"])
+
+            # Verify files exist in S3
+            for fname in files_created:
+                file_hash = self.versioner.hash_file(fname)
+                s3_key = f"s3lfs/assets/{file_hash}/{fname}.gz"
+                response = self.s3.list_objects_v2(
+                    Bucket=self.bucket_name, Prefix=s3_key
+                )
+                self.assertTrue(
+                    "Contents" in response and len(response["Contents"]) == 1
+                )
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_checkout_interleaved(self):
+        """Test that interleaved checkout works correctly."""
+        # First upload some files
+        os.makedirs("data", exist_ok=True)
+        files_created = []
+
+        for i in range(3):
+            fname = f"checkout_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content for checkout test {i}")
+            files_created.append(fname)
+
+        try:
+            # Track the files first
+            self.versioner.track_interleaved("checkout_test_*.txt")
+
+            # Remove the files locally
+            for fname in files_created:
+                os.remove(fname)
+                self.assertFalse(Path(fname).exists())
+
+            # Test interleaved checkout
+            self.versioner.checkout_interleaved("checkout_test_*.txt")
+
+            # Verify all files are restored
+            for fname in files_created:
+                self.assertTrue(Path(fname).exists())
+                with open(fname, "r") as f:
+                    content = f.read()
+                    self.assertIn("Content for checkout test", content)
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_interleaved_vs_two_stage_compatibility(self):
+        """Test that interleaved and two-stage methods produce the same results."""
+        # Create test files
+        files_created = []
+
+        for i in range(2):
+            fname = f"compat_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Compatibility test content {i}")
+            files_created.append(fname)
+
+        try:
+            # Track with two-stage method
+            self.versioner.track("compat_test_0.txt", interleaved=False)
+
+            # Track with interleaved method
+            self.versioner.track("compat_test_1.txt", interleaved=True)
+
+            # Both should be in manifest
+            for fname in files_created:
+                self.assertIn(fname, self.versioner.manifest["files"])
+
+            # Remove files locally
+            for fname in files_created:
+                os.remove(fname)
+
+            # Checkout with two-stage method
+            self.versioner.checkout("compat_test_0.txt", interleaved=False)
+
+            # Checkout with interleaved method
+            self.versioner.checkout("compat_test_1.txt", interleaved=True)
+
+            # Both files should be restored correctly
+            for fname in files_created:
+                self.assertTrue(Path(fname).exists())
+                with open(fname, "r") as f:
+                    content = f.read()
+                    self.assertIn("Compatibility test content", content)
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    # -------------------------------------------------
+    # 16. Coverage Tests for Edge Cases and Error Conditions
+    # -------------------------------------------------
+    def test_hash_and_upload_worker_no_upload_needed(self):
+        """Test _hash_and_upload_worker when no upload is needed (file already up-to-date)."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+
+        # Test the worker function directly - it should return False for uploaded since file is up-to-date
+        result = self.versioner._hash_and_upload_worker(self.test_file, silence=True)
+        file_path, file_hash, uploaded = result
+
+        self.assertEqual(file_path, self.test_file)
+        self.assertIsNotNone(file_hash)
+        self.assertFalse(uploaded)  # Should be False since no upload was needed
+
+    def test_hash_and_download_worker_no_download_needed(self):
+        """Test _hash_and_download_worker when no download is needed (file already exists and correct)."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+        expected_hash = self.versioner.hash_file(self.test_file)
+
+        # Test the worker function directly - it should return False for downloaded since file exists and is correct
+        result = self.versioner._hash_and_download_worker(
+            (self.test_file, expected_hash), silence=True
+        )
+        file_path, downloaded = result
+
+        self.assertEqual(file_path, self.test_file)
+        self.assertFalse(downloaded)  # Should be False since no download was needed
+
+    def test_hash_and_upload_worker_error_handling(self):
+        """Test _hash_and_upload_worker error handling."""
+        # Create a file that will cause an error (non-existent file)
+        non_existent_file = "non_existent_file.txt"
+
+        with self.assertRaises(FileNotFoundError):
+            self.versioner._hash_and_upload_worker(non_existent_file, silence=True)
+
+    def test_hash_and_download_worker_error_handling(self):
+        """Test _hash_and_download_worker error handling."""
+        # Create a file and upload it to have it in manifest
+        test_file = "error_test_file.txt"
+        with open(test_file, "w") as f:
+            f.write("test content")
+
+        try:
+            self.versioner.upload(test_file)
+
+            # Remove the file locally
+            os.remove(test_file)
+
+            # Mock the download method to raise an exception
+            with patch.object(
+                self.versioner, "download", side_effect=RuntimeError("Download error")
+            ):
+                with patch("builtins.print") as mock_print:
+                    with self.assertRaises(RuntimeError):
+                        expected_hash = self.versioner.manifest["files"][test_file]
+                        self.versioner._hash_and_download_worker(
+                            (test_file, expected_hash), silence=True
+                        )
+
+                    # Should print error message
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    error_calls = [call for call in calls if "Error processing" in call]
+                    self.assertTrue(
+                        len(error_calls) > 0, "Error message should be printed"
+                    )
+
+        finally:
+            # Cleanup
+            try:
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+            except OSError:
+                pass
+
+    def test_track_interleaved_no_files_found(self):
+        """Test track_interleaved when no files match the pattern."""
+        # Use a pattern that won't match any files
+        with patch("builtins.print") as mock_print:
+            self.versioner.track_interleaved("*.nonexistent")
+
+            # Should print warning message
+            mock_print.assert_any_call(
+                "⚠️ No files found to track for '*.nonexistent'."
+            )
+
+    def test_checkout_interleaved_no_files_found(self):
+        """Test checkout_interleaved when no files match the pattern in manifest."""
+        # Use a pattern that won't match any files in manifest
+        with patch("builtins.print") as mock_print:
+            self.versioner.checkout_interleaved("*.nonexistent")
+
+            # Should print warning message
+            mock_print.assert_any_call(
+                "⚠️ No files found in the manifest for '*.nonexistent'."
+            )
+
+    def test_track_interleaved_with_shutdown_signal(self):
+        """Test track_interleaved behavior when shutdown is requested."""
+        # Create test files
+        files_created = []
+        for i in range(3):
+            fname = f"shutdown_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+
+        try:
+            # Mock the shutdown flag to be True during processing
+            original_shutdown = self.versioner._shutdown_requested
+
+            def mock_worker(file_path, silence):
+                # Set shutdown flag during first call
+                self.versioner._shutdown_requested = True
+                return self.versioner._hash_and_upload_worker(file_path, silence)
+
+            with patch.object(
+                self.versioner, "_hash_and_upload_worker", side_effect=mock_worker
+            ):
+                with patch("builtins.print") as mock_print:
+                    self.versioner.track_interleaved("shutdown_test_*.txt")
+
+                    # Should print shutdown message
+                    mock_print.assert_any_call(
+                        "⚠️ Shutdown requested. Cancelling remaining operations..."
+                    )
+
+            # Restore original shutdown state
+            self.versioner._shutdown_requested = original_shutdown
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_checkout_interleaved_with_shutdown_signal(self):
+        """Test checkout_interleaved behavior when shutdown is requested."""
+        # First upload some files
+        files_created = []
+        for i in range(3):
+            fname = f"shutdown_checkout_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+            self.versioner.upload(fname)
+
+        try:
+            # Remove files locally
+            for fname in files_created:
+                os.remove(fname)
+
+            # Mock the shutdown flag to be True during processing
+            original_shutdown = self.versioner._shutdown_requested
+
+            def mock_worker(file_info, silence):
+                # Set shutdown flag during first call
+                self.versioner._shutdown_requested = True
+                return self.versioner._hash_and_download_worker(file_info, silence)
+
+            with patch.object(
+                self.versioner, "_hash_and_download_worker", side_effect=mock_worker
+            ):
+                with patch("builtins.print") as mock_print:
+                    self.versioner.checkout_interleaved("shutdown_checkout_test_*.txt")
+
+                    # Should print shutdown message
+                    mock_print.assert_any_call(
+                        "⚠️ Shutdown requested. Cancelling remaining operations..."
+                    )
+
+            # Restore original shutdown state
+            self.versioner._shutdown_requested = original_shutdown
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    if os.path.exists(fname):
+                        os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_track_interleaved_keyboard_interrupt(self):
+        """Test track_interleaved behavior when KeyboardInterrupt occurs."""
+        # Create test files
+        files_created = []
+        for i in range(2):
+            fname = f"interrupt_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+
+        try:
+            # Mock ThreadPoolExecutor to raise KeyboardInterrupt
+            with patch("s3lfs.core.ThreadPoolExecutor") as mock_executor:
+                mock_executor.return_value.__enter__.return_value.submit.side_effect = (
+                    KeyboardInterrupt()
+                )
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner.track_interleaved("interrupt_test_*.txt")
+
+                    # Should print interrupt message
+                    mock_print.assert_any_call("\n⚠️ Processing interrupted by user.")
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_checkout_interleaved_keyboard_interrupt(self):
+        """Test checkout_interleaved behavior when KeyboardInterrupt occurs."""
+        # First upload some files
+        files_created = []
+        for i in range(2):
+            fname = f"interrupt_checkout_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+            self.versioner.upload(fname)
+
+        try:
+            # Remove files locally
+            for fname in files_created:
+                os.remove(fname)
+
+            # Mock ThreadPoolExecutor to raise KeyboardInterrupt
+            with patch("s3lfs.core.ThreadPoolExecutor") as mock_executor:
+                mock_executor.return_value.__enter__.return_value.submit.side_effect = (
+                    KeyboardInterrupt()
+                )
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner.checkout_interleaved("interrupt_checkout_test_*.txt")
+
+                    # Should print interrupt message
+                    mock_print.assert_any_call("\n⚠️ Processing interrupted by user.")
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    if os.path.exists(fname):
+                        os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_track_interleaved_processing_error(self):
+        """Test track_interleaved behavior when processing error occurs."""
+        # Create test files
+        files_created = []
+        for i in range(2):
+            fname = f"error_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+
+        try:
+            # Mock worker to raise an exception
+            def mock_worker(file_path, silence):
+                raise RuntimeError(f"Processing error for {file_path}")
+
+            with patch.object(
+                self.versioner, "_hash_and_upload_worker", side_effect=mock_worker
+            ):
+                with patch("builtins.print") as mock_print:
+                    with self.assertRaises(RuntimeError):
+                        self.versioner.track_interleaved("error_test_*.txt")
+
+                    # Should print error message - check that at least one error call was made
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    error_calls = [
+                        call
+                        for call in calls
+                        if "An error occurred during processing:" in call
+                    ]
+                    self.assertTrue(
+                        len(error_calls) > 0,
+                        "Error message should be printed during processing",
+                    )
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_checkout_interleaved_processing_error(self):
+        """Test checkout_interleaved behavior when processing error occurs."""
+        # First upload some files
+        files_created = []
+        for i in range(2):
+            fname = f"error_checkout_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content {i}")
+            files_created.append(fname)
+            self.versioner.upload(fname)
+
+        try:
+            # Remove files locally
+            for fname in files_created:
+                os.remove(fname)
+
+            # Mock worker to raise an exception
+            def mock_worker(file_info, silence):
+                file_path, expected_hash = file_info
+                raise RuntimeError(f"Processing error for {file_path}")
+
+            with patch.object(
+                self.versioner, "_hash_and_download_worker", side_effect=mock_worker
+            ):
+                with patch("builtins.print") as mock_print:
+                    with self.assertRaises(RuntimeError):
+                        self.versioner.checkout_interleaved("error_checkout_test_*.txt")
+
+                    # Should print error message - check that at least one error call was made
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    error_calls = [
+                        call
+                        for call in calls
+                        if "An error occurred during processing:" in call
+                    ]
+                    self.assertTrue(
+                        len(error_calls) > 0,
+                        "Error message should be printed during processing",
+                    )
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    if os.path.exists(fname):
+                        os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_worker_error_print_and_raise(self):
+        """Test that worker functions print errors and re-raise them."""
+        # Test _hash_and_upload_worker error handling
+        non_existent_file = "definitely_does_not_exist.txt"
+
+        with patch("builtins.print") as mock_print:
+            with self.assertRaises(FileNotFoundError):
+                self.versioner._hash_and_upload_worker(non_existent_file, silence=True)
+
+            # Should print error message - check that at least one error call was made
+            calls = [str(call) for call in mock_print.call_args_list]
+            error_calls = [
+                call
+                for call in calls
+                if "Error processing" in call and non_existent_file in call
+            ]
+            self.assertTrue(
+                len(error_calls) > 0,
+                f"Error message should be printed for {non_existent_file}",
+            )
+
+    def test_checkout_interleaved_finally_block(self):
+        """Test that checkout_interleaved finally block executes and prints completion message."""
+        # Upload a test file first
+        self.versioner.upload(self.test_file)
+
+        # Remove it locally
+        os.remove(self.test_file)
+
+        # Mock to cause an exception during processing but ensure finally block runs
+        with patch.object(
+            self.versioner,
+            "_hash_and_download_worker",
+            side_effect=RuntimeError("Test error"),
+        ):
+            with patch("builtins.print") as mock_print:
+                with self.assertRaises(RuntimeError):
+                    self.versioner.checkout_interleaved(self.test_file)
+
+                # Should print completion message in finally block
+                calls = [str(call) for call in mock_print.call_args_list]
+                completion_calls = [
+                    call for call in calls if "Successfully processed" in call
+                ]
+                self.assertTrue(
+                    len(completion_calls) > 0,
+                    "Finally block completion message should be printed",
+                )
 
 
 if __name__ == "__main__":

@@ -1081,13 +1081,18 @@ class S3LFS:
 
             return True
 
-    def track(self, path, silence=True):
+    def track(self, path, silence=True, interleaved=True):
         """
         Track and upload files, directories, or globs.
 
         :param path: A file, directory, or glob pattern to track.
         :param silence: Silences verbose logging.
+        :param interleaved: If True, use interleaved hashing and uploading for better performance.
         """
+        if interleaved:
+            return self.track_interleaved(path, silence=silence)
+
+        # Original two-stage implementation
         # Phase 1: Resolve filesystem paths and compute hashes
         print("🔍 Resolving filesystem paths and computing hashes...")
         files_to_track = self._resolve_filesystem_paths(path)
@@ -1172,13 +1177,18 @@ class S3LFS:
         progress_bar.update(1)
         return result
 
-    def checkout(self, path, silence=True):
+    def checkout(self, path, silence=True, interleaved=True):
         """
         Checkout files, directories, or globs from the manifest.
 
         :param path: A file, directory, or glob pattern to checkout.
         :param silence: Silences verbose logging.
+        :param interleaved: If True, use interleaved hashing and downloading for better performance.
         """
+        if interleaved:
+            return self.checkout_interleaved(path, silence=silence)
+
+        # Original two-stage implementation
         # Phase 1: Resolve manifest paths using improved globbing
         print("🔒 Resolving paths from manifest...")
         files_to_checkout = self._resolve_manifest_paths(path)
@@ -1294,3 +1304,190 @@ class S3LFS:
                 chunk_index += 1
 
         return chunk_paths
+
+    def _hash_and_upload_worker(self, file_path, silence=True):
+        """
+        Worker function that hashes a file and uploads it if needed.
+        Returns (file_path, hash, uploaded) tuple.
+        """
+        try:
+            current_hash = self.hash_file(file_path)
+
+            # Check if upload is needed
+            with self._lock_context():
+                stored_hash = self.manifest["files"].get(
+                    str(Path(file_path).as_posix())
+                )
+
+            if current_hash == stored_hash:
+                return (file_path, current_hash, False)  # No upload needed
+
+            # Upload the file
+            self.upload(file_path, silence=silence, needs_immediate_update=False)
+            return (file_path, current_hash, True)  # Upload completed
+
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            raise
+
+    def _hash_and_download_worker(self, file_info, silence=True):
+        """
+        Worker function that checks if a file needs download and downloads it if needed.
+        file_info is (file_path, expected_hash) tuple.
+        Returns (file_path, downloaded) tuple.
+        """
+        file_path, expected_hash = file_info
+        try:
+            # Check if file exists and has correct hash
+            if Path(file_path).exists():
+                current_hash = self.hash_file(file_path)
+                if current_hash == expected_hash:
+                    return (file_path, False)  # No download needed
+
+            # Download the file
+            self.download(file_path, silence=silence)
+            return (file_path, True)  # Download completed
+
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            raise
+
+    def track_interleaved(self, path, silence=True):
+        """
+        Track and upload files with interleaved hashing and uploading for better performance.
+
+        :param path: A file, directory, or glob pattern to track.
+        :param silence: Silences verbose logging.
+        """
+        # Phase 1: Resolve filesystem paths
+        print("🔍 Resolving filesystem paths...")
+        files_to_track = self._resolve_filesystem_paths(path)
+
+        if not files_to_track:
+            print(f"⚠️ No files found to track for '{path}'.")
+            return
+
+        print(
+            f"🚀 Processing {len(files_to_track)} files with interleaved hashing and uploading..."
+        )
+
+        # Phase 2: Process files with interleaved hashing and uploading
+        files_uploaded = []
+        files_processed = 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # Submit all hash-and-upload tasks
+                future_to_file = {
+                    executor.submit(
+                        self._hash_and_upload_worker, str(file.as_posix()), silence
+                    ): file
+                    for file in files_to_track
+                }
+
+                # Process results as they complete
+                with tqdm(
+                    total=len(files_to_track), desc="Processing files", unit="file"
+                ) as pbar:
+                    for future in as_completed(future_to_file):
+                        if self._shutdown_requested:
+                            print(
+                                "⚠️ Shutdown requested. Cancelling remaining operations..."
+                            )
+                            return
+
+                        try:
+                            file_path, file_hash, uploaded = future.result()
+                            files_processed += 1
+
+                            if uploaded:
+                                files_uploaded.append((file_path, file_hash))
+
+                            pbar.update(1)
+
+                        except Exception as e:
+                            print(f"An error occurred during processing: {e}")
+                            raise
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Processing interrupted by user.")
+            return
+
+        # Phase 3: Update manifest with all changes
+        if files_uploaded:
+            print(f"📝 Updating manifest with {len(files_uploaded)} uploaded files...")
+            with self._lock_context():
+                self.load_manifest()
+                for file_path, file_hash in files_uploaded:
+                    self.manifest["files"][file_path] = file_hash
+                self.save_manifest()
+
+        print(
+            f"✅ Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
+        )
+
+    def checkout_interleaved(self, path, silence=True):
+        """
+        Checkout files with interleaved hashing and downloading for better performance.
+
+        :param path: A file, directory, or glob pattern to checkout.
+        :param silence: Silences verbose logging.
+        """
+        # Phase 1: Resolve manifest paths
+        print("🔒 Resolving paths from manifest...")
+        files_to_checkout = self._resolve_manifest_paths(path)
+
+        if not files_to_checkout:
+            print(f"⚠️ No files found in the manifest for '{path}'.")
+            return
+
+        print(
+            f"🚀 Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
+        )
+
+        # Phase 2: Process files with interleaved hashing and downloading
+        files_downloaded = 0
+        files_processed = 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # Submit all hash-and-download tasks
+                future_to_file = {
+                    executor.submit(
+                        self._hash_and_download_worker,
+                        (file_path, expected_hash),
+                        silence,
+                    ): file_path
+                    for file_path, expected_hash in files_to_checkout.items()
+                }
+
+                # Process results as they complete
+                with tqdm(
+                    total=len(files_to_checkout), desc="Processing files", unit="file"
+                ) as pbar:
+                    for future in as_completed(future_to_file):
+                        if self._shutdown_requested:
+                            print(
+                                "⚠️ Shutdown requested. Cancelling remaining operations..."
+                            )
+                            break
+
+                        try:
+                            file_path, downloaded = future.result()
+                            files_processed += 1
+
+                            if downloaded:
+                                files_downloaded += 1
+
+                            pbar.update(1)
+
+                        except Exception as e:
+                            print(f"An error occurred during processing: {e}")
+                            raise
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Processing interrupted by user.")
+        finally:
+            print(
+                f"✅ Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
+            )
