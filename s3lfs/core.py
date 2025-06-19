@@ -14,12 +14,14 @@ import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable, Optional, Union
 from uuid import uuid4
 
 import boto3
 import portalocker
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
+from botocore.config import Config
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -29,18 +31,20 @@ from botocore.exceptions import (
 from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
-"""
-import logging
+# Constants
+DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
+DEFAULT_BUFFER_SIZE = 1024 * 1024  # 1 MB
+DEFAULT_THREAD_POOL_SIZE = 8
+DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
+DEFAULT_MAX_CONCURRENCY = 10
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-
-# Set botocore and boto3 loggers to debug
-logging.getLogger('boto3').setLevel(logging.DEBUG)
-logging.getLogger('botocore').setLevel(logging.DEBUG)
-logging.getLogger('s3transfer').setLevel(logging.DEBUG)
-logging.getLogger('urllib3').setLevel(logging.DEBUG)
-"""
+# Common error messages
+ERROR_MESSAGES = {
+    "no_credentials": "AWS credentials are missing. Please configure them or use --no-sign-request.",
+    "partial_credentials": "Incomplete AWS credentials. Check your AWS configuration.",
+    "invalid_credentials": "Invalid AWS credentials. Please verify your access key and secret key.",
+    "s3_access_denied": "Invalid or insufficient AWS credentials for bucket '{bucket_name}'.",
+}
 
 
 def retry(times, exceptions):
@@ -62,8 +66,8 @@ def retry(times, exceptions):
                     return func(*args, **kwargs)
                 except exceptions as exc:
                     print(
-                        "Exception thrown when attempting to run %s, attempt "
-                        "%d of %d: %s" % (func, attempt, times, exc)
+                        f"Exception thrown when attempting to run {func}, attempt "
+                        f"{attempt} of {times}: {exc}"
                     )
                     attempt += 1
             return func(*args, **kwargs)
@@ -82,7 +86,7 @@ class S3LFS:
         encryption=True,
         no_sign_request=False,
         temp_dir=None,
-        chunk_size=5 * 1024 * 1024 * 1024,
+        chunk_size=DEFAULT_CHUNK_SIZE,
         s3_factory=None,
     ):
         """
@@ -96,19 +100,16 @@ class S3LFS:
         :param s3_factory: Custom S3 client factory function (for testing)
         """
         self.chunk_size = chunk_size
-        self.s3_factory = (
-            (
-                lambda no_sign_request: (
-                    boto3.session.Session().client(
-                        "s3", config=boto3.session.Config(signature_version=UNSIGNED)
-                    )
-                    if no_sign_request
-                    else boto3.session.Session().client("s3")
-                )
-            )
-            if s3_factory is None
-            else s3_factory
-        )
+
+        def default_s3_factory(no_sign_request):
+            """Default S3 client factory with proper boto3 usage."""
+            if no_sign_request:
+                config = Config(signature_version=UNSIGNED)
+                return boto3.client("s3", config=config)
+            else:
+                return boto3.client("s3")
+
+        self.s3_factory = s3_factory if s3_factory is not None else default_s3_factory
 
         # Set the temporary directory to the base of the repository if not provided
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
@@ -120,10 +121,11 @@ class S3LFS:
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
             self.config = TransferConfig(
-                multipart_threshold=5 * 1024 * 1024 * 1024, max_concurrency=10
+                multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
+                max_concurrency=DEFAULT_MAX_CONCURRENCY,
             )
         else:
-            self.config = TransferConfig(max_concurrency=10)
+            self.config = TransferConfig(max_concurrency=DEFAULT_MAX_CONCURRENCY)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
         self.no_sign_request = no_sign_request
@@ -138,7 +140,10 @@ class S3LFS:
                 self.bucket_name = self.manifest.get("bucket_name")
 
         if not self.bucket_name:
-            raise ValueError("Bucket name must be provided or stored in the manifest.")
+            raise ValueError(
+                "Bucket name must be provided either as a parameter or stored in the manifest. "
+                "Use 'initialize_repo()' to set up the repository configuration."
+            )
 
         with self._lock_context():
             if repo_prefix:
@@ -180,21 +185,15 @@ class S3LFS:
             try:
                 self.thread_local.s3 = self.s3_factory(self.no_sign_request)
             except NoCredentialsError:
-                raise RuntimeError(
-                    "AWS credentials are missing. Please configure them or use --no-sign-request."
-                )
+                raise RuntimeError(ERROR_MESSAGES["no_credentials"])
             except PartialCredentialsError:
-                raise RuntimeError(
-                    "Incomplete AWS credentials. Check your AWS configuration."
-                )
+                raise RuntimeError(ERROR_MESSAGES["partial_credentials"])
             except ClientError as e:
                 if e.response["Error"]["Code"] in [
                     "InvalidAccessKeyId",
                     "SignatureDoesNotMatch",
                 ]:
-                    raise RuntimeError(
-                        "Invalid AWS credentials. Please verify your access key and secret key."
-                    )
+                    raise RuntimeError(ERROR_MESSAGES["invalid_credentials"])
                 raise RuntimeError(f"Error initializing S3 client: {e}")
 
         return self.thread_local.s3
@@ -207,21 +206,17 @@ class S3LFS:
         :param repo_prefix: A unique prefix for this repository in the bucket
         """
         with self._lock_context():
-            self.manifest["bucket_name"] = self.bucket_name
-            self.manifest["repo_prefix"] = self.repo_prefix
+            # Store configuration in manifest
+            if self.bucket_name is not None:
+                self.manifest["bucket_name"] = str(self.bucket_name)  # type: ignore
+            if self.repo_prefix is not None:
+                self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
             self.save_manifest()
 
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         print("Manifest file saved as .s3_manifest.json")
-
-    def track_subtree(self, directory, silence=True):
-        """
-        Deprecated: Use `track` instead.
-        """
-        print("⚠️ `track_subtree` is deprecated. Use `track` instead.")
-        self.track(directory, silence=silence)
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
@@ -248,7 +243,7 @@ class S3LFS:
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
-    def hash_file(self, file_path, method="auto"):
+    def hash_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
         """
         Compute a unique SHA-256 hash of the file using its content and relative path.
         Supports multiple hashing methods for performance optimization.
@@ -296,7 +291,7 @@ class S3LFS:
                 hasher.update(mm)
         return hasher.hexdigest()
 
-    def _hash_file_iter(self, file_path, chunk_size=1024 * 1024):
+    def _hash_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
         """
         Compute the SHA-256 hash by iteratively reading the file in chunks.
         """
@@ -317,6 +312,91 @@ class S3LFS:
             check=True,
         )
         return result.stdout.split()[0]  # Extract the hash from the output
+
+    def md5_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
+        """
+        Compute an MD5 hash of the file using its content.
+        Supports multiple hashing methods for performance optimization.
+
+        :param file_path: Path to the file to hash.
+        :param method: Hashing method to use. Options are:
+                    - "auto": Automatically select the best method.
+                    - "mmap": Use memory-mapped files (default for non-empty files).
+                    - "iter": Use an iterative read approach (fallback for empty files).
+                    - "cli": Use the `md5sum` CLI utility (POSIX only).
+        :return: The computed MD5 hash as a hexadecimal string.
+        """
+        file_path = Path(file_path)
+
+        # Ensure the file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Automatically select the best method if "auto" is specified
+        if method == "auto":
+            if file_path.stat().st_size == 0:  # Empty file
+                method = "iter"
+            elif sys.platform.startswith("linux") and shutil.which("md5sum"):
+                method = "cli"
+            elif sys.platform.startswith("darwin") and shutil.which("md5"):
+                method = "cli"
+            else:
+                method = "mmap"
+
+        # Use the selected hashing method
+        if method == "mmap":
+            return self._md5_file_mmap(file_path)
+        elif method == "iter":
+            return self._md5_file_iter(file_path)
+        elif method == "cli":
+            return self._md5_file_cli(file_path)
+        else:
+            raise ValueError(f"Unsupported MD5 hashing method: {method}")
+
+    def _md5_file_mmap(self, file_path):
+        """
+        Compute the MD5 hash using memory-mapped files.
+        """
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                hasher.update(mm)
+        return hasher.hexdigest()
+
+    def _md5_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
+        """
+        Compute the MD5 hash by iteratively reading the file in chunks.
+        """
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _md5_file_cli(self, file_path):
+        """
+        Compute the MD5 hash using the appropriate CLI utility (md5sum on Linux, md5 on macOS).
+        """
+        if sys.platform.startswith("linux") and shutil.which("md5sum"):
+            # Linux: use md5sum
+            result = subprocess.run(
+                ["md5sum", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.split()[0]  # Extract the hash from the output
+        elif sys.platform.startswith("darwin") and shutil.which("md5"):
+            # macOS: use md5 -r (for raw output similar to md5sum)
+            result = subprocess.run(
+                ["md5", "-r", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.split()[0]  # Extract the hash from the output
+        else:
+            raise RuntimeError("No suitable MD5 CLI utility found (md5sum or md5)")
 
     def compress_file(self, file_path, method="auto"):
         """
@@ -355,7 +435,7 @@ class S3LFS:
         Compress the file deterministically using Python's gzip module.
         """
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
-        buffer_size = 1024 * 1024  # 1 MB chunks
+        buffer_size = DEFAULT_BUFFER_SIZE
 
         with open(file_path, "rb") as f_in, open(compressed_path, "wb") as f_out:
             with gzip.GzipFile(
@@ -383,143 +463,6 @@ class S3LFS:
             )
 
         return compressed_path
-
-    def file_exists_in_s3(self, s3_key):
-        """Check if a file exists in the S3 bucket."""
-        try:
-            self._get_s3_client().head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                return False
-            raise
-
-    def get_git_commit(self):
-        """Retrieve the current Git commit hash to use for tagging in S3."""
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
-        )
-        return result.stdout.strip()
-
-    @retry(3, (BotoCoreError, ClientError, SSLError))
-    def upload(
-        self,
-        file_path,
-        silence=False,
-        needs_immediate_update=True,
-        progress_callback=None,
-    ):
-        """
-        Upload a file to S3 and update the manifest using the file path as the key.
-        """
-        file_path = Path(file_path)
-        if not file_path.exists():
-            print(f"Error: {file_path} does not exist.")
-            return
-
-        file_hash = self.hash_file(file_path)
-        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
-
-        extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
-        compressed_path = self.compress_file(file_path)
-
-        chunked = False
-        if compressed_path.stat().st_size > self.chunk_size:
-            paths = self.split_file(compressed_path)
-            chunked = True
-        else:
-            paths = [compressed_path]
-
-        for chunk_idx, path in enumerate(paths):
-            try:
-                if not silence:
-                    print(f"Uploading {path}")
-                file_size = path.stat().st_size
-                if progress_callback:
-                    # Use the provided callback for progress updates
-                    callback = progress_callback
-                    context_manager = contextlib.nullcontext()
-                elif not silence:
-                    # Create individual progress bar only if not silenced
-                    progress_bar = tqdm(
-                        total=file_size,
-                        unit="B",
-                        unit_scale=True,
-                        desc=f"Uploading {path.name}",
-                        leave=False,
-                    )
-                    callback = progress_bar.update
-                    context_manager = progress_bar
-                else:
-                    # No progress display
-                    def callback(x):
-                        """No-op callback for when progress display is disabled."""
-                        pass
-
-                    context_manager = contextlib.nullcontext()
-
-                with context_manager:
-                    # Compute the local MD5 checksum
-                    with open(path, "rb") as f:
-                        local_md5 = hashlib.md5(f.read()).hexdigest()
-
-                    # Check if the file already exists in S3 with the same MD5
-                    try:
-                        s3_object = self._get_s3_client().head_object(
-                            Bucket=self.bucket_name,
-                            Key=s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
-                        )
-                        s3_etag = s3_object["ETag"].strip(
-                            '"'
-                        )  # Remove quotes from ETag
-                        if local_md5 == s3_etag:
-                            if not silence:
-                                print(
-                                    f"Skipping upload for {path}, already exists in S3 with matching MD5."
-                                )
-                            continue
-                        else:
-                            if not silence:
-                                print(
-                                    f"MD5 mismatch for {path}: {local_md5}/{s3_etag}, uploading new version."
-                                )
-                    except ClientError as e:
-                        if e.response["Error"]["Code"] != "404":
-                            raise  # Re-raise if it's not a "Not Found" error
-
-                    # Proceed with the upload if MD5 does not match or file does not exist
-                    with open(path, "rb") as f:
-                        self._get_s3_client().upload_fileobj(
-                            f,
-                            self.bucket_name,
-                            s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
-                            ExtraArgs=extra_args,
-                            Config=self.config,
-                            Callback=callback,
-                        )
-                if not silence:
-                    print(f"{path} uploaded")
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-
-        if not silence:
-            print(f"Compressed file removed: {compressed_path}")
-        try:
-            os.remove(compressed_path)  # Ensure temp file is deleted
-        except OSError:
-            pass
-
-        # Store file path as key, hash as value
-        if needs_immediate_update:
-            with self._lock_context():
-                self.load_manifest()
-                self.manifest["files"][str(file_path.as_posix())] = file_hash
-                self.save_manifest()
-        if not silence:
-            print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
 
     def decompress_file(self, compressed_path, output_path=None, method="auto"):
         """
@@ -563,8 +506,17 @@ class S3LFS:
         """
         Decompress the file using Python's gzip module and save it to the output path.
         """
-        with gzip.open(compressed_path, "rb") as f_in, open(output_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+        with gzip.open(compressed_path, "rb") as f_in:
+            with open(output_path, "wb") as f_out:
+                # Use manual chunked copy to avoid type issues
+                while True:
+                    chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                    if not chunk:
+                        break
+                    # Ensure we have bytes for writing
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    f_out.write(chunk)
 
         return output_path
 
@@ -586,101 +538,129 @@ class S3LFS:
         return output_path
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
-    def download(self, file_path, silence=False, progress_callback=None):
+    def upload(
+        self,
+        file_path: Union[str, Path],
+        silence: bool = False,
+        needs_immediate_update: bool = True,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
         """
-        Download a file from S3 by its recorded hash, but skip if it already exists and matches.
+        Upload a file to S3 and update the manifest using the file path as the key.
         """
         file_path = Path(file_path)
-
-        # Get the expected hash for the file
-        with self._lock_context():
-            expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
-        if not expected_hash:
-            print(f"⚠️ File '{file_path}' is not in the manifest.")
+        if not file_path.exists():
+            print(f"Error: {file_path} does not exist.")
             return
 
-        # If the file exists, check its hash
-        if not silence:
-            print(f"file_path exists?: {file_path.exists()}")
-        if file_path.exists():
-            current_hash = self.hash_file(file_path)
-            if not silence:
-                print(f"current_hash: {current_hash}")
-                print(f"expected_hash: {expected_hash}")
-            if current_hash == expected_hash:
-                if not silence:
-                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
-                return  # Skip download if hashes match
+        file_hash = self.hash_file(file_path)
+        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
 
-        # Proceed with download if file is missing or different
-        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
+        extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
+        compressed_path = self.compress_file(file_path)
 
-        compressed_path = self.temp_dir / f"{uuid4()}.gz"
-
-        chunk_keys = self._get_s3_client().list_objects_v2(
-            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
-        )
-        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
-        chunk_keys_sorted = []
-        for i in range(len(chunk_keys)):
-            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
-        chunk_keys = chunk_keys_sorted
-
-        if chunk_keys:
-            keys = chunk_keys
+        chunked = False
+        if compressed_path.stat().st_size > self.chunk_size:
+            paths = self.split_file(compressed_path)
+            chunked = True
         else:
-            keys = [s3_key]
+            paths = [compressed_path]
 
-        base_directrory = os.path.dirname(compressed_path)
-        os.makedirs(base_directrory, exist_ok=True)
-
-        target_paths = []
-        for idx, key in enumerate(keys):
+        for chunk_idx, path in enumerate(paths):
             try:
-                target_path = self.temp_dir / f"{uuid4()}.gz"
-                target_paths.append(target_path)
-                obj = self._get_s3_client().head_object(
-                    Bucket=self.bucket_name, Key=key
-                )
-                file_size = obj["ContentLength"]
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(key)}",
-                    leave=False,
-                ) as progress_bar:
-                    print(f"Downloading {key} to {target_path}")
-                    with open(target_path, "wb") as f:
-                        self._get_s3_client().download_fileobj(
+                if not silence:
+                    print(f"Uploading {path}")
+                file_size = path.stat().st_size
+                # Set up progress callback and context manager
+                if progress_callback:
+                    # Use the provided callback for progress updates
+                    def upload_callback(bytes_transferred):
+                        progress_callback(bytes_transferred)
+
+                    context_manager = contextlib.nullcontext()
+                elif not silence:
+                    # Create individual progress bar only if not silenced
+                    progress_bar = tqdm(
+                        total=file_size,
+                        unit="B",
+                        unit_scale=True,
+                        desc=f"Uploading {path.name}",
+                        leave=False,
+                    )
+
+                    def upload_callback(bytes_transferred):
+                        progress_bar.update(bytes_transferred)
+
+                    context_manager = progress_bar
+                else:
+                    # No progress display
+                    def upload_callback(bytes_transferred):
+                        pass
+
+                    context_manager = contextlib.nullcontext()
+
+                with context_manager:
+                    # Compute the local MD5 checksum
+                    with open(path, "rb") as f:
+                        local_md5 = hashlib.md5(f.read()).hexdigest()
+
+                    # Check if the file already exists in S3 with the same MD5
+                    try:
+                        s3_object = self._get_s3_client().head_object(
                             Bucket=self.bucket_name,
-                            Key=key,
-                            Fileobj=f,
-                            Callback=progress_bar.update,
+                            Key=s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
                         )
-            except Exception as e:
-                print(f"❌ Error downloading {key}: {e}")
+                        s3_etag = s3_object["ETag"].strip(
+                            '"'
+                        )  # Remove quotes from ETag
+                        if local_md5 == s3_etag:
+                            if not silence:
+                                print(
+                                    f"Skipping upload for {path}, already exists in S3 with matching MD5."
+                                )
+                            continue
+                        else:
+                            if not silence:
+                                print(
+                                    f"MD5 mismatch for {path}: {local_md5}/{s3_etag}, uploading new version."
+                                )
+                    except ClientError as e:
+                        if e.response["Error"]["Code"] != "404":
+                            raise  # Re-raise if it's not a "Not Found" error
 
-        if chunk_keys:
-            compressed_path = self.merge_files(compressed_path, target_paths)
-            for path in target_paths:
-                os.remove(path)
-        else:
-            compressed_path = target_paths[0]
+                    # Proceed with the upload if MD5 does not match or file does not exist
+                    with open(path, "rb") as f:
+                        self._get_s3_client().upload_fileobj(
+                            f,
+                            self.bucket_name,
+                            s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
+                            ExtraArgs=extra_args,
+                            Config=self.config,
+                            Callback=upload_callback,
+                        )
+                if not silence:
+                    print(f"{path} uploaded")
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
-        if os.path.dirname(file_path):
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        try:
-            self.decompress_file(compressed_path, file_path)
-        except Exception as e:
-            print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
-            raise
-        os.remove(compressed_path)  # Ensure temp file is deleted
         if not silence:
-            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+            print(f"Compressed file removed: {compressed_path}")
+        try:
+            os.remove(compressed_path)  # Ensure temp file is deleted
+        except OSError:
+            pass
 
-        # Return bytes transferred for progress tracking
-        return file_path.stat().st_size if file_path.exists() else 0
+        # Store file path as key, hash as value
+        if needs_immediate_update:
+            with self._lock_context():
+                self.load_manifest()
+                self.manifest["files"][str(file_path.as_posix())] = file_hash
+                self.save_manifest()
+        if not silence:
+            print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
 
     def remove_file(self, file_path, keep_in_s3=True):
         """
@@ -734,7 +714,7 @@ class S3LFS:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    parts = key.replace(self.repo_prefix + "/", "").split("/")
+                    parts = key.replace(f"{self.repo_prefix}/", "").split("/")
                     if len(parts) < 3:
                         continue
 
@@ -774,7 +754,7 @@ class S3LFS:
             )  # Files listed in the manifest
 
         # Compute hashes in parallel
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
             results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
 
         # Process results
@@ -808,7 +788,7 @@ class S3LFS:
             print("🔐 Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
                 executor.submit(
@@ -844,7 +824,7 @@ class S3LFS:
         self.test_s3_credentials()
 
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 # Submit all tasks and collect futures
                 futures = [
                     executor.submit(self.download, kv[0], silence=silence)
@@ -872,41 +852,6 @@ class S3LFS:
             print("\n⚠️ Download interrupted by user.")
         finally:
             print("✅ All files downloaded.")
-
-    def sparse_checkout(self, prefix, silence=True):
-        """
-        Deprecated: Use `checkout` instead.
-        """
-        print("⚠️ `sparse_checkout` is deprecated. Use `checkout` instead.")
-        self.checkout(prefix, silence=silence)
-
-    def integrate_with_git(self):
-        """
-        Set up Git hooks for a more seamless S3-based large file workflow.
-        """
-        hook_path = ".git/hooks/pre-commit"
-        new_command = "s3lfs track-modified\n"
-
-        # Ensure the hooks directory exists
-        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
-
-        # Check if the pre-commit hook already exists
-        if os.path.exists(hook_path):
-            with open(hook_path, "r") as f:
-                existing_content = f.readlines()
-
-            # Avoid duplicate entries
-            if new_command not in existing_content:
-                with open(hook_path, "a") as f:
-                    f.write("\n" + new_command)
-        else:
-            # Create a new pre-commit hook
-            with open(hook_path, "w") as f:
-                f.write("#!/bin/sh\n" + new_command)
-
-        # Ensure the hook is executable
-        os.chmod(hook_path, 0o755)
-        print("Git integration setup completed.")
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
@@ -957,11 +902,9 @@ class S3LFS:
             if not silence:
                 print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
         except NoCredentialsError:
-            raise RuntimeError("AWS credentials are missing. Please configure them.")
+            raise RuntimeError(ERROR_MESSAGES["no_credentials"])
         except PartialCredentialsError:
-            raise RuntimeError(
-                "Incomplete AWS credentials. Check your AWS configuration."
-            )
+            raise RuntimeError(ERROR_MESSAGES["partial_credentials"])
         except ClientError as e:
             if e.response["Error"]["Code"] in [
                 "InvalidAccessKeyId",
@@ -969,7 +912,9 @@ class S3LFS:
                 "AccessDenied",
             ]:
                 raise RuntimeError(
-                    f"Invalid or insufficient AWS credentials for bucket '{self.bucket_name}'."
+                    ERROR_MESSAGES["s3_access_denied"].format(
+                        bucket_name=self.bucket_name
+                    )
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
 
@@ -1138,7 +1083,7 @@ class S3LFS:
 
         # Compute hashes in parallel with a progress bar
         with tqdm(total=len(files_to_track), desc="Hashing files", unit="file") as pbar:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 file_hashes = {
                     str(file.as_posix()): hash_result
                     for file, hash_result in zip(
@@ -1172,7 +1117,7 @@ class S3LFS:
         # Phase 3: Upload files needing updates
         print("🚀 Uploading files...")
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 futures = [
                     executor.submit(
                         self.upload,
@@ -1247,7 +1192,7 @@ class S3LFS:
         with tqdm(
             total=len(files_to_checkout), desc="Hashing files", unit="file"
         ) as pbar:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 future_to_file = {
                     executor.submit(self._hash_with_progress, Path(file), pbar): file
                     for file in files_to_checkout.keys()
@@ -1277,7 +1222,7 @@ class S3LFS:
         # Phase 3: Download files that need updates
         print("🚀 Downloading files...")
         try:
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
                 futures = [
                     executor.submit(self.download, file, silence=silence)
                     for file in files_to_download
@@ -1456,7 +1401,9 @@ class S3LFS:
                     """Callback to update the bytes progress bar"""
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                with ThreadPoolExecutor(
+                    max_workers=DEFAULT_THREAD_POOL_SIZE
+                ) as executor:
                     # Submit all hash-and-upload tasks
                     future_to_file = {
                         executor.submit(
@@ -1567,7 +1514,9 @@ class S3LFS:
                     """Callback to update the bytes progress bar"""
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                with ThreadPoolExecutor(
+                    max_workers=DEFAULT_THREAD_POOL_SIZE
+                ) as executor:
                     # Submit all hash-and-download tasks
                     future_to_file = {
                         executor.submit(
@@ -1618,3 +1567,105 @@ class S3LFS:
             print(
                 f"✅ Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
             )
+
+    @retry(3, (BotoCoreError, ClientError, SSLError))
+    def download(
+        self,
+        file_path: Union[str, Path],
+        silence: bool = False,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> Optional[int]:
+        """
+        Download a file from S3 by its recorded hash, but skip if it already exists and matches.
+        """
+        file_path = Path(file_path)
+
+        # Get the expected hash for the file
+        with self._lock_context():
+            expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
+        if not expected_hash:
+            print(f"⚠️ File '{file_path}' is not in the manifest.")
+            return None
+
+        # If the file exists, check its hash
+        if not silence:
+            print(f"file_path exists?: {file_path.exists()}")
+        if file_path.exists():
+            current_hash = self.hash_file(file_path)
+            if not silence:
+                print(f"current_hash: {current_hash}")
+                print(f"expected_hash: {expected_hash}")
+            if current_hash == expected_hash:
+                if not silence:
+                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
+                return 0  # Skip download if hashes match
+
+        # Proceed with download if file is missing or different
+        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
+
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
+
+        chunk_keys = self._get_s3_client().list_objects_v2(
+            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
+        )
+        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
+        chunk_keys_sorted = []
+        for i in range(len(chunk_keys)):
+            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
+        chunk_keys = chunk_keys_sorted
+
+        if chunk_keys:
+            keys = chunk_keys
+        else:
+            keys = [s3_key]
+
+        base_directrory = os.path.dirname(compressed_path)
+        os.makedirs(base_directrory, exist_ok=True)
+
+        target_paths = []
+        for idx, key in enumerate(keys):
+            try:
+                target_path = self.temp_dir / f"{uuid4()}.gz"
+                target_paths.append(target_path)
+                obj = self._get_s3_client().head_object(
+                    Bucket=self.bucket_name, Key=key
+                )
+                file_size = obj["ContentLength"]
+                with tqdm(
+                    total=file_size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=f"Downloading {os.path.basename(key)}",
+                    leave=False,
+                ) as progress_bar:
+                    print(f"Downloading {key} to {target_path}")
+                    with open(target_path, "wb") as f:
+                        self._get_s3_client().download_fileobj(
+                            Bucket=self.bucket_name,
+                            Key=key,
+                            Fileobj=f,
+                            Callback=progress_bar.update,
+                        )
+            except Exception as e:
+                print(f"❌ Error downloading {key}: {e}")
+
+        if chunk_keys:
+            compressed_path = self.merge_files(compressed_path, target_paths)
+            for path in target_paths:
+                os.remove(path)
+        else:
+            compressed_path = target_paths[0]
+
+        if os.path.dirname(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        try:
+            self.decompress_file(compressed_path, file_path)
+        except Exception as e:
+            print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
+            raise
+        os.remove(compressed_path)  # Ensure temp file is deleted
+        if not silence:
+            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+
+        # Return bytes transferred for progress tracking
+        return file_path.stat().st_size if file_path.exists() else 0
