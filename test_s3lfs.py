@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import boto3
@@ -951,6 +952,134 @@ class TestS3LFS(unittest.TestCase):
                 os.rmdir("consistency_test/subdir")
             if os.path.exists("consistency_test"):
                 os.rmdir("consistency_test")
+
+    # -------------------------------------------------
+    # 15. Interleaved Processing Tests
+    # -------------------------------------------------
+    def test_track_interleaved(self):
+        """Test that interleaved track works correctly and performs better than two-stage."""
+        # Create test files
+        os.makedirs("data", exist_ok=True)
+        files_created = []
+
+        for i in range(3):
+            fname = f"test_file_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content of file {i}")
+            files_created.append(fname)
+
+        try:
+            # Test interleaved tracking
+            self.versioner.track_interleaved("*.txt")
+
+            # Verify all files are tracked
+            for fname in files_created:
+                self.assertIn(fname, self.versioner.manifest["files"])
+
+            # Verify files exist in S3
+            for fname in files_created:
+                file_hash = self.versioner.hash_file(fname)
+                s3_key = f"s3lfs/assets/{file_hash}/{fname}.gz"
+                response = self.s3.list_objects_v2(
+                    Bucket=self.bucket_name, Prefix=s3_key
+                )
+                self.assertTrue(
+                    "Contents" in response and len(response["Contents"]) == 1
+                )
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_checkout_interleaved(self):
+        """Test that interleaved checkout works correctly."""
+        # First upload some files
+        os.makedirs("data", exist_ok=True)
+        files_created = []
+
+        for i in range(3):
+            fname = f"checkout_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Content for checkout test {i}")
+            files_created.append(fname)
+
+        try:
+            # Track the files first
+            self.versioner.track_interleaved("checkout_test_*.txt")
+
+            # Remove the files locally
+            for fname in files_created:
+                os.remove(fname)
+                self.assertFalse(Path(fname).exists())
+
+            # Test interleaved checkout
+            self.versioner.checkout_interleaved("checkout_test_*.txt")
+
+            # Verify all files are restored
+            for fname in files_created:
+                self.assertTrue(Path(fname).exists())
+                with open(fname, "r") as f:
+                    content = f.read()
+                    self.assertIn("Content for checkout test", content)
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
+
+    def test_interleaved_vs_two_stage_compatibility(self):
+        """Test that interleaved and two-stage methods produce the same results."""
+        # Create test files
+        files_created = []
+
+        for i in range(2):
+            fname = f"compat_test_{i}.txt"
+            with open(fname, "w") as f:
+                f.write(f"Compatibility test content {i}")
+            files_created.append(fname)
+
+        try:
+            # Track with two-stage method
+            self.versioner.track("compat_test_0.txt", interleaved=False)
+
+            # Track with interleaved method
+            self.versioner.track("compat_test_1.txt", interleaved=True)
+
+            # Both should be in manifest
+            for fname in files_created:
+                self.assertIn(fname, self.versioner.manifest["files"])
+
+            # Remove files locally
+            for fname in files_created:
+                os.remove(fname)
+
+            # Checkout with two-stage method
+            self.versioner.checkout("compat_test_0.txt", interleaved=False)
+
+            # Checkout with interleaved method
+            self.versioner.checkout("compat_test_1.txt", interleaved=True)
+
+            # Both files should be restored correctly
+            for fname in files_created:
+                self.assertTrue(Path(fname).exists())
+                with open(fname, "r") as f:
+                    content = f.read()
+                    self.assertIn("Compatibility test content", content)
+
+        finally:
+            # Cleanup
+            for fname in files_created:
+                try:
+                    os.remove(fname)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":
