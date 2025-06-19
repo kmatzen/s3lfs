@@ -97,11 +97,13 @@ class S3LFS:
         self.chunk_size = chunk_size
         self.s3_factory = (
             (
-                lambda no_sign_request: boto3.session.Session().client(
-                    "s3", config=boto3.session.Config(signature_version=UNSIGNED)
+                lambda no_sign_request: (
+                    boto3.session.Session().client(
+                        "s3", config=boto3.session.Config(signature_version=UNSIGNED)
+                    )
+                    if no_sign_request
+                    else boto3.session.Session().client("s3")
                 )
-                if no_sign_request
-                else boto3.session.Session().client("s3")
             )
             if s3_factory is None
             else s3_factory
