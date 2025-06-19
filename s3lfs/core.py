@@ -1,3 +1,5 @@
+import fnmatch
+import glob
 import gzip
 import hashlib
 import json
@@ -95,11 +97,13 @@ class S3LFS:
         self.chunk_size = chunk_size
         self.s3_factory = (
             (
-                lambda no_sign_request: boto3.session.Session().client(
-                    "s3", config=boto3.session.Config(signature_version=UNSIGNED)
+                lambda no_sign_request: (
+                    boto3.session.Session().client(
+                        "s3", config=boto3.session.Config(signature_version=UNSIGNED)
+                    )
+                    if no_sign_request
+                    else boto3.session.Session().client("s3")
                 )
-                if no_sign_request
-                else boto3.session.Session().client("s3")
             )
             if s3_factory is None
             else s3_factory
@@ -352,14 +356,15 @@ class S3LFS:
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
         buffer_size = 1024 * 1024  # 1 MB chunks
 
-        with open(file_path, "rb") as f_in, gzip.GzipFile(
-            filename="",  # avoid embedding filename
-            mode="wb",
-            fileobj=open(compressed_path, "wb"),
-            compresslevel=5,
-            mtime=0,  # fixed mtime for determinism
-        ) as f_out:
-            shutil.copyfileobj(f_in, f_out, length=buffer_size)
+        with open(file_path, "rb") as f_in, open(compressed_path, "wb") as f_out:
+            with gzip.GzipFile(
+                filename="",  # avoid embedding filename
+                mode="wb",
+                fileobj=f_out,
+                compresslevel=5,
+                mtime=0,  # fixed mtime for determinism
+            ) as gz_out:
+                shutil.copyfileobj(f_in, gz_out, length=buffer_size)
 
         return compressed_path
 
@@ -431,7 +436,8 @@ class S3LFS:
                     leave=False,
                 ) as progress_bar:
                     # Compute the local MD5 checksum
-                    local_md5 = hashlib.md5(open(path, "rb").read()).hexdigest()
+                    with open(path, "rb") as f:
+                        local_md5 = hashlib.md5(f.read()).hexdigest()
 
                     # Check if the file already exists in S3 with the same MD5
                     try:
@@ -932,6 +938,149 @@ class S3LFS:
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
 
+    def _resolve_filesystem_paths(self, path):
+        """
+        Resolve a path pattern to actual filesystem paths.
+        Used for tracking operations.
+
+        :param path: Path object that could be a file, directory, or glob pattern
+        :return: List of Path objects for files found
+        """
+        path = Path(path)
+
+        # If it's an existing file, return it directly
+        if path.is_file():
+            return [path]
+
+        # If it's an existing directory, get all files recursively
+        if path.is_dir():
+            return [f for f in path.rglob("*") if f.is_file()]
+
+        # Otherwise treat as a glob pattern
+        # Handle both absolute and relative patterns properly
+        if path.is_absolute():
+            # For absolute paths, use glob.glob directly
+            matched_paths = glob.glob(str(path), recursive=True)
+        else:
+            # For relative paths, use Path.glob for better handling
+            try:
+                if "/" in str(path):
+                    # Multi-level glob pattern like "data/**/*.txt"
+                    parent = Path(".")
+                    pattern = str(path)
+                    matched_paths = [str(p) for p in parent.glob(pattern)]
+                else:
+                    # Simple pattern like "*.txt"
+                    matched_paths = glob.glob(str(path))
+            except Exception:
+                # Fallback to simple glob
+                matched_paths = glob.glob(str(path))
+
+        # Filter to only return files, not directories
+        return [Path(p) for p in matched_paths if Path(p).is_file()]
+
+    def _resolve_manifest_paths(self, path):
+        """
+        Resolve a path pattern against the manifest contents.
+        Used for checkout operations.
+
+        :param path: Path object that could be a file, directory, or glob pattern
+        :return: Dictionary of manifest entries {file_path: hash}
+        """
+        path_str = str(Path(path).as_posix())
+
+        with self._lock_context():
+            manifest_files = self.manifest["files"]
+
+            # Check for exact file match first
+            if path_str in manifest_files:
+                return {path_str: manifest_files[path_str]}
+
+            # Check if it has glob characters
+            has_glob_chars = any(char in path_str for char in ["*", "?", "[", "]"])
+
+            if has_glob_chars:
+                # Implement proper filesystem-like glob behavior
+                matched_files = {}
+                for file_path, file_hash in manifest_files.items():
+                    if self._glob_match(file_path, path_str):
+                        matched_files[file_path] = file_hash
+            else:
+                # Treat as directory prefix - match files that start with the path
+                # Add trailing slash if not present to avoid partial matches
+                prefix = path_str if path_str.endswith("/") else f"{path_str}/"
+                matched_files = {
+                    file_path: file_hash
+                    for file_path, file_hash in manifest_files.items()
+                    if file_path.startswith(prefix)
+                }
+
+                # If no directory matches found, it might be a file without extension
+                # or a directory that was specified without trailing slash
+                if not matched_files:
+                    # Try matching files that start with the exact path (for files)
+                    matched_files = {
+                        file_path: file_hash
+                        for file_path, file_hash in manifest_files.items()
+                        if file_path == path_str
+                    }
+
+            return matched_files
+
+    def _glob_match(self, file_path, pattern):
+        """
+        Custom glob matching that behaves like filesystem glob.
+
+        :param file_path: The file path to test
+        :param pattern: The glob pattern
+        :return: True if the file path matches the pattern
+        """
+        # Handle ** recursive patterns
+        if "**" in pattern:
+            # Convert ** patterns to regex-like behavior
+            # Split on ** and handle each part
+            parts = pattern.split("**")
+            if len(parts) == 2:
+                prefix, suffix = parts
+                prefix = prefix.rstrip("/")
+                suffix = suffix.lstrip("/")
+
+                # Check if file starts with prefix (if any) and ends with suffix pattern
+                if prefix and not file_path.startswith(prefix):
+                    return False
+
+                # For the suffix, we need to match it against the remaining path
+                if suffix:
+                    if prefix:
+                        remaining_path = file_path[len(prefix) :].lstrip("/")
+                    else:
+                        remaining_path = file_path
+
+                    # Use fnmatch for the suffix part
+                    return fnmatch.fnmatch(remaining_path, suffix)
+                else:
+                    # Pattern ends with **, so just check prefix
+                    return not prefix or file_path.startswith(prefix)
+            else:
+                # Multiple ** or more complex pattern - fall back to fnmatch
+                return fnmatch.fnmatch(file_path, pattern)
+        else:
+            # For non-recursive patterns, we need to ensure * doesn't cross directories
+            # Split both the pattern and file path by / and match segment by segment
+            pattern_parts = pattern.split("/")
+            file_parts = file_path.split("/")
+
+            # If pattern has fewer parts than file, it can't match (unless it's just *)
+            if len(pattern_parts) != len(file_parts):
+                return False
+
+            # Match each segment
+            for pattern_part, file_part in zip(pattern_parts, file_parts):
+                if not fnmatch.fnmatch(file_part, pattern_part):
+                    return False
+
+            return True
+
     def track(self, path, silence=True):
         """
         Track and upload files, directories, or globs.
@@ -939,19 +1088,9 @@ class S3LFS:
         :param path: A file, directory, or glob pattern to track.
         :param silence: Silences verbose logging.
         """
-        path = Path(path)
-
-        # Phase 1: Compute hashes for files on the filesystem in parallel
-        print("🔍 Computing hashes for files on the filesystem...")
-        if path.is_file():
-            files_to_track = [path]
-        elif path.is_dir():
-            files_to_track = [f for f in path.rglob("*") if f.is_file()]
-        else:
-            # Treat as a glob pattern
-            files_to_track = [
-                Path(f) for f in path.parent.glob(path.name) if Path(f).is_file()
-            ]
+        # Phase 1: Resolve filesystem paths and compute hashes
+        print("🔍 Resolving filesystem paths and computing hashes...")
+        files_to_track = self._resolve_filesystem_paths(path)
 
         if not files_to_track:
             print(f"⚠️ No files found to track for '{path}'.")
@@ -1040,34 +1179,9 @@ class S3LFS:
         :param path: A file, directory, or glob pattern to checkout.
         :param silence: Silences verbose logging.
         """
-        path = Path(path)
-
-        # Phase 1: Lock the manifest and read contents
-        print("🔒 Locking manifest to read contents...")
-        with self._lock_context():
-            path_str = str(path.as_posix())
-            if "*" in path_str or "?" in path_str:  # Glob pattern
-                files_to_checkout = {
-                    file: self.manifest["files"][file]
-                    for file in self.manifest["files"]
-                    if Path(file).match(path_str)
-                }
-            else:
-                # Treat as a directory if it matches as a prefix in the manifest
-                prefix = path_str if path_str.endswith("/") else f"{path_str}/"
-                files_to_checkout = {
-                    file: self.manifest["files"][file]
-                    for file in self.manifest["files"]
-                    if file.startswith(prefix)
-                }
-
-                # If no files match the prefix, treat it as a single file
-                if not files_to_checkout:
-                    files_to_checkout = {
-                        file: self.manifest["files"][file]
-                        for file in self.manifest["files"]
-                        if file == path_str
-                    }
+        # Phase 1: Resolve manifest paths using improved globbing
+        print("🔒 Resolving paths from manifest...")
+        files_to_checkout = self._resolve_manifest_paths(path)
 
         if not files_to_checkout:
             print(f"⚠️ No files found in the manifest for '{path}'.")
@@ -1086,7 +1200,7 @@ class S3LFS:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 future_to_file = {
                     executor.submit(self._hash_with_progress, Path(file), pbar): file
-                    for file in files_to_checkout.keys()  # Use index for consistent progress bar position
+                    for file in files_to_checkout.keys()
                     if Path(file).exists()  # Only hash files that exist on disk
                 }
 

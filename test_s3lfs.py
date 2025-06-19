@@ -494,6 +494,464 @@ class TestS3LFS(unittest.TestCase):
             # Verify the error is related to authentication
             self.assertIn("InvalidAccessKeyId", str(context.exception))
 
+    # -------------------------------------------------
+    # 13. Globbing Functionality Tests
+    # -------------------------------------------------
+    def test_track_filesystem_globbing(self):
+        """Test that track() uses filesystem-based globbing patterns correctly."""
+        # Create a complex directory structure for testing
+        os.makedirs("data/subdir", exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+
+        # Create various test files
+        files_created = []
+
+        # Root level files
+        for fname in ["file1.txt", "file2.txt", "config.json", "readme.md"]:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+            files_created.append(fname)
+
+        # Data directory files
+        for fname in [
+            "data/dataset1.txt",
+            "data/dataset2.csv",
+            "data/subdir/nested.txt",
+        ]:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+            files_created.append(fname)
+
+        # Logs directory files
+        for fname in ["logs/app.log", "logs/error.log"]:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+            files_created.append(fname)
+
+        try:
+            # Test 1: Simple glob pattern - only root level .txt files
+            self.versioner.track("*.txt")
+            tracked_files = list(self.versioner.manifest["files"].keys())
+            expected_root_txt = ["file1.txt", "file2.txt"]
+            for expected in expected_root_txt:
+                self.assertIn(expected, tracked_files)
+            # Should NOT include nested txt files
+            self.assertNotIn("data/dataset1.txt", tracked_files)
+            self.assertNotIn("data/subdir/nested.txt", tracked_files)
+
+            # Clear manifest for next test
+            self.versioner.manifest["files"] = {}
+            self.versioner.save_manifest()
+
+            # Test 2: Directory tracking
+            self.versioner.track("data")
+            tracked_files = list(self.versioner.manifest["files"].keys())
+            expected_data_files = [
+                "data/dataset1.txt",
+                "data/dataset2.csv",
+                "data/subdir/nested.txt",
+            ]
+            for expected in expected_data_files:
+                self.assertIn(expected, tracked_files)
+            # Should NOT include root level files
+            self.assertNotIn("file1.txt", tracked_files)
+
+            # Clear manifest for next test
+            self.versioner.manifest["files"] = {}
+            self.versioner.save_manifest()
+
+            # Test 3: Recursive glob pattern
+            self.versioner.track("**/*.txt")
+            tracked_files = list(self.versioner.manifest["files"].keys())
+            expected_all_txt = [
+                "file1.txt",
+                "file2.txt",
+                "data/dataset1.txt",
+                "data/subdir/nested.txt",
+            ]
+            for expected in expected_all_txt:
+                self.assertIn(expected, tracked_files)
+            # Should NOT include non-txt files
+            self.assertNotIn("config.json", tracked_files)
+            self.assertNotIn("data/dataset2.csv", tracked_files)
+
+            # Clear manifest for next test
+            self.versioner.manifest["files"] = {}
+            self.versioner.save_manifest()
+
+            # Test 4: Directory-specific glob
+            self.versioner.track("data/*.txt")
+            tracked_files = list(self.versioner.manifest["files"].keys())
+            self.assertIn("data/dataset1.txt", tracked_files)
+            # Should NOT include files in subdirectories of data/
+            self.assertNotIn("data/subdir/nested.txt", tracked_files)
+            # Should NOT include root level files
+            self.assertNotIn("file1.txt", tracked_files)
+
+        finally:
+            # Clean up all created files
+            for fname in files_created:
+                if os.path.exists(fname):
+                    os.remove(fname)
+            # Clean up directories
+            if os.path.exists("data/subdir"):
+                os.rmdir("data/subdir")
+            if os.path.exists("data"):
+                os.rmdir("data")
+            if os.path.exists("logs"):
+                shutil.rmtree("logs")
+
+    def test_checkout_manifest_globbing(self):
+        """Test that checkout() uses manifest-based globbing patterns correctly."""
+        # Create test files and upload them
+        os.makedirs("data/subdir", exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+
+        files_created = []
+
+        # Create and upload various test files
+        test_files = [
+            "file1.txt",
+            "file2.txt",
+            "config.json",
+            "data/dataset1.txt",
+            "data/dataset2.csv",
+            "data/subdir/nested.txt",
+            "logs/app.log",
+            "logs/error.log",
+        ]
+
+        for fname in test_files:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+            self.versioner.upload(fname)
+            files_created.append(fname)
+
+        try:
+            # Remove all local files to test checkout
+            for fname in files_created:
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+            # Test 1: Simple glob pattern - only root level .txt files
+            self.versioner.checkout("*.txt")
+
+            # Check which files were downloaded
+            expected_root_txt = ["file1.txt", "file2.txt"]
+            for expected in expected_root_txt:
+                self.assertTrue(
+                    os.path.exists(expected), f"{expected} should have been downloaded"
+                )
+
+            # Should NOT have downloaded nested txt files with simple glob
+            self.assertFalse(
+                os.path.exists("data/dataset1.txt"),
+                "data/dataset1.txt should NOT have been downloaded",
+            )
+            self.assertFalse(
+                os.path.exists("data/subdir/nested.txt"),
+                "data/subdir/nested.txt should NOT have been downloaded",
+            )
+
+            # Clean up for next test
+            for fname in expected_root_txt:
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+            # Test 2: Directory checkout
+            self.versioner.checkout("data")
+
+            # Check that all files in data/ were downloaded
+            expected_data_files = [
+                "data/dataset1.txt",
+                "data/dataset2.csv",
+                "data/subdir/nested.txt",
+            ]
+            for expected in expected_data_files:
+                self.assertTrue(
+                    os.path.exists(expected), f"{expected} should have been downloaded"
+                )
+
+            # Should NOT have downloaded root level files
+            self.assertFalse(
+                os.path.exists("file1.txt"), "file1.txt should NOT have been downloaded"
+            )
+
+            # Clean up for next test
+            for fname in expected_data_files:
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+            # Test 3: Recursive glob pattern
+            self.versioner.checkout("**/*.txt")
+
+            # Check that all .txt files were downloaded
+            expected_all_txt = [
+                "file1.txt",
+                "file2.txt",
+                "data/dataset1.txt",
+                "data/subdir/nested.txt",
+            ]
+            for expected in expected_all_txt:
+                self.assertTrue(
+                    os.path.exists(expected), f"{expected} should have been downloaded"
+                )
+
+            # Should NOT have downloaded non-txt files
+            self.assertFalse(
+                os.path.exists("config.json"),
+                "config.json should NOT have been downloaded",
+            )
+            self.assertFalse(
+                os.path.exists("data/dataset2.csv"),
+                "data/dataset2.csv should NOT have been downloaded",
+            )
+
+            # Clean up for next test
+            for fname in expected_all_txt:
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+            # Test 4: Directory-specific glob
+            self.versioner.checkout("data/*.txt")
+
+            # Should download only .txt files directly in data/
+            self.assertTrue(
+                os.path.exists("data/dataset1.txt"),
+                "data/dataset1.txt should have been downloaded",
+            )
+
+            # Should NOT download files in subdirectories or other extensions
+            self.assertFalse(
+                os.path.exists("data/subdir/nested.txt"),
+                "data/subdir/nested.txt should NOT have been downloaded",
+            )
+            self.assertFalse(
+                os.path.exists("data/dataset2.csv"),
+                "data/dataset2.csv should NOT have been downloaded",
+            )
+            self.assertFalse(
+                os.path.exists("file1.txt"), "file1.txt should NOT have been downloaded"
+            )
+
+            # Test 5: Specific file checkout
+            if os.path.exists("data/dataset1.txt"):
+                os.remove("data/dataset1.txt")
+
+            self.versioner.checkout("data/dataset1.txt")
+            self.assertTrue(
+                os.path.exists("data/dataset1.txt"),
+                "data/dataset1.txt should have been downloaded",
+            )
+
+        finally:
+            # Clean up all created files
+            for fname in files_created:
+                if os.path.exists(fname):
+                    os.remove(fname)
+            # Clean up directories
+            if os.path.exists("data/subdir"):
+                os.rmdir("data/subdir")
+            if os.path.exists("data"):
+                os.rmdir("data")
+            if os.path.exists("logs"):
+                shutil.rmtree("logs")
+
+    def test_glob_match_helper_function(self):
+        """Test the internal _glob_match helper function directly."""
+        # Test non-recursive patterns
+        self.assertTrue(self.versioner._glob_match("file.txt", "*.txt"))
+        self.assertFalse(self.versioner._glob_match("dir/file.txt", "*.txt"))
+        self.assertTrue(self.versioner._glob_match("dir/file.txt", "dir/*.txt"))
+        self.assertFalse(self.versioner._glob_match("dir/subdir/file.txt", "dir/*.txt"))
+
+        # Test recursive patterns
+        self.assertTrue(self.versioner._glob_match("file.txt", "**/*.txt"))
+        self.assertTrue(self.versioner._glob_match("dir/file.txt", "**/*.txt"))
+        self.assertTrue(self.versioner._glob_match("dir/subdir/file.txt", "**/*.txt"))
+
+        # Test prefix recursive patterns
+        self.assertTrue(self.versioner._glob_match("data/file.txt", "data/**/*.txt"))
+        self.assertTrue(
+            self.versioner._glob_match("data/subdir/file.txt", "data/**/*.txt")
+        )
+        self.assertFalse(self.versioner._glob_match("logs/file.txt", "data/**/*.txt"))
+
+        # Test complex patterns
+        self.assertTrue(self.versioner._glob_match("data/test.log", "data/*.log"))
+        self.assertFalse(
+            self.versioner._glob_match("data/subdir/test.log", "data/*.log")
+        )
+
+    def test_resolve_filesystem_paths_helper(self):
+        """Test the _resolve_filesystem_paths helper function."""
+        # Create test files
+        os.makedirs("test_glob/subdir", exist_ok=True)
+
+        test_files = [
+            "test_glob/file1.txt",
+            "test_glob/file2.txt",
+            "test_glob/data.csv",
+            "test_glob/subdir/nested.txt",
+        ]
+
+        for fname in test_files:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+
+        try:
+            # Test single file
+            result = self.versioner._resolve_filesystem_paths("test_glob/file1.txt")
+            self.assertEqual(len(result), 1)
+            self.assertEqual(str(result[0]), "test_glob/file1.txt")
+
+            # Test directory
+            result = self.versioner._resolve_filesystem_paths("test_glob")
+            self.assertEqual(len(result), 4)
+            result_strs = [str(p) for p in result]
+            for expected in test_files:
+                self.assertIn(expected, result_strs)
+
+            # Test glob pattern
+            result = self.versioner._resolve_filesystem_paths("test_glob/*.txt")
+            self.assertEqual(len(result), 2)
+            result_strs = [str(p) for p in result]
+            self.assertIn("test_glob/file1.txt", result_strs)
+            self.assertIn("test_glob/file2.txt", result_strs)
+            self.assertNotIn(
+                "test_glob/subdir/nested.txt", result_strs
+            )  # Should not include subdirs
+
+            # Test recursive glob
+            result = self.versioner._resolve_filesystem_paths("test_glob/**/*.txt")
+            self.assertEqual(len(result), 3)
+            result_strs = [str(p) for p in result]
+            self.assertIn("test_glob/file1.txt", result_strs)
+            self.assertIn("test_glob/file2.txt", result_strs)
+            self.assertIn("test_glob/subdir/nested.txt", result_strs)
+
+        finally:
+            # Clean up
+            for fname in test_files:
+                if os.path.exists(fname):
+                    os.remove(fname)
+            if os.path.exists("test_glob/subdir"):
+                os.rmdir("test_glob/subdir")
+            if os.path.exists("test_glob"):
+                os.rmdir("test_glob")
+
+    def test_resolve_manifest_paths_helper(self):
+        """Test the _resolve_manifest_paths helper function."""
+        # Setup manifest with test data
+        original_manifest = self.versioner.manifest["files"].copy()
+
+        self.versioner.manifest["files"] = {
+            "file1.txt": "hash1",
+            "file2.txt": "hash2",
+            "data/dataset1.txt": "hash3",
+            "data/dataset2.csv": "hash4",
+            "data/subdir/nested.txt": "hash5",
+            "logs/app.log": "hash6",
+            "config.json": "hash7",
+        }
+
+        try:
+            # Test exact file match
+            result = self.versioner._resolve_manifest_paths("file1.txt")
+            self.assertEqual(result, {"file1.txt": "hash1"})
+
+            # Test directory prefix
+            result = self.versioner._resolve_manifest_paths("data")
+            expected = {
+                "data/dataset1.txt": "hash3",
+                "data/dataset2.csv": "hash4",
+                "data/subdir/nested.txt": "hash5",
+            }
+            self.assertEqual(result, expected)
+
+            # Test simple glob pattern
+            result = self.versioner._resolve_manifest_paths("*.txt")
+            expected = {"file1.txt": "hash1", "file2.txt": "hash2"}
+            self.assertEqual(result, expected)
+
+            # Test directory-specific glob
+            result = self.versioner._resolve_manifest_paths("data/*.txt")
+            expected = {"data/dataset1.txt": "hash3"}
+            self.assertEqual(result, expected)
+
+            # Test recursive glob
+            result = self.versioner._resolve_manifest_paths("**/*.txt")
+            expected = {
+                "file1.txt": "hash1",
+                "file2.txt": "hash2",
+                "data/dataset1.txt": "hash3",
+                "data/subdir/nested.txt": "hash5",
+            }
+            self.assertEqual(result, expected)
+
+            # Test prefix recursive glob
+            result = self.versioner._resolve_manifest_paths("data/**/*.txt")
+            expected = {"data/dataset1.txt": "hash3", "data/subdir/nested.txt": "hash5"}
+            self.assertEqual(result, expected)
+
+            # Test no matches
+            result = self.versioner._resolve_manifest_paths("nonexistent/*.txt")
+            self.assertEqual(result, {})
+
+        finally:
+            # Restore original manifest
+            self.versioner.manifest["files"] = original_manifest
+
+    def test_track_checkout_consistency(self):
+        """Test that track and checkout work consistently with the same patterns."""
+        # Create test files
+        os.makedirs("consistency_test/subdir", exist_ok=True)
+
+        test_files = [
+            "consistency_test/file1.txt",
+            "consistency_test/file2.log",
+            "consistency_test/subdir/nested.txt",
+        ]
+
+        for fname in test_files:
+            with open(fname, "w") as f:
+                f.write(f"Content of {fname}")
+
+        try:
+            # Track files using glob pattern
+            self.versioner.track("consistency_test/*.txt")
+
+            # Verify only the .txt file in the directory was tracked (not subdirs)
+            tracked_files = list(self.versioner.manifest["files"].keys())
+            self.assertIn("consistency_test/file1.txt", tracked_files)
+            self.assertNotIn("consistency_test/file2.log", tracked_files)
+            self.assertNotIn("consistency_test/subdir/nested.txt", tracked_files)
+
+            # Remove the tracked file
+            os.remove("consistency_test/file1.txt")
+            self.assertFalse(os.path.exists("consistency_test/file1.txt"))
+
+            # Checkout using the same pattern
+            self.versioner.checkout("consistency_test/*.txt")
+
+            # Verify the file was restored
+            self.assertTrue(os.path.exists("consistency_test/file1.txt"))
+
+            # Verify content is correct
+            with open("consistency_test/file1.txt", "r") as f:
+                content = f.read()
+            self.assertEqual(content, "Content of consistency_test/file1.txt")
+
+        finally:
+            # Clean up
+            for fname in test_files:
+                if os.path.exists(fname):
+                    os.remove(fname)
+            if os.path.exists("consistency_test/subdir"):
+                os.rmdir("consistency_test/subdir")
+            if os.path.exists("consistency_test"):
+                os.rmdir("consistency_test")
+
 
 if __name__ == "__main__":
     unittest.main()
