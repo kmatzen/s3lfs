@@ -776,6 +776,11 @@ class S3LFS:
 
     def parallel_upload(self, files, silence=True):
         """Parallel upload of multiple files using ThreadPoolExecutor."""
+        # Test S3 credentials once before starting parallel operations
+        if not silence:
+            print("🔐 Testing S3 credentials...")
+        self.test_s3_credentials(silence=silence)
+
         with ThreadPoolExecutor(max_workers=8) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
@@ -910,17 +915,20 @@ class S3LFS:
 
         print(f"🗑 Removed tracking for all files under '{directory}'.")
 
-    def test_s3_credentials(self):
+    def test_s3_credentials(self, silence=False):
         """
         Test the S3 credentials to ensure they are valid for the target bucket.
         This prevents repeated failures during bulk operations.
+
+        :param silence: If True, suppress success messages.
         """
         try:
             # Attempt to list objects in the target bucket with a minimal prefix
             self._get_s3_client().list_objects_v2(
                 Bucket=self.bucket_name, MaxKeys=1, Prefix=""
             )
-            print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
+            if not silence:
+                print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
         except NoCredentialsError:
             raise RuntimeError("AWS credentials are missing. Please configure them.")
         except PartialCredentialsError:
@@ -1128,6 +1136,11 @@ class S3LFS:
             return
 
         print(f"📤 {len(files_to_upload)} files need to be uploaded.")
+
+        # Test S3 credentials once before starting parallel operations
+        if not silence:
+            print("🔐 Testing S3 credentials...")
+        self.test_s3_credentials(silence=silence)
 
         # Phase 3: Upload files needing updates
         print("🚀 Uploading files...")
@@ -1367,6 +1380,11 @@ class S3LFS:
             print(f"⚠️ No files found to track for '{path}'.")
             return
 
+        # Test S3 credentials once before starting parallel operations
+        if not silence:
+            print("🔐 Testing S3 credentials...")
+        self.test_s3_credentials(silence=silence)
+
         print(
             f"🚀 Processing {len(files_to_track)} files with interleaved hashing and uploading..."
         )
@@ -1440,6 +1458,11 @@ class S3LFS:
         if not files_to_checkout:
             print(f"⚠️ No files found in the manifest for '{path}'.")
             return
+
+        # Test S3 credentials once before starting parallel operations
+        if not silence:
+            print("🔐 Testing S3 credentials...")
+        self.test_s3_credentials(silence=silence)
 
         print(
             f"🚀 Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
