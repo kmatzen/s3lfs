@@ -208,9 +208,9 @@ class S3LFS:
         with self._lock_context():
             # Store configuration in manifest
             if self.bucket_name is not None:
-                self.manifest["bucket_name"] = str(self.bucket_name)
+                self.manifest["bucket_name"] = str(self.bucket_name)  # type: ignore
             if self.repo_prefix is not None:
-                self.manifest["repo_prefix"] = str(self.repo_prefix)
+                self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
             self.save_manifest()
 
         print("✅ Successfully initialized S3LFS with:")
@@ -574,7 +574,9 @@ class S3LFS:
                 # Set up progress callback and context manager
                 if progress_callback:
                     # Use the provided callback for progress updates
-                    upload_callback = progress_callback
+                    def upload_callback(bytes_transferred):
+                        progress_callback(bytes_transferred)
+
                     context_manager = contextlib.nullcontext()
                 elif not silence:
                     # Create individual progress bar only if not silenced
