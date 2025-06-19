@@ -1631,20 +1631,44 @@ class S3LFS:
                     Bucket=self.bucket_name, Key=key
                 )
                 file_size = obj["ContentLength"]
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(key)}",
-                    leave=False,
-                ) as progress_bar:
-                    print(f"Downloading {key} to {target_path}")
+
+                # Set up progress callback and context manager
+                if progress_callback:
+                    # Use the provided callback for unified progress tracking
+                    def download_callback(bytes_transferred):
+                        progress_callback(bytes_transferred)
+
+                    context_manager = contextlib.nullcontext()
+                elif not silence:
+                    # Create individual progress bar only if not silenced and no unified callback
+                    progress_bar = tqdm(
+                        total=file_size,
+                        unit="B",
+                        unit_scale=True,
+                        desc=f"Downloading {os.path.basename(key)}",
+                        leave=False,
+                    )
+
+                    def download_callback(bytes_transferred):
+                        progress_bar.update(bytes_transferred)
+
+                    context_manager = progress_bar
+                else:
+                    # No progress display
+                    def download_callback(bytes_transferred):
+                        pass
+
+                    context_manager = contextlib.nullcontext()
+
+                with context_manager:
+                    if not silence:
+                        print(f"Downloading {key} to {target_path}")
                     with open(target_path, "wb") as f:
                         self._get_s3_client().download_fileobj(
                             Bucket=self.bucket_name,
                             Key=key,
                             Fileobj=f,
-                            Callback=progress_bar.update,
+                            Callback=download_callback,
                         )
             except Exception as e:
                 print(f"❌ Error downloading {key}: {e}")
