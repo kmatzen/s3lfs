@@ -3160,6 +3160,31 @@ class TestS3LFS(unittest.TestCase):
             # Should return empty list or handle gracefully
             self.assertIsInstance(result, list)
 
+    def test_checkout_interleaved_no_files_to_process_with_message(self):
+        """Test checkout_interleaved when no files to process (not silenced)."""
+        # Clear manifest to ensure no files to process
+        self.versioner.manifest["files"] = {}
+
+        # Test with silence=False to trigger the print statement
+        self.versioner.checkout_interleaved("nonexistent_pattern", silence=False)
+
+    def test_download_progress_callback_type_error_fallback(self):
+        """Test download progress callback TypeError fallback."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+        os.remove(self.test_file)
+
+        # Create a callback that doesn't accept **kwargs
+        def incompatible_callback(bytes_chunk):
+            # This callback doesn't accept file_size parameter
+            pass
+
+        # Download with incompatible callback - should handle TypeError gracefully
+        self.versioner.download(self.test_file, progress_callback=incompatible_callback)
+
+        # File should be downloaded successfully despite callback incompatibility
+        self.assertTrue(os.path.exists(self.test_file))
+
 
 if __name__ == "__main__":
     unittest.main()
