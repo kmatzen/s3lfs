@@ -1345,9 +1345,10 @@ class S3LFS:
             if Path(file_path).exists():
                 current_hash = self.hash_file(file_path)
                 if current_hash == expected_hash:
+                    # File is up-to-date, don't add to download total since no download is needed
                     return (file_path, False, 0)  # No download needed
 
-            # Download the file with progress callback
+            # Download the file with progress callback that supports size discovery
             bytes_transferred = self.download(
                 file_path, silence=True, progress_callback=progress_callback
             )
@@ -1494,15 +1495,30 @@ class S3LFS:
             f"🚀 Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
         )
 
-        # Phase 2: Process files with interleaved hashing and downloading
+        # Phase 2: Start processing immediately - discover sizes during download
+        # We'll process ALL files to ensure proper progress tracking, even for up-to-date ones
+        files_to_process = files_to_checkout
+
+        if not files_to_process:
+            if not silence:
+                print("✅ No files to process.")
+            return
+
+        if not silence:
+            print(
+                f"📥 Processing {len(files_to_process)} files (calculating sizes during processing...)",
+                flush=True,
+            )
+
+        # Phase 3: Process files with interleaved hashing and downloading
         files_downloaded = 0
         files_processed = 0
         total_bytes_transferred = 0
 
         try:
-            # Create unified progress bars
+            # Create unified progress bars with dynamic total for bytes
             with tqdm(
-                total=len(files_to_checkout),
+                total=len(files_to_process),
                 desc="Files processed",
                 unit="file",
                 position=0,
@@ -1510,14 +1526,18 @@ class S3LFS:
                 total=0, desc="Data downloaded", unit="B", unit_scale=True, position=1
             ) as bytes_pbar:
 
-                def progress_callback(bytes_chunk):
-                    """Callback to update the bytes progress bar"""
+                def progress_callback(bytes_chunk, file_size=None):
+                    """Callback to update the bytes progress bar and optionally set total"""
+                    if file_size is not None:
+                        # Update total when we discover a new file size
+                        bytes_pbar.total = (bytes_pbar.total or 0) + file_size
+                        bytes_pbar.refresh()
                     bytes_pbar.update(bytes_chunk)
 
                 with ThreadPoolExecutor(
                     max_workers=DEFAULT_THREAD_POOL_SIZE
                 ) as executor:
-                    # Submit all hash-and-download tasks
+                    # Submit hash-and-download tasks for all files (including up-to-date ones for progress tracking)
                     future_to_file = {
                         executor.submit(
                             self._hash_and_download_worker,
@@ -1525,7 +1545,7 @@ class S3LFS:
                             True,
                             progress_callback,
                         ): file_path
-                        for file_path, expected_hash in files_to_checkout.items()
+                        for file_path, expected_hash in files_to_process.items()
                     }
 
                     # Process results as they complete
@@ -1543,11 +1563,6 @@ class S3LFS:
 
                             if downloaded:
                                 files_downloaded += 1
-                                # Update the bytes progress bar total for downloaded files
-                                bytes_pbar.total = (
-                                    bytes_pbar.total or 0
-                                ) + bytes_transferred
-                                bytes_pbar.refresh()
 
                             file_pbar.update(1)
                             file_pbar.set_postfix(
@@ -1623,6 +1638,22 @@ class S3LFS:
         os.makedirs(base_directrory, exist_ok=True)
 
         target_paths = []
+        total_file_size = 0
+
+        # First pass: discover total size and notify progress callback
+        for idx, key in enumerate(keys):
+            obj = self._get_s3_client().head_object(Bucket=self.bucket_name, Key=key)
+            total_file_size += obj["ContentLength"]
+
+        # Notify progress callback of total size discovery (for dynamic progress bar)
+        if progress_callback:
+            try:
+                # Try to call with file_size parameter for dynamic progress bar
+                progress_callback(0, **{"file_size": total_file_size})
+            except TypeError:
+                # Fallback: callback doesn't support file_size parameter
+                pass
+
         for idx, key in enumerate(keys):
             try:
                 target_path = self.temp_dir / f"{uuid4()}.gz"
@@ -1631,20 +1662,44 @@ class S3LFS:
                     Bucket=self.bucket_name, Key=key
                 )
                 file_size = obj["ContentLength"]
-                with tqdm(
-                    total=file_size,
-                    unit="B",
-                    unit_scale=True,
-                    desc=f"Downloading {os.path.basename(key)}",
-                    leave=False,
-                ) as progress_bar:
-                    print(f"Downloading {key} to {target_path}")
+
+                # Set up progress callback and context manager
+                if progress_callback:
+                    # Use the provided callback for unified progress tracking
+                    def download_callback(bytes_transferred):
+                        progress_callback(bytes_transferred)
+
+                    context_manager = contextlib.nullcontext()
+                elif not silence:
+                    # Create individual progress bar only if not silenced and no unified callback
+                    progress_bar = tqdm(
+                        total=file_size,
+                        unit="B",
+                        unit_scale=True,
+                        desc=f"Downloading {os.path.basename(key)}",
+                        leave=False,
+                    )
+
+                    def download_callback(bytes_transferred):
+                        progress_bar.update(bytes_transferred)
+
+                    context_manager = progress_bar
+                else:
+                    # No progress display
+                    def download_callback(bytes_transferred):
+                        pass
+
+                    context_manager = contextlib.nullcontext()
+
+                with context_manager:
+                    if not silence:
+                        print(f"Downloading {key} to {target_path}")
                     with open(target_path, "wb") as f:
                         self._get_s3_client().download_fileobj(
                             Bucket=self.bucket_name,
                             Key=key,
                             Fileobj=f,
-                            Callback=progress_bar.update,
+                            Callback=download_callback,
                         )
             except Exception as e:
                 print(f"❌ Error downloading {key}: {e}")
