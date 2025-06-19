@@ -1,19 +1,17 @@
 # s3lfs
 
-A Python-based version control system for large assets using Amazon S3. This system is designed to work like Git LFS but utilizes S3 for better bandwidth and scalability. It integrates with Git and supports sparse checkouts, encryption, and automatic cleanup of unused assets.
+A Python-based version control system for large assets using Amazon S3. This system is designed to work like Git LFS but utilizes S3 for better bandwidth and scalability. It supports file tracking, parallel operations, encryption, and automatic cleanup of unused assets.
 
 ## Features
 - Upload and track large files in S3 instead of Git
 - Stores asset versions using SHA-256 hashes
-- Supports sparse checkouts to avoid downloading unnecessary files
-- Encrypts stored assets with AES256
+- Encrypts stored assets with AES256 server-side encryption
 - Cleans up unreferenced files in S3 after rebases or squashes
-- Direct Git integration for seamless workflow
-- **Automatic tracking of modified files**: Detects and uploads changed files before committing.
-- **Parallel uploads/downloads**: Improves speed using multi-threading.
-- **Caching**: Prevents redundant downloads of recently accessed files.
-- **Compression before upload**: Uses gzip to reduce storage and bandwidth usage.
-- **File locking/conflict resolution**: Checks for existing files in S3 to prevent overwrites.
+- **Parallel uploads/downloads**: Improves speed using multi-threading
+- **Compression before upload**: Uses gzip to reduce storage and bandwidth usage
+- **File deduplication**: Prevents redundant uploads using content hashing
+- **Flexible path resolution**: Supports files, directories, and glob patterns
+- **Multiple hashing algorithms**: SHA-256 (default) and MD5 support
 
 ## Installation
 
@@ -25,146 +23,215 @@ poetry install
 
 ## Command Line Interface (CLI) Usage
 
-The CLI tool provides various commands for managing large files with S3. Below is a comprehensive list of available commands.  Almost all commands can take additional `--bucket` and `--repo-prefix` options to override values set in the manifest
+The CLI tool provides a simplified set of commands for managing large files with S3. All commands automatically use the bucket and prefix configured during initialization.
 
 ### Initialize Repository
 ```sh
 s3lfs init <bucket-name> <repo-prefix>
 ```
-**Description**: Initializes the S3 asset versioning system with the specified S3 bucket and repository prefix.
+**Description**: Initializes the S3LFS system with the specified S3 bucket and repository prefix. This creates a `.s3_manifest.json` file that stores the configuration and file mappings.
 
-### Upload a File
+**Example**:
 ```sh
-s3lfs upload <file-path>
-```
-**Description**: Uploads a single file to S3.
-
-### Download a File
-```sh
-s3lfs download <file-path>
-```
-**Description**: Downloads a file from S3 by the hash stored in the manifest.
-
-### Track and Upload Modified Files
-```sh
-s3lfs track-modified
-```
-**Description**: Detects modified files in a Git repository and uploads them to S3.
-
-### Download All Files Listed in Manifest
-```sh
-s3lfs download-all
-```
-**Description**: Downloads all files listed in the manifest from S3.
-
-### Sparse Checkout
-```sh
-s3lfs sparse-checkout <dir-path>
-```
-**Description**: Downloads all files under a given subtree (prefix) instead of fetching the entire repository.
-
-### Set Up Git Filters for Automatic S3 Integration
-```sh
-s3lfs git-setup
-```
-**Description**: Configures Git filters for automatic asset tracking with S3.
-
-### Recursively Track and Upload a Directory
-```sh
-s3lfs track-subtree <dir-path>
-```
-**Description**: Recursively tracks and uploads all files in a specified directory.
-
-### Remove a File from Tracking
-```sh
-s3lfs remove <file-path> [--purge-from-s3]
-```
-**Description**: Removes a single file from tracking. Optionally, the file can be immediately deleted from S3.
-
-### Remove a Tracked Directory
-```sh
-s3lfs remove-subtree <dir-path> [--purge-from-s3]
-```
-**Description**: Removes an entire directory from tracking. Optionally, the files can be immediately deleted from S3.
-
-### Cleanup Unreferenced Files in S3
-```sh
-s3lfs cleanup [--force]
-```
-**Description**: Cleans up unreferenced files in S3 that are no longer tracked by Git.  This command prompts for confirmation unless `--force` is specified.
-
-## Git Workflow Integration
-To integrate S3 Asset Versioning into your Git workflow, follow these steps:
-
-### 1. Initiailize s3lfs manifest
-RUn the following command to create the manifest for s3lfs:
-```sh
-s3lfs init <bucket> <repo-prefix>
+s3lfs init my-bucket my-project
 ```
 
-`.s3_manifest.json` will be created.
+### Track Files
+```sh
+s3lfs track <path>
+s3lfs track --modified
+```
+**Description**: Tracks and uploads files, directories, or glob patterns to S3.
 
-### 2. Initialize and Set Up Git Hooks
-Run the following command to set up Git hooks for seamless asset tracking:
-```sh
-s3lfs git-setup
-```
-This configures Git to automatically upload tracked files on each commit.
+**Options**:
+- `--modified`: Track only files that have changed since last upload
+- `--verbose`: Show detailed progress information
+- `--no-sign-request`: Use unsigned S3 requests (for public buckets)
 
-### 3. Track Large Files
-Instead of committing large binary files directly to Git, track them using:
+**Examples**:
 ```sh
-s3lfs upload my_large_file.zip
-```
-This will:
-- Upload the file to S3 (compressed and hashed)
-- Store the mapping in `.s3_manifest.json`
-
-### 4. Commit and Push
-After tracking large files, commit and push your changes as usual:
-```sh
-git add .s3_manifest.json
-```
-```sh
-git commit -m "Tracked large file using S3 Asset Versioning"
-```
-```sh
-git push origin main
+s3lfs track data/large_file.zip          # Track a single file
+s3lfs track data/                        # Track entire directory
+s3lfs track "*.mp4"                      # Track all MP4 files
+s3lfs track --modified                   # Track only changed files
 ```
 
-### 5. Clone and Retrieve Large Files
-When another user or CI system clones the repository, they should run:
+### Checkout Files
 ```sh
-git clone https://github.com/your-repo/my-repo.git
-cd my-repo
-s3lfs download-all
+s3lfs checkout <path>
+s3lfs checkout --all
 ```
-This will restore all tracked large files from S3 to their appropriate locations.
+**Description**: Downloads files, directories, or glob patterns from S3.
 
-### 6. Automatically Track Modified Files
-To ensure modified assets are always synchronized with S3 before committing, run:
+**Options**:
+- `--all`: Download all files tracked in the manifest
+- `--verbose`: Show detailed progress information
+- `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+
+**Examples**:
 ```sh
-s3lfs track-modified
+s3lfs checkout data/large_file.zip       # Download a single file
+s3lfs checkout data/                     # Download entire directory
+s3lfs checkout "*.mp4"                   # Download all MP4 files
+s3lfs checkout --all                     # Download all tracked files
 ```
-This detects changes in large files and uploads them automatically before committing.
 
-### 7. Perform Sparse Checkouts
-If you only need a specific file rather than downloading all assets, use:
+### Remove Files from Tracking
 ```sh
-s3lfs sparse-checkout <dir-name>
+s3lfs remove <path>
 ```
-This will retrieve only the specified assets instead of downloading everything.
+**Description**: Removes files or directories from tracking. Supports files, directories, and glob patterns.
 
-### 8. Clean Up Unused Files
-After a rebase or squash, unreferenced files in S3 may remain. To clean them up, run:
+**Options**:
+- `--purge-from-s3`: Immediately delete files from S3 (default: keep for history)
+- `--no-sign-request`: Use unsigned S3 requests
+
+**Examples**:
+```sh
+s3lfs remove data/old_file.zip           # Remove single file
+s3lfs remove data/temp/                  # Remove directory
+s3lfs remove "*.tmp"                     # Remove all temp files
+s3lfs remove data/ --purge-from-s3       # Remove and delete from S3
+```
+
+### Cleanup Unreferenced Files
 ```sh
 s3lfs cleanup
 ```
-This will remove all files from S3 that are no longer referenced in the Git history.
+**Description**: Removes files from S3 that are no longer referenced in the current manifest.
+
+**Options**:
+- `--force`: Skip confirmation prompt
+- `--no-sign-request`: Use unsigned S3 requests
+
+**Example**:
+```sh
+s3lfs cleanup --force                    # Clean up without confirmation
+```
+
+## Git Workflow Integration
+
+### 1. Initialize S3LFS
+First, initialize S3LFS in your repository:
+```sh
+s3lfs init my-bucket my-project-name
+```
+
+This creates `.s3_manifest.json` which should be committed to Git:
+```sh
+git add .s3_manifest.json
+git commit -m "Initialize S3LFS"
+```
+
+### 2. Track Large Files
+Instead of committing large files directly to Git, track them with S3LFS:
+```sh
+s3lfs track data/large_dataset.zip
+s3lfs track models/
+s3lfs track "*.mp4"
+```
+
+### 3. Commit Changes
+After tracking files, commit the updated manifest:
+```sh
+git add .s3_manifest.json
+git commit -m "Track large files with S3LFS"
+git push
+```
+
+### 4. Clone and Restore Files
+When cloning the repository, restore tracked files:
+```sh
+git clone https://github.com/your-repo/my-repo.git
+cd my-repo
+s3lfs checkout --all
+```
+
+### 5. Update Workflow
+For ongoing development:
+```sh
+# Track any modified large files
+s3lfs track --modified
+
+# Commit manifest changes
+git add .s3_manifest.json
+git commit -m "Update tracked files"
+
+# Download latest files
+s3lfs checkout --all
+```
+
+### 6. Selective Downloads
+Download only specific files or directories:
+```sh
+s3lfs checkout data/                     # Only data directory
+s3lfs checkout "models/*.pkl"            # Only pickle files in models
+```
+
+### 7. Cleanup
+Periodically clean up unreferenced files:
+```sh
+s3lfs cleanup
+```
 
 ## Configuration
-- Ensure your AWS credentials are set up using `aws configure`.
-- The manifest file `.s3_manifest.json` should be committed to track asset mappings.
+
+### AWS Credentials
+Ensure your AWS credentials are configured:
+```sh
+aws configure
+```
+
+Or use environment variables:
+```sh
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+### Public Buckets
+For public S3 buckets, use the `--no-sign-request` flag:
+```sh
+s3lfs init public-bucket my-project --no-sign-request
+s3lfs checkout --all --no-sign-request
+```
+
+### Manifest File
+The `.s3_manifest.json` file contains:
+- S3 bucket and prefix configuration
+- File-to-hash mappings for tracked files
+- Should be committed to Git for team collaboration
+
+## Advanced Features
+
+### Multiple Hashing Algorithms
+S3LFS supports both SHA-256 (default) and MD5 hashing:
+- SHA-256: More secure, used for file integrity
+- MD5: Available for compatibility with legacy systems
+
+### Compression
+All files are automatically compressed with gzip before upload, reducing storage costs and transfer time.
+
+### Parallel Operations
+Large file operations use multi-threading for improved performance on multiple files.
+
+### File Deduplication
+Files with identical content (same hash) are stored only once in S3, regardless of path or filename.
+
+## Troubleshooting
+
+### Common Issues
+1. **AWS Credentials**: Ensure credentials are properly configured
+2. **Bucket Permissions**: Verify read/write access to the S3 bucket
+3. **Network**: Check internet connectivity for S3 operations
+4. **Disk Space**: Ensure sufficient local storage for file operations
+
+### Verbose Output
+Use `--verbose` flag for detailed operation information:
+```sh
+s3lfs track data/ --verbose
+s3lfs checkout --all --verbose
+```
 
 ## License
 MIT License
