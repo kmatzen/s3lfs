@@ -1125,7 +1125,7 @@ class S3LFS:
         # Process results
         for file, current_hash in results:
             with self._lock_context():
-                stored_hash = self.manifest.get(file)
+                stored_hash = self.manifest["files"].get(file)
 
             if current_hash is None:
                 print(f"Warning: File {file} is missing. Skipping.")
