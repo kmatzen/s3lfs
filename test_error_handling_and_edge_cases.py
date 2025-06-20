@@ -14,8 +14,10 @@ These tests complement the main test suite by covering code paths that are
 difficult to test in normal usage scenarios.
 """
 
+import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import mock_open, patch
@@ -250,78 +252,464 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
 
-            # Mock the Path.cwd() to return our temp directory
-            with patch("pathlib.Path.cwd", return_value=temp_path):
-                gitignore_path = temp_path / ".gitignore"
+            # Change working directory to temp dir for this test
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_path)
+                gitignore_path = Path(".gitignore")
 
                 # Ensure .gitignore doesn't exist
                 if gitignore_path.exists():
                     gitignore_path.unlink()
 
-                # Simulate the method behavior
-                s3lfs_patterns = [
-                    "",
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                ]
+                with patch("builtins.print") as mock_print:
+                    self.versioner._update_gitignore()
 
-                with open(gitignore_path, "a") as f:
-                    for pattern in s3lfs_patterns:
-                        f.write(f"{pattern}\n")
+                    self.assertTrue(gitignore_path.exists())
 
-                self.assertTrue(gitignore_path.exists())
+                    with open(gitignore_path, "r") as f:
+                        content = f.read()
 
-                with open(gitignore_path, "r") as f:
-                    content = f.read()
+                    self.assertIn("*_cache.json", content)
+                    self.assertIn(".s3lfs_temp/", content)
+                    self.assertIn("*.s3lfs.lock", content)
+                    self.assertIn("S3LFS cache and temporary files", content)
 
-                self.assertIn("*_cache.json", content)
-                self.assertIn(".s3lfs_temp/", content)
-                self.assertIn("*.s3lfs.lock", content)
-                self.assertIn("S3LFS cache and temporary files", content)
+                    # Should print the creation message
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    create_calls = [
+                        call
+                        for call in calls
+                        if "Updated .gitignore to exclude S3LFS" in call
+                    ]
+                    self.assertTrue(len(create_calls) > 0)
+            finally:
+                os.chdir(original_cwd)
 
     def test_update_gitignore_existing_s3lfs_section(self):
         """Test _update_gitignore when S3LFS section already exists."""
         # Use a temporary directory for this test to avoid polluting git root
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            gitignore_path = temp_path / ".gitignore"
 
-            gitignore_content = [
-                "# Existing content",
-                "*.log",
-                "",
-                "# S3LFS cache and temporary files - should not be version controlled",
-                "*_cache.json",
-                ".s3lfs_temp/",
-                "*.s3lfs.lock",
-                "# Additional content",
-                "*.tmp",
-            ]
+            # Change working directory to temp dir for this test
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_path)
+                gitignore_path = Path(".gitignore")
 
-            with open(gitignore_path, "w") as f:
-                f.write("\n".join(gitignore_content))
-
-            with patch("builtins.print") as mock_print:
-                # Simulate checking for existing S3LFS section
-                with open(gitignore_path, "r") as f:
-                    content = f.read()
-
-                has_s3lfs_section = "S3LFS" in content
-                self.assertTrue(has_s3lfs_section)
-
-                # Simulate the print statement that would occur
-                if has_s3lfs_section:
-                    print("✅ .gitignore already contains S3LFS cache exclusions")
-
-                calls = [str(call) for call in mock_print.call_args_list]
-                existing_calls = [
-                    call for call in calls if "already contains S3LFS" in call
+                gitignore_content = [
+                    "# Existing content",
+                    "*.log",
+                    "",
+                    "# S3LFS cache and temporary files - should not be version controlled",
+                    "*_cache.json",
+                    ".s3lfs_temp/",
+                    "*.s3lfs.lock",
+                    "# Additional content",
+                    "*.tmp",
                 ]
-                self.assertTrue(len(existing_calls) > 0)
 
-    # Edge Cases
+                with open(gitignore_path, "w") as f:
+                    f.write("\n".join(gitignore_content))
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner._update_gitignore()
+
+                    # Should print the "already contains" message
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    existing_calls = [
+                        call for call in calls if "already contains S3LFS" in call
+                    ]
+                    self.assertTrue(len(existing_calls) > 0)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_update_gitignore_partial_patterns(self):
+        """Test _update_gitignore when some patterns are missing."""
+        # Use a temporary directory for this test to avoid polluting git root
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Change working directory to temp dir for this test
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_path)
+                gitignore_path = Path(".gitignore")
+
+                gitignore_content = [
+                    "# S3LFS cache and temporary files - should not be version controlled",
+                    "*_cache.json",
+                    # Missing .s3lfs_temp/ and *.s3lfs.lock
+                ]
+
+                with open(gitignore_path, "w") as f:
+                    f.write("\n".join(gitignore_content))
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner._update_gitignore()
+
+                    # Verify patterns were added
+                    with open(gitignore_path, "r") as f:
+                        updated_content = f.read()
+
+                    self.assertIn(".s3lfs_temp/", updated_content)
+                    self.assertIn("*.s3lfs.lock", updated_content)
+
+                    # Should print message about adding missing patterns
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    missing_calls = [
+                        call for call in calls if "missing S3LFS patterns" in call
+                    ]
+                    self.assertTrue(len(missing_calls) > 0)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_update_gitignore_no_missing_patterns_with_header(self):
+        """Test _update_gitignore when S3LFS section exists but no patterns are missing."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_path)
+                gitignore_path = Path(".gitignore")
+
+                # Create gitignore with S3LFS section but missing header patterns
+                gitignore_content = [
+                    "# Existing content",
+                    "*.log",
+                    "# S3LFS cache and temporary files - should not be version controlled",
+                    "*_cache.json",
+                    ".s3lfs_temp/",
+                    "*.s3lfs.lock",
+                ]
+
+                with open(gitignore_path, "w") as f:
+                    f.write("\n".join(gitignore_content))
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner._update_gitignore()
+
+                    # Should print the "already contains" message since no missing patterns
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    existing_calls = [
+                        call for call in calls if "already contains S3LFS" in call
+                    ]
+                    self.assertTrue(len(existing_calls) > 0)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_update_gitignore_existing_without_s3lfs_section_but_has_patterns(self):
+        """Test _update_gitignore when patterns exist but no S3LFS section header."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(temp_path)
+                gitignore_path = Path(".gitignore")
+
+                # Create gitignore with patterns but no S3LFS header
+                gitignore_content = [
+                    "# Existing content",
+                    "*.log",
+                    "*_cache.json",
+                    ".s3lfs_temp/",
+                    "*.s3lfs.lock",
+                ]
+
+                with open(gitignore_path, "w") as f:
+                    f.write("\n".join(gitignore_content))
+
+                with patch("builtins.print") as mock_print:
+                    self.versioner._update_gitignore()
+
+                    # Since all patterns already exist, should print "already contains" message
+                    # The method checks if patterns exist, not if the header exists
+                    calls = [str(call) for call in mock_print.call_args_list]
+                    existing_calls = [
+                        call for call in calls if "already contains S3LFS" in call
+                    ]
+                    self.assertTrue(len(existing_calls) > 0)
+
+                    # Content should remain the same since all patterns exist
+                    with open(gitignore_path, "r") as f:
+                        updated_content = f.read()
+
+                    # Original patterns should still be there
+                    self.assertIn("*_cache.json", updated_content)
+                    self.assertIn(".s3lfs_temp/", updated_content)
+                    self.assertIn("*.s3lfs.lock", updated_content)
+            finally:
+                os.chdir(original_cwd)
+
+    # Enhanced Cache Management Tests
+    def test_cleanup_stale_cache_no_stale_entries(self):
+        """Test cleanup_stale_cache when no entries are stale."""
+        # Create a real file for the fresh entry
+        fresh_file = self.test_dir / "fresh_file.txt"
+        fresh_file.write_text("fresh content")
+
+        # Add a fresh cache entry with the actual file path
+        fresh_file_path = str(fresh_file)
+        self.versioner.hash_cache[fresh_file_path] = {
+            "hash": "fresh_hash",
+            "metadata": {"size": 100, "mtime": 123456789},
+            "timestamp": time.time(),  # Fresh timestamp
+        }
+
+        # Save the cache to ensure it's persisted
+        self.versioner.save_cache()
+
+        initial_count = len(self.versioner.hash_cache)
+
+        with patch("builtins.print") as mock_print:
+            self.versioner.cleanup_stale_cache(max_age_days=30)
+
+            # Should have same number of entries since file exists and is fresh
+            final_count = len(self.versioner.hash_cache)
+
+            self.assertEqual(final_count, initial_count)
+
+            # Should not print cleanup message since no stale entries
+            calls = [str(call) for call in mock_print.call_args_list]
+            cleanup_calls = [call for call in calls if "Cleaned up" in call]
+            self.assertEqual(len(cleanup_calls), 0)
+
+    def test_cleanup_stale_cache_mixed_entries(self):
+        """Test cleanup_stale_cache with mix of fresh, old, and missing file entries."""
+        import time
+
+        # Create a real file for fresh entry
+        fresh_file = self.test_dir / "fresh_file.txt"
+        fresh_file.write_text("fresh content")
+
+        # Create a real file for old entry (exists but old in cache)
+        old_file = self.test_dir / "old_existing_file.txt"
+        old_file.write_text("old content")
+
+        # Add mixed cache entries
+        current_time = time.time()
+        self.versioner.hash_cache[str(fresh_file)] = {
+            "hash": "fresh_hash",
+            "metadata": {"size": 100, "mtime": 123456789},
+            "timestamp": current_time,  # Fresh
+        }
+
+        # Missing file entry (file doesn't exist)
+        missing_file_path = str(self.test_dir / "missing_file.txt")
+        self.versioner.hash_cache[missing_file_path] = {
+            "hash": "missing_hash",
+            "metadata": {"size": 200, "mtime": 123456789},
+            "timestamp": current_time,  # Fresh but file doesn't exist
+        }
+
+        # Old file entry (file exists but cache is old)
+        self.versioner.hash_cache[str(old_file)] = {
+            "hash": "old_hash",
+            "metadata": {"size": 300, "mtime": 123456789},
+            "timestamp": current_time - (35 * 24 * 60 * 60),  # 35 days old
+        }
+
+        # Save the cache to ensure it's persisted
+        self.versioner.save_cache()
+
+        initial_count = len(self.versioner.hash_cache)
+        self.assertEqual(initial_count, 3)
+
+        with patch("builtins.print") as mock_print:
+            self.versioner.cleanup_stale_cache(max_age_days=30)
+
+            # Should keep fresh existing file, remove missing file and old file
+            final_count = len(self.versioner.hash_cache)
+            self.assertEqual(final_count, 1)
+            self.assertIn(str(fresh_file), self.versioner.hash_cache)
+            self.assertNotIn(missing_file_path, self.versioner.hash_cache)
+            self.assertNotIn(str(old_file), self.versioner.hash_cache)
+
+            # Should print cleanup message
+            calls = [str(call) for call in mock_print.call_args_list]
+            cleanup_calls = [
+                call for call in calls if "Cleaned up 2 stale cache entries" in call
+            ]
+            self.assertTrue(len(cleanup_calls) > 0)
+
+    def test_cleanup_stale_cache_missing_timestamp(self):
+        """Test cleanup_stale_cache with entries missing timestamp."""
+        # Add cache entry without timestamp (should default to 0)
+        self.versioner.hash_cache["no_timestamp_file.txt"] = {
+            "hash": "no_timestamp_hash",
+            "metadata": {"size": 100, "mtime": 123456789},
+            # No timestamp field
+        }
+
+        initial_count = len(self.versioner.hash_cache)
+
+        self.versioner.cleanup_stale_cache(max_age_days=30)
+
+        # Entry without timestamp should be removed (defaults to 0, very old)
+        final_count = len(self.versioner.hash_cache)
+        self.assertLess(final_count, initial_count)
+        self.assertNotIn("no_timestamp_file.txt", self.versioner.hash_cache)
+
+    # Tests with Cache Disabled
+    def test_track_with_cache_disabled(self):
+        """Test track method with use_cache=False."""
+        test_file = self.test_dir / "cache_disabled_track.txt"
+        test_file.write_text("content for cache disabled test")
+
+        # Track with cache disabled
+        self.versioner.track(str(test_file), use_cache=False, interleaved=False)
+
+        # File should be in manifest
+        self.assertIn(str(test_file), self.versioner.manifest["files"])
+
+        # Cache should be empty since we didn't use it
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_track_interleaved_with_cache_disabled(self):
+        """Test track_interleaved method with use_cache=False."""
+        test_file = self.test_dir / "cache_disabled_interleaved.txt"
+        test_file.write_text("content for interleaved cache disabled test")
+
+        # Track with cache disabled
+        self.versioner.track_interleaved(str(test_file), use_cache=False)
+
+        # File should be in manifest
+        self.assertIn(str(test_file), self.versioner.manifest["files"])
+
+        # Cache should be empty since we didn't use it
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_checkout_with_cache_disabled(self):
+        """Test checkout method with use_cache=False."""
+        test_file = self.test_dir / "cache_disabled_checkout.txt"
+        test_file.write_text("content for checkout cache disabled test")
+
+        # First track the file
+        self.versioner.track(str(test_file), use_cache=False)
+
+        # Remove the local file
+        test_file.unlink()
+        self.assertFalse(test_file.exists())
+
+        # Checkout with cache disabled
+        self.versioner.checkout(str(test_file), use_cache=False, interleaved=False)
+
+        # File should be restored
+        self.assertTrue(test_file.exists())
+        self.assertEqual(
+            test_file.read_text(), "content for checkout cache disabled test"
+        )
+
+        # Cache should still be empty
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_checkout_interleaved_with_cache_disabled(self):
+        """Test checkout_interleaved method with use_cache=False."""
+        test_file = self.test_dir / "cache_disabled_checkout_interleaved.txt"
+        test_file.write_text("content for interleaved checkout cache disabled test")
+
+        # First track the file
+        self.versioner.track_interleaved(str(test_file), use_cache=False)
+
+        # Remove the local file
+        test_file.unlink()
+        self.assertFalse(test_file.exists())
+
+        # Checkout with cache disabled
+        self.versioner.checkout_interleaved(str(test_file), use_cache=False)
+
+        # File should be restored
+        self.assertTrue(test_file.exists())
+        self.assertEqual(
+            test_file.read_text(),
+            "content for interleaved checkout cache disabled test",
+        )
+
+        # Cache should still be empty
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_hash_and_upload_worker_with_cache_disabled(self):
+        """Test _hash_and_upload_worker with use_cache=False."""
+        test_file = self.test_dir / "worker_cache_disabled.txt"
+        test_file.write_text("content for worker cache disabled test")
+
+        # Test the worker function directly with cache disabled
+        result = self.versioner._hash_and_upload_worker(
+            str(test_file), silence=True, progress_callback=None, use_cache=False
+        )
+
+        file_path, file_hash, uploaded, bytes_transferred = result
+
+        # Should have computed hash and uploaded
+        self.assertEqual(file_path, str(test_file))
+        self.assertIsInstance(file_hash, str)
+        self.assertTrue(uploaded)  # Should be uploaded since not in manifest
+        self.assertGreater(bytes_transferred, 0)
+
+        # Cache should still be empty
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_hash_and_download_worker_with_cache_disabled(self):
+        """Test _hash_and_download_worker with use_cache=False."""
+        test_file = self.test_dir / "download_worker_cache_disabled.txt"
+        test_file.write_text("content for download worker cache disabled test")
+
+        # First upload the file
+        self.versioner.upload(str(test_file))
+        expected_hash = self.versioner.hash_file(str(test_file))
+
+        # Remove local file
+        test_file.unlink()
+
+        # Test the worker function directly with cache disabled
+        result = self.versioner._hash_and_download_worker(
+            (str(test_file), expected_hash),
+            silence=True,
+            progress_callback=None,
+            use_cache=False,
+        )
+
+        file_path, downloaded, bytes_transferred = result
+
+        # Should have downloaded the file
+        self.assertEqual(file_path, str(test_file))
+        self.assertTrue(downloaded)
+        self.assertGreater(bytes_transferred, 0)
+
+        # File should be restored
+        self.assertTrue(test_file.exists())
+
+        # Cache should still be empty
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+    def test_cache_disabled_performance_comparison(self):
+        """Test that cache disabled mode works correctly and doesn't use cache."""
+        test_file = self.test_dir / "performance_test.txt"
+        test_file.write_text("content for performance test")
+
+        # Track with cache enabled
+        self.versioner.track(str(test_file), use_cache=True)
+
+        # Should have cache entry
+        self.assertGreater(len(self.versioner.hash_cache), 0)
+
+        # Clear cache
+        self.versioner.clear_hash_cache()
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+        # Track again with cache disabled
+        self.versioner.track(str(test_file), use_cache=False)
+
+        # Cache should still be empty
+        self.assertEqual(len(self.versioner.hash_cache), 0)
+
+        # But file should still be tracked properly
+        self.assertIn(str(test_file), self.versioner.manifest["files"])
+
+    # Edge Cases and Missing Tests
     def test_hash_file_empty_file_auto_method(self):
         """Test hash_file with empty file using auto method selection."""
         empty_file = self.test_dir / "empty.txt"
@@ -372,48 +760,40 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         final_count = len(self.versioner.hash_cache)
         self.assertLess(final_count, initial_count)
 
-    # Additional tests for remaining missing lines
-    def test_update_gitignore_partial_patterns(self):
-        """Test _update_gitignore when some patterns are missing."""
-        # Use a temporary directory for this test to avoid polluting git root
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            gitignore_path = temp_path / ".gitignore"
+    def test_clear_hash_cache_all_entries(self):
+        """Test clear_hash_cache clearing all entries."""
+        # Add some cache entries
+        self.versioner.hash_cache["file1.txt"] = {"hash": "hash1"}
+        self.versioner.hash_cache["file2.txt"] = {"hash": "hash2"}
 
-            gitignore_content = [
-                "# S3LFS cache and temporary files - should not be version controlled",
-                "*_cache.json",
-                # Missing .s3lfs_temp/ and *.s3lfs.lock
-            ]
+        with patch("builtins.print") as mock_print:
+            self.versioner.clear_hash_cache()  # Clear all
 
-            with open(gitignore_path, "w") as f:
-                f.write("\n".join(gitignore_content))
+            self.assertEqual(len(self.versioner.hash_cache), 0)
 
-            with patch("builtins.print") as mock_print:
-                # Simulate adding missing patterns
-                missing_patterns = [".s3lfs_temp/", "*.s3lfs.lock"]
-                with open(gitignore_path, "a") as f:
-                    for pattern in missing_patterns:
-                        f.write(f"{pattern}\n")
+            calls = [str(call) for call in mock_print.call_args_list]
+            clear_calls = [call for call in calls if "Cleared all hash cache" in call]
+            self.assertTrue(len(clear_calls) > 0)
 
-                # Simulate the print statement
-                print(
-                    f"📝 Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
-                )
+    def test_clear_hash_cache_specific_file(self):
+        """Test clear_hash_cache clearing specific file."""
+        # Add some cache entries and save them
+        self.versioner.hash_cache["file1.txt"] = {"hash": "hash1"}
+        self.versioner.hash_cache["file2.txt"] = {"hash": "hash2"}
+        self.versioner.save_cache()
 
-                # Verify patterns were added
-                with open(gitignore_path, "r") as f:
-                    updated_content = f.read()
+        with patch("builtins.print") as mock_print:
+            self.versioner.clear_hash_cache("file1.txt")
 
-                self.assertIn(".s3lfs_temp/", updated_content)
-                self.assertIn("*.s3lfs.lock", updated_content)
+            # Reload cache to see the persisted state
+            self.versioner.load_cache()
 
-                # Should print message about adding missing patterns
-                calls = [str(call) for call in mock_print.call_args_list]
-                missing_calls = [
-                    call for call in calls if "missing S3LFS patterns" in call
-                ]
-                self.assertTrue(len(missing_calls) > 0)
+            self.assertNotIn("file1.txt", self.versioner.hash_cache)
+            self.assertIn("file2.txt", self.versioner.hash_cache)
+
+            calls = [str(call) for call in mock_print.call_args_list]
+            clear_calls = [call for call in calls if "Cleared hash cache for" in call]
+            self.assertTrue(len(clear_calls) > 0)
 
     def test_hash_file_unsupported_method(self):
         """Test hash_file with unsupported method."""
@@ -449,41 +829,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         finally:
             if compressed_file.exists():
                 compressed_file.unlink()
-
-    def test_clear_hash_cache_all_entries(self):
-        """Test clear_hash_cache clearing all entries."""
-        # Add some cache entries
-        self.versioner.hash_cache["file1.txt"] = {"hash": "hash1"}
-        self.versioner.hash_cache["file2.txt"] = {"hash": "hash2"}
-
-        with patch("builtins.print") as mock_print:
-            self.versioner.clear_hash_cache()  # Clear all
-
-            self.assertEqual(len(self.versioner.hash_cache), 0)
-
-            calls = [str(call) for call in mock_print.call_args_list]
-            clear_calls = [call for call in calls if "Cleared all hash cache" in call]
-            self.assertTrue(len(clear_calls) > 0)
-
-    def test_clear_hash_cache_specific_file(self):
-        """Test clear_hash_cache clearing specific file."""
-        # Add some cache entries and save them
-        self.versioner.hash_cache["file1.txt"] = {"hash": "hash1"}
-        self.versioner.hash_cache["file2.txt"] = {"hash": "hash2"}
-        self.versioner.save_cache()
-
-        with patch("builtins.print") as mock_print:
-            self.versioner.clear_hash_cache("file1.txt")
-
-            # Reload cache to see the persisted state
-            self.versioner.load_cache()
-
-            self.assertNotIn("file1.txt", self.versioner.hash_cache)
-            self.assertIn("file2.txt", self.versioner.hash_cache)
-
-            calls = [str(call) for call in mock_print.call_args_list]
-            clear_calls = [call for call in calls if "Cleared hash cache for" in call]
-            self.assertTrue(len(clear_calls) > 0)
 
     def test_hash_file_auto_selection_linux_cli(self):
         """Test automatic selection of CLI method on Linux for non-empty files."""
