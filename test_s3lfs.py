@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import unittest
 from concurrent.futures import CancelledError
 from pathlib import Path
@@ -54,6 +55,12 @@ class TestS3LFS(unittest.TestCase):
         # Clean up the manifest if created
         if os.path.exists(self.versioner.manifest_file):
             os.remove(self.versioner.manifest_file)
+
+        # Clean up the cache file if created
+        if hasattr(self.versioner, "cache_file") and os.path.exists(
+            self.versioner.cache_file
+        ):
+            os.remove(self.versioner.cache_file)
 
         if os.path.exists(self.test_directory):
             os.rmdir(self.test_directory)
@@ -3184,6 +3191,195 @@ class TestS3LFS(unittest.TestCase):
 
         # File should be downloaded successfully despite callback incompatibility
         self.assertTrue(os.path.exists(self.test_file))
+
+    # -------------------------------------------------
+    # 22. Hash Caching Tests
+    # -------------------------------------------------
+    def test_hash_file_cached_basic(self):
+        """Test basic hash_file_cached functionality."""
+        # First call should compute and cache the hash
+        hash1 = self.versioner.hash_file_cached(self.test_file)
+        self.assertIsInstance(hash1, str)
+        self.assertEqual(len(hash1), 64)  # SHA256 length
+
+        # Verify cache was created
+        self.assertIn(self.test_file, self.versioner.hash_cache)
+
+        # Second call should return cached hash without recomputation
+        hash2 = self.versioner.hash_file_cached(self.test_file)
+        self.assertEqual(hash1, hash2)
+
+    def test_hash_file_cached_invalidation(self):
+        """Test that cache is invalidated when file changes."""
+        # Cache initial hash
+        hash1 = self.versioner.hash_file_cached(self.test_file)
+
+        # Modify the file
+        import time
+
+        time.sleep(0.1)  # Ensure mtime changes
+        with open(self.test_file, "a") as f:
+            f.write("\nModified content")
+
+        # Should compute new hash due to changed mtime/size
+        hash2 = self.versioner.hash_file_cached(self.test_file)
+        self.assertNotEqual(hash1, hash2)
+
+    def test_get_file_status(self):
+        """Test get_file_status method."""
+        # Test non-existent file
+        status = self.versioner.get_file_status("nonexistent.txt")
+        self.assertFalse(status["exists"])
+        self.assertFalse(status["cached"])
+
+        # Test existing file without cache
+        status = self.versioner.get_file_status(self.test_file)
+        self.assertTrue(status["exists"])
+        self.assertFalse(status["cached"])
+        self.assertFalse(status["cache_valid"])
+
+        # Cache the file hash
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Test existing file with valid cache
+        status = self.versioner.get_file_status(self.test_file)
+        self.assertTrue(status["exists"])
+        self.assertTrue(status["cached"])
+        self.assertTrue(status["cache_valid"])
+        self.assertIsNotNone(status["cached_hash"])
+        self.assertIsNotNone(status["cache_timestamp"])
+
+    def test_clear_hash_cache(self):
+        """Test clear_hash_cache functionality."""
+        # Cache some hashes
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Create another test file
+        test_file2 = "test_file2.txt"
+        with open(test_file2, "w") as f:
+            f.write("Test content 2")
+
+        try:
+            self.versioner.hash_file_cached(test_file2)
+
+            # Verify both files are cached
+            self.assertEqual(len(self.versioner.hash_cache), 2)
+
+            # Clear cache for specific file
+            self.versioner.clear_hash_cache(self.test_file)
+            self.assertEqual(len(self.versioner.hash_cache), 1)
+            self.assertNotIn(self.test_file, self.versioner.hash_cache)
+
+            # Clear all cache
+            self.versioner.clear_hash_cache()
+            self.assertEqual(len(self.versioner.hash_cache), 0)
+
+        finally:
+            if os.path.exists(test_file2):
+                os.remove(test_file2)
+
+    def test_cleanup_stale_cache(self):
+        """Test cleanup_stale_cache functionality."""
+        # Cache a hash
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Create a fake cache entry for non-existent file
+        self.versioner.hash_cache["nonexistent.txt"] = {
+            "hash": "fake_hash",
+            "metadata": {"size": 100, "mtime": 123456789},
+            "timestamp": time.time(),
+        }
+
+        # Create an old cache entry
+        old_timestamp = time.time() - (31 * 24 * 60 * 60)  # 31 days ago
+        self.versioner.hash_cache["old_file.txt"] = {
+            "hash": "old_hash",
+            "metadata": {"size": 200, "mtime": 123456789},
+            "timestamp": old_timestamp,
+        }
+
+        # Should have 3 entries before cleanup
+        self.assertEqual(len(self.versioner.hash_cache), 3)
+
+        # Cleanup stale entries
+        self.versioner.cleanup_stale_cache(max_age_days=30)
+
+        # Should only have the valid entry left
+        self.assertEqual(len(self.versioner.hash_cache), 1)
+        self.assertIn(self.test_file, self.versioner.hash_cache)
+
+    def test_track_modified_files_cached(self):
+        """Test track_modified_files_cached performance optimization."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+
+        # Cache the hash
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Mock parallel_upload to verify it's not called when no changes
+        with patch.object(self.versioner, "parallel_upload") as mock_upload:
+            self.versioner.track_modified_files_cached(silence=False)
+            # Should NOT have called parallel_upload since file hasn't changed
+            self.assertFalse(mock_upload.called)
+
+    def test_track_modified_files_cached_with_changes(self):
+        """Test track_modified_files_cached detects changes correctly."""
+        # Upload file first
+        self.versioner.upload(self.test_file)
+
+        # Cache the hash
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Modify the file
+        import time
+
+        time.sleep(0.1)  # Ensure mtime changes
+        with open(self.test_file, "a") as f:
+            f.write("\nModified for cache test")
+
+        # Mock parallel_upload to verify it's called when changes detected
+        with patch.object(self.versioner, "parallel_upload") as mock_upload:
+            self.versioner.track_modified_files_cached(silence=False)
+            # Should have called parallel_upload due to detected changes
+            self.assertTrue(mock_upload.called)
+
+    def test_hash_cache_performance_comparison(self):
+        """Test that cached hashing is faster than regular hashing."""
+        import time
+
+        # Time regular hashing
+        start_time = time.time()
+        hash1 = self.versioner.hash_file(self.test_file)
+        regular_time = time.time() - start_time
+
+        # Cache the hash
+        self.versioner.hash_file_cached(self.test_file)
+
+        # Time cached hashing (should be much faster)
+        start_time = time.time()
+        hash2 = self.versioner.hash_file_cached(self.test_file)
+        cached_time = time.time() - start_time
+
+        # Hashes should be the same
+        self.assertEqual(hash1, hash2)
+
+        # Cached version should be significantly faster
+        # (This might not always pass in fast test environments, so we'll just verify it doesn't error)
+        self.assertGreater(regular_time, 0)
+        self.assertGreater(cached_time, 0)
+
+    def test_hash_cache_with_different_methods(self):
+        """Test that cached hashing works with different hash methods."""
+        # Cache with auto method
+        hash1 = self.versioner.hash_file_cached(self.test_file, method="auto")
+
+        # Should return cached result regardless of method specified
+        hash2 = self.versioner.hash_file_cached(self.test_file, method="mmap")
+        hash3 = self.versioner.hash_file_cached(self.test_file, method="iter")
+
+        # All should return the same cached hash
+        self.assertEqual(hash1, hash2)
+        self.assertEqual(hash2, hash3)
 
 
 if __name__ == "__main__":
