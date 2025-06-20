@@ -580,48 +580,71 @@ class S3LFS:
                 self.manifest["files"].keys()
             )  # Files listed in the manifest
 
-        # Use cached hashing for better performance
-        for file_path in files_to_check:
-            try:
-                # Get file status to check cache validity
-                status = self.get_file_status(file_path)
+        if not files_to_check:
+            print(
+                "⚠️ No files found in manifest. Use 's3lfs track <path>' to track files first."
+            )
+            return
 
-                if not status["exists"]:
-                    print(f"Warning: File {file_path} is missing. Skipping.")
+        print(f"🔍 Checking {len(files_to_check)} tracked files for modifications...")
+
+        # Use cached hashing for better performance with progress indication
+        with tqdm(
+            total=len(files_to_check), desc="Checking files", unit="file"
+        ) as pbar:
+            for file_path in files_to_check:
+                try:
+                    # Get file status to check cache validity
+                    status = self.get_file_status(file_path)
+
+                    if not status["exists"]:
+                        print(f"⚠️ Warning: File {file_path} is missing. Skipping.")
+                        pbar.update(1)
+                        continue
+
+                    # Use cached hash if available and valid
+                    if status["cache_valid"]:
+                        current_hash = status["cached_hash"]
+                        cache_hits += 1
+                    else:
+                        current_hash = self.hash_file_cached(file_path)
+                        cache_misses += 1
+
+                    with self._lock_context():
+                        stored_hash = self.manifest["files"].get(file_path)
+
+                    if current_hash != stored_hash:
+                        print(f"📝 File {file_path} has changed. Marking for upload.")
+                        files_to_upload.append(file_path)
+
+                    # Update progress bar with current status
+                    pbar.set_postfix(
+                        {
+                            "changed": len(files_to_upload),
+                            "cache_hits": cache_hits,
+                            "cache_misses": cache_misses,
+                        }
+                    )
+                    pbar.update(1)
+
+                except Exception as e:
+                    print(f"❌ Error processing {file_path}: {e}")
+                    pbar.update(1)
                     continue
-
-                # Use cached hash if available and valid
-                if status["cache_valid"]:
-                    current_hash = status["cached_hash"]
-                    cache_hits += 1
-                else:
-                    current_hash = self.hash_file_cached(file_path)
-                    cache_misses += 1
-
-                with self._lock_context():
-                    stored_hash = self.manifest["files"].get(file_path)
-
-                if current_hash != stored_hash:
-                    print(f"File {file_path} has changed. Marking for upload.")
-                    files_to_upload.append(file_path)
-
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
-                continue
 
         if not silence:
             print(f"📊 Hash cache performance: {cache_hits} hits, {cache_misses} misses")
 
         # Upload files in parallel if needed
         if files_to_upload:
-            print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
+            print(f"📤 Uploading {len(files_to_upload)} modified file(s) in parallel...")
             self.parallel_upload(files_to_upload, silence=silence)
 
             # Save updated manifest (including cache)
             with self._lock_context():
                 self.save_manifest()
         else:
-            print("No modified files needing upload.")
+            print("✅ No modified files needing upload.")
 
     def _hash_file_mmap(self, file_path):
         """
