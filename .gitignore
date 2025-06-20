@@ -1,8 +1,13 @@
-.coverage*
-coverage.xml
-cli_test_file.txt.gz
-*.pyc
+
+# S3LFS cache and temporary files - should not be version controlled
+*_cache.json
+.s3lfs_temp
+*.s3lfs.lock
 venv
-.s3lfs.lock
 htmlcov
+__pycache__
+s3lfs/__pycache__
+coverage.xml
 *.swp
+.coverage*
+.s3lfs_temp/
