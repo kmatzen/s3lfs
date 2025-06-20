@@ -1086,7 +1086,9 @@ class TestS3LFS(unittest.TestCase):
         self.versioner.upload(self.test_file)
 
         # Test the worker function directly - it should return False for uploaded since file is up-to-date
-        result = self.versioner._hash_and_upload_worker(self.test_file, silence=True)
+        result = self.versioner._hash_and_upload_worker(
+            self.test_file, silence=True, use_cache=True
+        )
         file_path, file_hash, uploaded, bytes_transferred = result
 
         self.assertEqual(file_path, self.test_file)
@@ -1120,7 +1122,9 @@ class TestS3LFS(unittest.TestCase):
         non_existent_file = "non_existent_file.txt"
 
         with self.assertRaises(FileNotFoundError):
-            self.versioner._hash_and_upload_worker(non_existent_file, silence=True)
+            self.versioner._hash_and_upload_worker(
+                non_existent_file, silence=True, use_cache=True
+            )
 
     def test_hash_and_download_worker_error_handling(self):
         """Test _hash_and_download_worker error handling."""
@@ -1197,11 +1201,11 @@ class TestS3LFS(unittest.TestCase):
             # Mock the shutdown flag to be True during processing
             original_shutdown = self.versioner._shutdown_requested
 
-            def mock_worker(file_path, silence, progress_callback=None):
+            def mock_worker(file_path, silence, progress_callback=None, use_cache=True):
                 # Set shutdown flag during first call
                 self.versioner._shutdown_requested = True
                 return self.versioner._hash_and_upload_worker(
-                    file_path, silence, progress_callback
+                    file_path, silence, progress_callback, use_cache
                 )
 
             with patch.object(
@@ -1245,11 +1249,11 @@ class TestS3LFS(unittest.TestCase):
             # Mock the shutdown flag to be True during processing
             original_shutdown = self.versioner._shutdown_requested
 
-            def mock_worker(file_info, silence, progress_callback=None):
+            def mock_worker(file_info, silence, progress_callback=None, use_cache=True):
                 # Set shutdown flag during first call
                 self.versioner._shutdown_requested = True
                 return self.versioner._hash_and_download_worker(
-                    file_info, silence, progress_callback
+                    file_info, silence, progress_callback, use_cache
                 )
 
             with patch.object(
@@ -1355,7 +1359,7 @@ class TestS3LFS(unittest.TestCase):
 
         try:
             # Mock worker to raise an exception
-            def mock_worker(file_path, silence, progress_callback=None):
+            def mock_worker(file_path, silence, progress_callback=None, use_cache=True):
                 raise RuntimeError(f"Processing error for {file_path}")
 
             with patch.object(
@@ -1402,7 +1406,7 @@ class TestS3LFS(unittest.TestCase):
                 os.remove(fname)
 
             # Mock worker to raise an exception
-            def mock_worker(file_info, silence, progress_callback=None):
+            def mock_worker(file_info, silence, progress_callback=None, use_cache=True):
                 file_path, expected_hash = file_info
                 raise RuntimeError(f"Processing error for {file_path}")
 
@@ -1435,13 +1439,14 @@ class TestS3LFS(unittest.TestCase):
                     pass
 
     def test_worker_error_print_and_raise(self):
-        """Test that worker functions print errors and re-raise them."""
         # Test _hash_and_upload_worker error handling
         non_existent_file = "definitely_does_not_exist.txt"
 
         with patch("builtins.print") as mock_print:
             with self.assertRaises(FileNotFoundError):
-                self.versioner._hash_and_upload_worker(non_existent_file, silence=True)
+                self.versioner._hash_and_upload_worker(
+                    non_existent_file, silence=True, use_cache=True
+                )
 
             # Should print error message - check that at least one error call was made
             calls = [str(call) for call in mock_print.call_args_list]
@@ -2235,7 +2240,9 @@ class TestS3LFS(unittest.TestCase):
 
     def test_hash_and_upload_worker_basic(self):
         """Test _hash_and_upload_worker basic functionality."""
-        result = self.versioner._hash_and_upload_worker(self.test_file, silence=True)
+        result = self.versioner._hash_and_upload_worker(
+            self.test_file, silence=True, use_cache=True
+        )
 
         file_path, file_hash, uploaded, bytes_transferred = result
         self.assertEqual(file_path, self.test_file)
@@ -3050,7 +3057,8 @@ class TestS3LFS(unittest.TestCase):
         current_hash = self.versioner.hash_file(self.test_file)
         # The bug is in track_modified_files line 763 - it uses manifest.get(file) instead of manifest["files"].get(file)
         # So we need to also set the hash at the top level for this test
-        self.versioner.manifest[self.test_file] = current_hash
+        # Note: This is testing a bug that has been fixed, but keeping the test structure
+        self.versioner.manifest["files"][self.test_file] = current_hash
 
         # Mock parallel_upload to verify it's not called
         with patch.object(self.versioner, "parallel_upload") as mock_upload:
