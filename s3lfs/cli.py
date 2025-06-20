@@ -35,8 +35,8 @@ def track(path, no_sign_request, verbose, modified):
     s3lfs = S3LFS(no_sign_request=no_sign_request)
 
     if modified:
-        # Track only modified files
-        s3lfs.track_modified_files(silence=not verbose)
+        # Track only modified files using cached version for better performance
+        s3lfs.track_modified_files_cached(silence=not verbose)
     elif path:
         # Track specific path
         s3lfs.track(path, silence=not verbose)

@@ -117,9 +117,9 @@ First, initialize S3LFS in your repository:
 s3lfs init my-bucket my-project-name
 ```
 
-This creates `.s3_manifest.json` which should be committed to Git:
+This creates `.s3_manifest.json` which should be committed to Git, and automatically updates your `.gitignore` to exclude S3LFS cache files:
 ```sh
-git add .s3_manifest.json
+git add .s3_manifest.json .gitignore
 git commit -m "Initialize S3LFS"
 ```
 

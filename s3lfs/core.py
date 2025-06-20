@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
@@ -128,8 +129,14 @@ class S3LFS:
             self.config = TransferConfig(max_concurrency=DEFAULT_MAX_CONCURRENCY)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
+
+        # Separate cache file - should NOT be version controlled
+        cache_file_name = self.manifest_file.stem + "_cache.json"
+        self.cache_file = self.manifest_file.parent / cache_file_name
+
         self.no_sign_request = no_sign_request
         self.load_manifest()
+        self.load_cache()
 
         # Use the stored bucket name if none is provided
         with self._lock_context():
@@ -201,6 +208,7 @@ class S3LFS:
     def initialize_repo(self):
         """
         Initialize the repository with a bucket name and a repo-specific prefix.
+        Also updates .gitignore to exclude S3LFS cache files.
 
         :param bucket_name: Name of the S3 bucket to use
         :param repo_prefix: A unique prefix for this repository in the bucket
@@ -213,10 +221,70 @@ class S3LFS:
                 self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
             self.save_manifest()
 
+        # Update .gitignore to exclude cache files
+        self._update_gitignore()
+
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         print("Manifest file saved as .s3_manifest.json")
+
+    def _update_gitignore(self):
+        """
+        Update .gitignore to exclude S3LFS cache files and temporary directories.
+        Creates .gitignore if it doesn't exist, or appends to existing one.
+        """
+        gitignore_path = Path(".gitignore")
+
+        # S3LFS patterns to add
+        s3lfs_patterns = [
+            "",  # Empty line for separation
+            "# S3LFS cache and temporary files - should not be version controlled",
+            "*_cache.json",
+            ".s3lfs_temp/",
+            "*.s3lfs.lock",
+        ]
+
+        # Check if .gitignore exists and read current content
+        existing_content = []
+        if gitignore_path.exists():
+            with open(gitignore_path, "r") as f:
+                existing_content = [line.rstrip() for line in f.readlines()]
+
+        # Check which patterns are already present
+        patterns_to_add = []
+        for pattern in s3lfs_patterns:
+            if pattern.startswith("#") or pattern == "":
+                # Always add comments and empty lines for structure
+                patterns_to_add.append(pattern)
+            elif pattern not in existing_content:
+                patterns_to_add.append(pattern)
+
+        # Only update if we have patterns to add
+        if any(p for p in patterns_to_add if not p.startswith("#") and p != ""):
+            # Check if we already have S3LFS section
+            has_s3lfs_section = any("S3LFS" in line for line in existing_content)
+
+            if not has_s3lfs_section:
+                # Add all patterns including header
+                with open(gitignore_path, "a") as f:
+                    for pattern in patterns_to_add:
+                        f.write(f"{pattern}\n")
+                print("📝 Updated .gitignore to exclude S3LFS cache files")
+            else:
+                # Only add missing patterns (without header)
+                missing_patterns = [
+                    p for p in patterns_to_add if not p.startswith("#") and p != ""
+                ]
+                if missing_patterns:
+                    with open(gitignore_path, "a") as f:
+                        for pattern in missing_patterns:
+                            f.write(f"{pattern}\n")
+                    print(
+                        f"📝 Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
+                    )
+        else:
+            print("✅ .gitignore already contains S3LFS cache exclusions")
 
     def load_manifest(self):
         """Load the local manifest (.s3_manifest.json)."""
@@ -240,6 +308,35 @@ class S3LFS:
             temp_file.replace(self.manifest_file)
         except Exception as e:
             print(f"❌ Failed to save manifest: {e}")
+            if temp_file.exists():
+                temp_file.unlink()  # Clean up the temporary file
+
+    def load_cache(self):
+        """Load the hash cache from a separate cache file."""
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, "r") as f:
+                    self.hash_cache = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(
+                    f"⚠️ Warning: Failed to load cache file, starting with empty cache: {e}"
+                )
+                self.hash_cache = {}
+        else:
+            self.hash_cache = {}
+
+    def save_cache(self):
+        """Save the hash cache back to disk atomically."""
+        temp_file = self.cache_file.with_suffix(".tmp")
+        try:
+            # Write the cache to a temporary file
+            with open(temp_file, "w") as f:
+                json.dump(self.hash_cache, f, indent=4, sort_keys=True)
+
+            # Atomically move the temporary file to the target location
+            temp_file.replace(self.cache_file)
+        except Exception as e:
+            print(f"❌ Failed to save cache: {e}")
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
@@ -280,6 +377,274 @@ class S3LFS:
             return self._hash_file_cli(file_path)
         else:
             raise ValueError(f"Unsupported hashing method: {method}")
+
+    def hash_file_cached(
+        self, file_path: Union[str, Path], method: str = "auto"
+    ) -> str:
+        """
+        Compute SHA-256 hash with caching based on file metadata (mtime, size, inode).
+        Returns cached hash if file hasn't changed, otherwise computes and caches new hash.
+        This method is multi-process safe using file-based locking.
+
+        :param file_path: Path to the file to hash.
+        :param method: Hashing method to use if computation is needed.
+        :return: The computed SHA-256 hash as a hexadecimal string.
+        """
+        file_path = Path(file_path)
+        file_path_str = str(file_path.as_posix())
+
+        # Ensure the file exists
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        # Get current file metadata
+        stat = file_path.stat()
+        current_metadata = {
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "inode": getattr(
+                stat, "st_ino", None
+            ),  # inode may not exist on all platforms
+        }
+
+        # Use file lock for multi-process safety
+        with self._lock_context():
+            # Reload cache to get latest state from other processes
+            self.load_cache()
+
+            # Check if we have cached data for this file
+            cached_data = self.hash_cache.get(file_path_str)
+            if cached_data:
+                cached_metadata = cached_data.get("metadata", {})
+
+                # Compare metadata to see if file has changed
+                if (
+                    cached_metadata.get("size") == current_metadata["size"]
+                    and cached_metadata.get("mtime") == current_metadata["mtime"]
+                    and cached_metadata.get("inode") == current_metadata["inode"]
+                ):
+                    # File hasn't changed, return cached hash
+                    return cached_data["hash"]
+
+            # File has changed or no cache exists, compute new hash
+            # Release lock while computing hash (can be expensive)
+            pass
+
+        # Compute hash outside of lock to avoid blocking other processes
+        new_hash = self.hash_file(file_path, method)
+
+        # Acquire lock again to update cache
+        with self._lock_context():
+            # Reload cache again in case it changed while we were computing hash
+            self.load_cache()
+
+            # Double-check if another process already computed this hash
+            cached_data = self.hash_cache.get(file_path_str)
+            if cached_data:
+                cached_metadata = cached_data.get("metadata", {})
+                if (
+                    cached_metadata.get("size") == current_metadata["size"]
+                    and cached_metadata.get("mtime") == current_metadata["mtime"]
+                    and cached_metadata.get("inode") == current_metadata["inode"]
+                ):
+                    # Another process computed it while we were working
+                    return cached_data["hash"]
+
+            # Cache the new hash with metadata
+            self.hash_cache[file_path_str] = {
+                "hash": new_hash,
+                "metadata": current_metadata,
+                "timestamp": time.time(),  # When hash was computed
+            }
+
+            # Save cache with updated data
+            self.save_cache()
+
+        return new_hash
+
+    def get_file_status(self, file_path: Union[str, Path]) -> dict:
+        """
+        Get comprehensive status information about a file including cache status.
+
+        :param file_path: Path to the file to check.
+        :return: Dictionary with file status information.
+        """
+        file_path = Path(file_path)
+        file_path_str = str(file_path.as_posix())
+
+        if not file_path.exists():
+            return {"exists": False, "cached": False}
+
+        stat = file_path.stat()
+        current_metadata = {
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "inode": getattr(stat, "st_ino", None),
+        }
+
+        # Check cache status - reload cache to get latest state
+        with self._lock_context():
+            self.load_cache()
+            cached_data = self.hash_cache.get(file_path_str)
+
+        is_cached = False
+        cache_valid = False
+
+        if cached_data:
+            is_cached = True
+            cached_metadata = cached_data.get("metadata", {})
+            cache_valid = (
+                cached_metadata.get("size") == current_metadata["size"]
+                and cached_metadata.get("mtime") == current_metadata["mtime"]
+                and cached_metadata.get("inode") == current_metadata["inode"]
+            )
+
+        return {
+            "exists": True,
+            "size": current_metadata["size"],
+            "mtime": current_metadata["mtime"],
+            "cached": is_cached,
+            "cache_valid": cache_valid,
+            "cached_hash": cached_data.get("hash") if cached_data else None,
+            "cache_timestamp": cached_data.get("timestamp") if cached_data else None,
+        }
+
+    def clear_hash_cache(self, file_path: Union[str, Path, None] = None):
+        """
+        Clear hash cache for a specific file or all files.
+        This method is multi-process safe using file-based locking.
+
+        :param file_path: If provided, clear cache only for this file. If None, clear all cache.
+        """
+        with self._lock_context():
+            self.load_cache()  # Get latest state
+
+            if file_path is None:
+                # Clear all cache
+                self.hash_cache = {}
+                print("🗑 Cleared all hash cache entries.")
+            else:
+                # Clear cache for specific file
+                file_path_str = str(Path(file_path).as_posix())
+                if file_path_str in self.hash_cache:
+                    del self.hash_cache[file_path_str]
+                    print(f"🗑 Cleared hash cache for '{file_path}'.")
+
+            self.save_cache()
+
+    def cleanup_stale_cache(self, max_age_days: int = 30):
+        """
+        Remove cache entries for files that no longer exist or are very old.
+        This method is multi-process safe using file-based locking.
+
+        :param max_age_days: Remove cache entries older than this many days.
+        """
+        with self._lock_context():
+            self.load_cache()  # Get latest state
+
+            current_time = time.time()
+            max_age_seconds = max_age_days * 24 * 60 * 60
+
+            stale_entries = []
+
+            for file_path_str, cached_data in self.hash_cache.items():
+                # Check if file still exists
+                if not Path(file_path_str).exists():
+                    stale_entries.append(file_path_str)
+                    continue
+
+                # Check if cache entry is too old
+                cache_timestamp = cached_data.get("timestamp", 0)
+                if current_time - cache_timestamp > max_age_seconds:
+                    stale_entries.append(file_path_str)
+
+            # Remove stale entries
+            for file_path_str in stale_entries:
+                del self.hash_cache[file_path_str]
+
+            if stale_entries:
+                print(f"🗑 Cleaned up {len(stale_entries)} stale cache entries.")
+                self.save_cache()  # Only save if changes were made
+
+    def track_modified_files_cached(self, silence=True):
+        """
+        Check manifest for outdated hashes using cached hashing and upload changed files in parallel.
+        This is an optimized version of track_modified_files that uses hash caching.
+        """
+        files_to_upload = []
+        cache_hits = 0
+        cache_misses = 0
+
+        with self._lock_context():
+            files_to_check = list(
+                self.manifest["files"].keys()
+            )  # Files listed in the manifest
+
+        if not files_to_check:
+            print(
+                "⚠️ No files found in manifest. Use 's3lfs track <path>' to track files first."
+            )
+            return
+
+        print(f"🔍 Checking {len(files_to_check)} tracked files for modifications...")
+
+        # Use cached hashing for better performance with progress indication
+        with tqdm(
+            total=len(files_to_check), desc="Checking files", unit="file"
+        ) as pbar:
+            for file_path in files_to_check:
+                try:
+                    # Get file status to check cache validity
+                    status = self.get_file_status(file_path)
+
+                    if not status["exists"]:
+                        print(f"⚠️ Warning: File {file_path} is missing. Skipping.")
+                        pbar.update(1)
+                        continue
+
+                    # Use cached hash if available and valid
+                    if status["cache_valid"]:
+                        current_hash = status["cached_hash"]
+                        cache_hits += 1
+                    else:
+                        current_hash = self.hash_file_cached(file_path)
+                        cache_misses += 1
+
+                    with self._lock_context():
+                        stored_hash = self.manifest["files"].get(file_path)
+
+                    if current_hash != stored_hash:
+                        print(f"📝 File {file_path} has changed. Marking for upload.")
+                        files_to_upload.append(file_path)
+
+                    # Update progress bar with current status
+                    pbar.set_postfix(
+                        {
+                            "changed": len(files_to_upload),
+                            "cache_hits": cache_hits,
+                            "cache_misses": cache_misses,
+                        }
+                    )
+                    pbar.update(1)
+
+                except Exception as e:
+                    print(f"❌ Error processing {file_path}: {e}")
+                    pbar.update(1)
+                    continue
+
+        if not silence:
+            print(f"📊 Hash cache performance: {cache_hits} hits, {cache_misses} misses")
+
+        # Upload files in parallel if needed
+        if files_to_upload:
+            print(f"📤 Uploading {len(files_to_upload)} modified file(s) in parallel...")
+            self.parallel_upload(files_to_upload, silence=silence)
+
+            # Save updated manifest (including cache)
+            with self._lock_context():
+                self.save_manifest()
+        else:
+            print("✅ No modified files needing upload.")
 
     def _hash_file_mmap(self, file_path):
         """
@@ -760,7 +1125,7 @@ class S3LFS:
         # Process results
         for file, current_hash in results:
             with self._lock_context():
-                stored_hash = self.manifest.get(file)
+                stored_hash = self.manifest["files"].get(file)
 
             if current_hash is None:
                 print(f"Warning: File {file} is missing. Skipping.")
@@ -1061,16 +1426,17 @@ class S3LFS:
 
             return True
 
-    def track(self, path, silence=True, interleaved=True):
+    def track(self, path, silence=True, interleaved=True, use_cache=True):
         """
         Track and upload files, directories, or globs.
 
         :param path: A file, directory, or glob pattern to track.
         :param silence: Silences verbose logging.
         :param interleaved: If True, use interleaved hashing and uploading for better performance.
+        :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
         if interleaved:
-            return self.track_interleaved(path, silence=silence)
+            return self.track_interleaved(path, silence=silence, use_cache=use_cache)
 
         # Original two-stage implementation
         # Phase 1: Resolve filesystem paths and compute hashes
@@ -1084,13 +1450,21 @@ class S3LFS:
         # Compute hashes in parallel with a progress bar
         with tqdm(total=len(files_to_track), desc="Hashing files", unit="file") as pbar:
             with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+                if use_cache:
+
+                    def hash_func(f):
+                        return self._hash_with_progress_cached(f, pbar)
+
+                else:
+
+                    def hash_func(f):
+                        return self._hash_with_progress(f, pbar)
+
                 file_hashes = {
                     str(file.as_posix()): hash_result
                     for file, hash_result in zip(
                         files_to_track,
-                        executor.map(
-                            lambda f: self._hash_with_progress(f, pbar), files_to_track
-                        ),
+                        executor.map(hash_func, files_to_track),
                     )
                 }
 
@@ -1154,6 +1528,14 @@ class S3LFS:
 
         print(f"✅ Successfully tracked and uploaded files for '{path}'.")
 
+    def _hash_with_progress_cached(self, file_path, progress_bar):
+        """
+        Helper function to compute the cached hash of a file and update the progress bar.
+        """
+        result = self.hash_file_cached(file_path)
+        progress_bar.update(1)
+        return result
+
     def _hash_with_progress(self, file_path, progress_bar):
         """
         Helper function to compute the hash of a file and update the progress bar.
@@ -1162,16 +1544,17 @@ class S3LFS:
         progress_bar.update(1)
         return result
 
-    def checkout(self, path, silence=True, interleaved=True):
+    def checkout(self, path, silence=True, interleaved=True, use_cache=True):
         """
         Checkout files, directories, or globs from the manifest.
 
         :param path: A file, directory, or glob pattern to checkout.
         :param silence: Silences verbose logging.
         :param interleaved: If True, use interleaved hashing and downloading for better performance.
+        :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
         if interleaved:
-            return self.checkout_interleaved(path, silence=silence)
+            return self.checkout_interleaved(path, silence=silence, use_cache=use_cache)
 
         # Original two-stage implementation
         # Phase 1: Resolve manifest paths using improved globbing
@@ -1193,8 +1576,18 @@ class S3LFS:
             total=len(files_to_checkout), desc="Hashing files", unit="file"
         ) as pbar:
             with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+                if use_cache:
+
+                    def hash_func(f):
+                        return self._hash_with_progress_cached(f, pbar)
+
+                else:
+
+                    def hash_func(f):
+                        return self._hash_with_progress(f, pbar)
+
                 future_to_file = {
-                    executor.submit(self._hash_with_progress, Path(file), pbar): file
+                    executor.submit(hash_func, Path(file)): file
                     for file in files_to_checkout.keys()
                     if Path(file).exists()  # Only hash files that exist on disk
                 }
@@ -1290,7 +1683,9 @@ class S3LFS:
 
         return chunk_paths
 
-    def _hash_and_upload_worker(self, file_path, silence=True, progress_callback=None):
+    def _hash_and_upload_worker(
+        self, file_path, silence=True, progress_callback=None, use_cache=True
+    ):
         """
         Worker function that hashes a file and uploads it if needed.
         Returns (file_path, hash, uploaded, bytes_transferred) tuple.
@@ -1298,9 +1693,13 @@ class S3LFS:
         :param file_path: Path to the file to process
         :param silence: Whether to suppress individual file progress bars
         :param progress_callback: Optional callback function for progress updates
+        :param use_cache: Whether to use cached hashing for performance
         """
         try:
-            current_hash = self.hash_file(file_path)
+            if use_cache:
+                current_hash = self.hash_file_cached(file_path)
+            else:
+                current_hash = self.hash_file(file_path)
 
             # Check if upload is needed
             with self._lock_context():
@@ -1328,7 +1727,7 @@ class S3LFS:
             raise
 
     def _hash_and_download_worker(
-        self, file_info, silence=True, progress_callback=None
+        self, file_info, silence=True, progress_callback=None, use_cache=True
     ):
         """
         Worker function that checks if a file needs download and downloads it if needed.
@@ -1338,12 +1737,16 @@ class S3LFS:
         :param file_info: Tuple of (file_path, expected_hash)
         :param silence: Whether to suppress individual file progress bars
         :param progress_callback: Optional callback function for progress updates
+        :param use_cache: Whether to use cached hashing for performance
         """
         file_path, expected_hash = file_info
         try:
             # Check if file exists and has correct hash
             if Path(file_path).exists():
-                current_hash = self.hash_file(file_path)
+                if use_cache:
+                    current_hash = self.hash_file_cached(file_path)
+                else:
+                    current_hash = self.hash_file(file_path)
                 if current_hash == expected_hash:
                     # File is up-to-date, don't add to download total since no download is needed
                     return (file_path, False, 0)  # No download needed
@@ -1358,12 +1761,13 @@ class S3LFS:
             print(f"Error processing {file_path}: {e}")
             raise
 
-    def track_interleaved(self, path, silence=True):
+    def track_interleaved(self, path, silence=True, use_cache=True):
         """
         Track and upload files with interleaved hashing and uploading for better performance.
 
         :param path: A file, directory, or glob pattern to track.
         :param silence: Silences verbose logging.
+        :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
         # Phase 1: Resolve filesystem paths
         print("🔍 Resolving filesystem paths...")
@@ -1412,6 +1816,7 @@ class S3LFS:
                             str(file.as_posix()),
                             True,
                             progress_callback,
+                            use_cache,
                         ): file
                         for file in files_to_track
                     }
@@ -1471,12 +1876,13 @@ class S3LFS:
             f"✅ Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
         )
 
-    def checkout_interleaved(self, path, silence=True):
+    def checkout_interleaved(self, path, silence=True, use_cache=True):
         """
         Checkout files with interleaved hashing and downloading for better performance.
 
         :param path: A file, directory, or glob pattern to checkout.
         :param silence: Silences verbose logging.
+        :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
         # Phase 1: Resolve manifest paths
         print("🔒 Resolving paths from manifest...")
@@ -1544,6 +1950,7 @@ class S3LFS:
                             (file_path, expected_hash),
                             True,
                             progress_callback,
+                            use_cache,
                         ): file_path
                         for file_path, expected_hash in files_to_process.items()
                     }
