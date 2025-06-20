@@ -65,6 +65,42 @@ class TestS3LFS(unittest.TestCase):
         if os.path.exists(self.test_directory):
             os.rmdir(self.test_directory)
 
+        # Clean up any test artifacts that might have been created in git root
+        test_artifacts = [
+            "third_file.txt",
+            "fourth_file.txt",
+            "large_download_test.txt",
+            "chunk1.txt",
+            "chunk2.txt",
+            "merged.txt",
+            "test_file2.txt",
+            ".test_init_manifest.json",
+            ".s3lfs_temp",
+        ]
+
+        for artifact in test_artifacts:
+            artifact_path = Path(artifact)
+            if artifact_path.exists():
+                if artifact_path.is_file():
+                    artifact_path.unlink()
+                elif artifact_path.is_dir():
+                    shutil.rmtree(artifact_path)
+
+        # Clean up test directories that might have been created in git root
+        test_dirs = [
+            "data",
+            "logs",
+            "test_glob",
+            "complex_test",
+            "test_dir",
+            "testdir",
+            "otherdir",
+        ]
+        for test_dir in test_dirs:
+            test_dir_path = Path(test_dir)
+            if test_dir_path.exists() and test_dir_path.is_dir():
+                shutil.rmtree(test_dir_path)
+
     # -------------------------------------------------
     # 1. Basic Upload & Manifest Tracking
     # -------------------------------------------------
