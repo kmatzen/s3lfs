@@ -1,8 +1,0 @@
-.coverage*
-coverage.xml
-cli_test_file.txt.gz
-*.pyc
-venv
-.s3lfs.lock
-htmlcov
-*.swp
