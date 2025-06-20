@@ -10,3 +10,4 @@ s3lfs/__pycache__
 coverage.xml
 *.swp
 .coverage*
+.s3lfs_temp/
