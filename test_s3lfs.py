@@ -3463,6 +3463,13 @@ class TestS3LFS(unittest.TestCase):
         with patch("builtins.print") as mock_print:
             self.versioner.list_files("nonexistent_pattern")
 
+        # Should not print warning message in non-verbose mode
+        mock_print.assert_not_called()
+
+        # Should print warning message in verbose mode
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_files("nonexistent_pattern", verbose=True)
+
         # Should print warning message
         mock_print.assert_called()
         calls = [str(call_args) for call_args in mock_print.call_args_list]
@@ -3507,6 +3514,13 @@ class TestS3LFS(unittest.TestCase):
 
         with patch("builtins.print") as mock_print:
             self.versioner.list_all_files()
+
+        # Should not print warning message in non-verbose mode
+        mock_print.assert_not_called()
+
+        # Should print warning message in verbose mode
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_all_files(verbose=True)
 
         # Should print warning message
         mock_print.assert_called()
