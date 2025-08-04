@@ -44,8 +44,8 @@ repos:
     hooks:
       - id: unittest
         name: unittest
-        entry: python -m unittest
+        entry: poetry run python -m unittest
         language: system
         pass_filenames: false
         always_run: true
-        args: ["test_s3lfs", "-v"]
+        args: ["discover", "-s", ".", "-p", "test_*.py", "-v"]
