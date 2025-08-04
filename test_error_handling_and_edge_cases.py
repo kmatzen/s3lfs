@@ -133,7 +133,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         with patch("builtins.print") as mock_print:
             self.versioner.load_cache()
             self.assertEqual(self.versioner.hash_cache, {})
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             warning_calls = [
                 call for call in calls if "Warning: Failed to load cache file" in call
             ]
@@ -276,7 +276,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     self.assertIn("S3LFS cache and temporary files", content)
 
                     # Should print the creation message
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     create_calls = [
                         call
                         for call in calls
@@ -317,7 +317,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     self.versioner._update_gitignore()
 
                     # Should print the "already contains" message
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     existing_calls = [
                         call for call in calls if "already contains S3LFS" in call
                     ]
@@ -357,7 +357,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     self.assertIn("*.s3lfs.lock", updated_content)
 
                     # Should print message about adding missing patterns
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     missing_calls = [
                         call for call in calls if "missing S3LFS patterns" in call
                     ]
@@ -392,7 +392,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     self.versioner._update_gitignore()
 
                     # Should print the "already contains" message since no missing patterns
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     existing_calls = [
                         call for call in calls if "already contains S3LFS" in call
                     ]
@@ -427,7 +427,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
                     # Since all patterns already exist, should print "already contains" message
                     # The method checks if patterns exist, not if the header exists
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     existing_calls = [
                         call for call in calls if "already contains S3LFS" in call
                     ]
@@ -473,7 +473,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             self.assertEqual(final_count, initial_count)
 
             # Should not print cleanup message since no stale entries
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             cleanup_calls = [call for call in calls if "Cleaned up" in call]
             self.assertEqual(len(cleanup_calls), 0)
 
@@ -529,7 +529,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             self.assertNotIn(str(old_file), self.versioner.hash_cache)
 
             # Should print cleanup message
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             cleanup_calls = [
                 call for call in calls if "Cleaned up 2 stale cache entries" in call
             ]
@@ -731,7 +731,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             # Use the cached version which has better error handling
             self.versioner.track_modified_files_cached()
 
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             missing_calls = [call for call in calls if "missing" in call.lower()]
             self.assertTrue(len(missing_calls) > 0)
 
@@ -771,7 +771,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
             self.assertEqual(len(self.versioner.hash_cache), 0)
 
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             clear_calls = [call for call in calls if "Cleared all hash cache" in call]
             self.assertTrue(len(clear_calls) > 0)
 
@@ -791,7 +791,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             self.assertNotIn("file1.txt", self.versioner.hash_cache)
             self.assertIn("file2.txt", self.versioner.hash_cache)
 
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             clear_calls = [call for call in calls if "Cleared hash cache for" in call]
             self.assertTrue(len(clear_calls) > 0)
 
