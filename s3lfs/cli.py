@@ -6,16 +6,20 @@ import click
 from s3lfs.core import S3LFS
 
 
-def find_git_root(start_path=None):
+def find_git_root(start_path=None, git_finder_func=None):
     """
     Find the git repository root by walking up the directory tree.
 
     Args:
         start_path: Starting path to search from (defaults to current directory)
+        git_finder_func: Custom function to find git root (for testing)
 
     Returns:
         Path object pointing to the git repository root, or None if not found
     """
+    if git_finder_func:
+        return git_finder_func(start_path)
+
     if start_path is None:
         start_path = Path.cwd()
     else:
@@ -202,10 +206,10 @@ def checkout(path, no_sign_request, verbose, all):
     help="Show detailed information including file sizes and hashes",
 )
 @click.option("--all", is_flag=True, help="List all tracked files from manifest")
-def ls(path, no_sign_request, verbose, all):
+def ls(path, no_sign_request, verbose, all, git_finder_func=None):
     """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
     # Find git root and resolve path
-    git_root = find_git_root()
+    git_root = find_git_root(git_finder_func=git_finder_func)
     if not git_root:
         click.echo("Error: Not in a git repository")
         raise click.Abort()

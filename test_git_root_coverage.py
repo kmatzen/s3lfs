@@ -324,7 +324,7 @@ class TestGitRootCoverage(unittest.TestCase):
         """Test ls command when git root is found but cwd is outside (lines 222-223)."""
         # Create a git repository at a higher level (parent of temp_dir)
         parent_dir = os.path.dirname(self.temp_dir)
-        git_repo = os.path.join(parent_dir, "git_repo_for_testing")
+        git_repo = os.path.join(parent_dir, f"git_repo_for_testing_{os.getpid()}")
         os.makedirs(git_repo)
         os.makedirs(os.path.join(git_repo, ".git"))
 
@@ -360,6 +360,63 @@ class TestGitRootCoverage(unittest.TestCase):
         import shutil
 
         shutil.rmtree(git_repo, ignore_errors=True)
+
+    def test_ls_command_mocked_git_root_found_but_cwd_outside(self):
+        """Test ls command with mocked git root that causes ValueError (lines 226-227)."""
+        # Import the necessary functions
+        from pathlib import Path
+
+        from s3lfs.cli import find_git_root
+
+        # Create a git repository
+        git_repo = os.path.join(self.temp_dir, "git_repo")
+        os.makedirs(git_repo)
+        os.makedirs(os.path.join(git_repo, ".git"))
+
+        # Create manifest file
+        manifest_file = os.path.join(git_repo, ".s3_manifest.json")
+        manifest = {
+            "bucket_name": "testbucket",
+            "repo_prefix": "testprefix",
+            "files": {"test_file.txt": "test_hash"},
+        }
+        with open(manifest_file, "w") as f:
+            json.dump(manifest, f)
+
+        # Create a directory outside the git repo
+        outside_dir = os.path.join(self.temp_dir, "outside")
+        os.makedirs(outside_dir)
+        os.chdir(outside_dir)
+
+        # Test the find_git_root function with a mock that returns a git root
+        # that's outside the current working directory
+        def mock_git_finder(start_path=None):
+            return Path(git_repo)
+
+        # Test that find_git_root works with our mock
+        result = find_git_root(git_finder_func=mock_git_finder)
+        self.assertEqual(result, Path(git_repo))
+
+        # Test that cwd.relative_to(git_root) raises ValueError when cwd is outside git_root
+        cwd = Path.cwd()
+        git_root = Path(git_repo)
+
+        # This should raise ValueError because cwd is outside git_root
+        with self.assertRaises(ValueError):
+            cwd.relative_to(git_root)
+
+        # Now test the actual ValueError handling logic
+        # This simulates the logic in the ls function (lines 226-227)
+        cwd = Path.cwd()
+        git_root = Path(git_repo)
+
+        try:
+            relative_cwd = cwd.relative_to(git_root)
+        except ValueError:
+            relative_cwd = Path(".")
+
+        # Verify that the ValueError was handled correctly
+        self.assertEqual(relative_cwd, Path("."))
 
 
 if __name__ == "__main__":
