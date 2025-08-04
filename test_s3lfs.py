@@ -1187,7 +1187,7 @@ class TestS3LFS(unittest.TestCase):
                         )
 
                     # Should print error message
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     error_calls = [call for call in calls if "Error processing" in call]
                     self.assertTrue(
                         len(error_calls) > 0, "Error message should be printed"
@@ -1406,7 +1406,7 @@ class TestS3LFS(unittest.TestCase):
                         self.versioner.track_interleaved("error_test_*.txt")
 
                     # Should print error message - check that at least one error call was made
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     error_calls = [
                         call
                         for call in calls
@@ -1454,7 +1454,7 @@ class TestS3LFS(unittest.TestCase):
                         self.versioner.checkout_interleaved("error_checkout_test_*.txt")
 
                     # Should print error message - check that at least one error call was made
-                    calls = [str(call) for call in mock_print.call_args_list]
+                    calls = [str(call_args) for call_args in mock_print.call_args_list]
                     error_calls = [
                         call
                         for call in calls
@@ -1485,7 +1485,7 @@ class TestS3LFS(unittest.TestCase):
                 )
 
             # Should print error message - check that at least one error call was made
-            calls = [str(call) for call in mock_print.call_args_list]
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
             error_calls = [
                 call
                 for call in calls
@@ -1515,7 +1515,7 @@ class TestS3LFS(unittest.TestCase):
                     self.versioner.checkout_interleaved(self.test_file)
 
                 # Should print completion message in finally block
-                calls = [str(call) for call in mock_print.call_args_list]
+                calls = [str(call_args) for call_args in mock_print.call_args_list]
                 completion_calls = [
                     call for call in calls if "Successfully processed" in call
                 ]
@@ -3424,6 +3424,155 @@ class TestS3LFS(unittest.TestCase):
         # All should return the same cached hash
         self.assertEqual(hash1, hash2)
         self.assertEqual(hash2, hash3)
+
+    # -------------------------------------------------
+    # 23. List Files (ls) Tests
+    # -------------------------------------------------
+    def test_list_files_basic(self):
+        """Test basic list_files functionality."""
+        # Upload a file first
+        self.versioner.upload(self.test_file)
+
+        # List the file
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_files(self.test_file)
+
+        # Should have printed the file
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        self.assertTrue(any(self.test_file in call for call in calls))
+
+    def test_list_files_verbose(self):
+        """Test list_files with verbose output."""
+        # Upload a file first
+        self.versioner.upload(self.test_file)
+
+        # List the file with verbose output
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_files(self.test_file, verbose=True)
+
+        # Should have printed detailed information
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        # Should include hash and size information
+        self.assertTrue(any("Hash:" in call for call in calls))
+        self.assertTrue(any("Size:" in call for call in calls))
+
+    def test_list_files_no_files_found(self):
+        """Test list_files when no files match the pattern."""
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_files("nonexistent_pattern")
+
+        # Should print warning message
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        self.assertTrue(any("No tracked files found" in call for call in calls))
+
+    def test_list_all_files_basic(self):
+        """Test basic list_all_files functionality."""
+        # Upload a couple of files
+        self.versioner.upload(self.test_file)
+        self.versioner.upload(self.another_test_file)
+
+        # List all files
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_all_files()
+
+        # Should have printed both files
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        self.assertTrue(any(self.test_file in call for call in calls))
+        self.assertTrue(any(self.another_test_file in call for call in calls))
+
+    def test_list_all_files_verbose(self):
+        """Test list_all_files with verbose output."""
+        # Upload a file first
+        self.versioner.upload(self.test_file)
+
+        # List all files with verbose output
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_all_files(verbose=True)
+
+        # Should have printed detailed information
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        # Should include hash and size information
+        self.assertTrue(any("Hash:" in call for call in calls))
+        self.assertTrue(any("Size:" in call for call in calls))
+
+    def test_list_all_files_empty_manifest(self):
+        """Test list_all_files with empty manifest."""
+        # Clear manifest
+        self.versioner.manifest["files"] = {}
+
+        with patch("builtins.print") as mock_print:
+            self.versioner.list_all_files()
+
+        # Should print warning message
+        mock_print.assert_called()
+        calls = [str(call_args) for call_args in mock_print.call_args_list]
+        self.assertTrue(any("No files are currently tracked" in call for call in calls))
+
+    def test_list_files_with_glob_pattern(self):
+        """Test list_files with glob patterns."""
+        # Create test files with different extensions
+        txt_file = "test.txt"
+        json_file = "test.json"
+
+        with open(txt_file, "w") as f:
+            f.write("Text file content")
+        with open(json_file, "w") as f:
+            f.write('{"key": "value"}')
+
+        try:
+            # Upload both files
+            self.versioner.upload(txt_file)
+            self.versioner.upload(json_file)
+
+            # List only .txt files
+            with patch("builtins.print") as mock_print:
+                self.versioner.list_files("*.txt")
+
+            # Should have printed only the .txt file
+            mock_print.assert_called()
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
+            self.assertTrue(any(txt_file in call for call in calls))
+            self.assertFalse(any(json_file in call for call in calls))
+
+        finally:
+            # Clean up
+            for filename in [txt_file, json_file]:
+                if os.path.exists(filename):
+                    os.remove(filename)
+
+    def test_list_files_with_directory_pattern(self):
+        """Test list_files with directory patterns."""
+        # Create test directory structure
+        os.makedirs("testdir", exist_ok=True)
+        nested_file = "testdir/nested.txt"
+
+        with open(nested_file, "w") as f:
+            f.write("Nested file content")
+
+        try:
+            # Upload the nested file
+            self.versioner.upload(nested_file)
+
+            # List files in the directory
+            with patch("builtins.print") as mock_print:
+                self.versioner.list_files("testdir")
+
+            # Should have printed the nested file
+            mock_print.assert_called()
+            calls = [str(call_args) for call_args in mock_print.call_args_list]
+            self.assertTrue(any(nested_file in call for call in calls))
+
+        finally:
+            # Clean up
+            if os.path.exists(nested_file):
+                os.remove(nested_file)
+            if os.path.exists("testdir"):
+                shutil.rmtree("testdir")
 
 
 if __name__ == "__main__":

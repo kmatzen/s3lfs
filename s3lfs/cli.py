@@ -69,6 +69,27 @@ def checkout(path, no_sign_request, verbose, all):
         raise click.Abort()
 
 
+@cli.command()
+@click.argument("path", required=False)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Show detailed information including file sizes and hashes",
+)
+@click.option("--all", is_flag=True, help="List all tracked files from manifest")
+def ls(path, no_sign_request, verbose, all):
+    """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
+    s3lfs = S3LFS(no_sign_request=no_sign_request)
+
+    if all or not path:
+        # List all files from manifest (default behavior when no path provided)
+        s3lfs.list_all_files(verbose=verbose)
+    else:
+        # List specific path
+        s3lfs.list_files(path, verbose=verbose)
+
+
 @click.command()
 @click.argument("path", required=True)
 @click.option("--purge-from-s3", is_flag=True, help="Purge file in S3 immediately")
@@ -100,6 +121,7 @@ def cleanup(force, no_sign_request):
 cli.add_command(init)
 cli.add_command(track)
 cli.add_command(checkout)
+cli.add_command(ls)
 cli.add_command(remove)
 cli.add_command(cleanup)
 
