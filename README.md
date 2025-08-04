@@ -282,3 +282,31 @@ MIT License
 
 ## Contributing
 Pull requests are welcome! Please submit issues and suggestions via GitHub.
+
+## Development Setup
+
+### Pre-commit Hooks
+
+This project uses pre-commit hooks to ensure code quality. The hooks include:
+
+- **Code Quality**: Trailing whitespace, end-of-file fixer, YAML validation, large file detection
+- **Python Formatting**: Black code formatter with 88-character line length
+- **Import Sorting**: isort with Black profile
+- **Linting**: flake8 with extended ignore patterns
+- **Type Checking**: mypy with boto3 type stubs
+- **Unit Tests**: Automatic test execution on every commit
+
+To set up pre-commit hooks:
+
+```bash
+# Install pre-commit
+pip install pre-commit
+
+# Install the git hook scripts
+pre-commit install
+
+# Run all hooks on all files
+pre-commit run --all-files
+```
+
+The test hook will automatically run all unit tests before each commit, ensuring that code changes don't break existing functionality.
