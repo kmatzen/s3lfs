@@ -2132,27 +2132,35 @@ class S3LFS:
         # Return bytes transferred for progress tracking
         return file_path.stat().st_size if file_path.exists() else 0
 
-    def list_files(self, path, verbose=False):
+    def list_files(self, path, verbose=False, strip_prefix=None):
         """
         List tracked files matching a path pattern.
 
         :param path: A file, directory, or glob pattern to list.
         :param verbose: If True, show detailed information including file sizes and hashes.
+        :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         # Resolve manifest paths using the same logic as checkout
         files_to_list = self._resolve_manifest_paths(path)
 
         if not files_to_list:
-            print(f"⚠️ No tracked files found for '{path}'.")
+            if verbose:
+                print(f"⚠️ No tracked files found for '{path}'.")
             return
 
-        print(f"📋 Found {len(files_to_list)} tracked file(s) for '{path}':")
-        print()
+        if verbose:
+            print(f"📋 Found {len(files_to_list)} tracked file(s) for '{path}':")
+            print()
 
         # Sort files for consistent output
         sorted_files = sorted(files_to_list.items())
 
         for file_path, file_hash in sorted_files:
+            # Strip prefix if provided
+            display_path = file_path
+            if strip_prefix and file_path.startswith(strip_prefix + "/"):
+                display_path = file_path[len(strip_prefix + "/") :]
+
             if verbose:
                 # Get file status if it exists locally
                 file_status = self.get_file_status(file_path)
@@ -2163,33 +2171,41 @@ class S3LFS:
                     size_str = "missing"
                     status = "❌"
 
-                print(f"{status} {file_path}")
+                print(f"{status} {display_path}")
                 print(f"    Hash: {file_hash}")
                 print(f"    Size: {size_str}")
                 print()
             else:
-                print(f"  {file_path}")
+                print(display_path)
 
-    def list_all_files(self, verbose=False):
+    def list_all_files(self, verbose=False, strip_prefix=None):
         """
         List all tracked files from the manifest.
 
         :param verbose: If True, show detailed information including file sizes and hashes.
+        :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         with self._lock_context():
             all_files = dict(self.manifest["files"])
 
         if not all_files:
-            print("⚠️ No files are currently tracked.")
+            if verbose:
+                print("⚠️ No files are currently tracked.")
             return
 
-        print(f"📋 All tracked files ({len(all_files)} total):")
-        print()
+        if verbose:
+            print(f"📋 All tracked files ({len(all_files)} total):")
+            print()
 
         # Sort files for consistent output
         sorted_files = sorted(all_files.items())
 
         for file_path, file_hash in sorted_files:
+            # Strip prefix if provided
+            display_path = file_path
+            if strip_prefix and file_path.startswith(strip_prefix + "/"):
+                display_path = file_path[len(strip_prefix + "/") :]
+
             if verbose:
                 # Get file status if it exists locally
                 file_status = self.get_file_status(file_path)
@@ -2200,9 +2216,9 @@ class S3LFS:
                     size_str = "missing"
                     status = "❌"
 
-                print(f"{status} {file_path}")
+                print(f"{status} {display_path}")
                 print(f"    Hash: {file_hash}")
                 print(f"    Size: {size_str}")
                 print()
             else:
-                print(f"  {file_path}")
+                print(display_path)
