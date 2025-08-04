@@ -433,6 +433,62 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         # Should succeed and reach lines 110-111
         self.assertEqual(result.returncode, 0)
 
+    def test_init_command_not_in_git_repo(self):
+        """Test init command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test init command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "init", "testbucket", "testprefix"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_init_command_not_in_git_repo_with_no_sign_request(self):
+        """Test init command with --no-sign-request flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test init command with --no-sign-request flag when not in git repo
+            result = subprocess.run(
+                [
+                    "python",
+                    "-m",
+                    "s3lfs.cli",
+                    "init",
+                    "--no-sign-request",
+                    "testbucket",
+                    "testprefix",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
     def test_track_command_no_path_no_modified_flag(self):
         """Test track command with no path and no --modified flag (lines 110-111)."""
         # Create a git repository with manifest file
