@@ -2131,3 +2131,78 @@ class S3LFS:
 
         # Return bytes transferred for progress tracking
         return file_path.stat().st_size if file_path.exists() else 0
+
+    def list_files(self, path, verbose=False):
+        """
+        List tracked files matching a path pattern.
+
+        :param path: A file, directory, or glob pattern to list.
+        :param verbose: If True, show detailed information including file sizes and hashes.
+        """
+        # Resolve manifest paths using the same logic as checkout
+        files_to_list = self._resolve_manifest_paths(path)
+
+        if not files_to_list:
+            print(f"⚠️ No tracked files found for '{path}'.")
+            return
+
+        print(f"📋 Found {len(files_to_list)} tracked file(s) for '{path}':")
+        print()
+
+        # Sort files for consistent output
+        sorted_files = sorted(files_to_list.items())
+
+        for file_path, file_hash in sorted_files:
+            if verbose:
+                # Get file status if it exists locally
+                file_status = self.get_file_status(file_path)
+                if file_status["exists"]:
+                    size_str = f"{file_status['size']:,} bytes"
+                    status = "✅" if file_status["cache_valid"] else "⚠️"
+                else:
+                    size_str = "missing"
+                    status = "❌"
+
+                print(f"{status} {file_path}")
+                print(f"    Hash: {file_hash}")
+                print(f"    Size: {size_str}")
+                print()
+            else:
+                print(f"  {file_path}")
+
+    def list_all_files(self, verbose=False):
+        """
+        List all tracked files from the manifest.
+
+        :param verbose: If True, show detailed information including file sizes and hashes.
+        """
+        with self._lock_context():
+            all_files = dict(self.manifest["files"])
+
+        if not all_files:
+            print("⚠️ No files are currently tracked.")
+            return
+
+        print(f"📋 All tracked files ({len(all_files)} total):")
+        print()
+
+        # Sort files for consistent output
+        sorted_files = sorted(all_files.items())
+
+        for file_path, file_hash in sorted_files:
+            if verbose:
+                # Get file status if it exists locally
+                file_status = self.get_file_status(file_path)
+                if file_status["exists"]:
+                    size_str = f"{file_status['size']:,} bytes"
+                    status = "✅" if file_status["cache_valid"] else "⚠️"
+                else:
+                    size_str = "missing"
+                    status = "❌"
+
+                print(f"{status} {file_path}")
+                print(f"    Hash: {file_hash}")
+                print(f"    Size: {size_str}")
+                print()
+            else:
+                print(f"  {file_path}")
