@@ -76,6 +76,26 @@ s3lfs checkout "*.mp4"                   # Download all MP4 files
 s3lfs checkout --all                     # Download all tracked files
 ```
 
+### List Tracked Files
+```sh
+s3lfs ls [<path>]
+s3lfs ls --all
+```
+**Description**: Lists files tracked by s3lfs. If no path is provided, all tracked files are listed by default. Supports files, directories, and glob patterns.
+
+**Options**:
+- `--all`: List all tracked files (default if no path is provided)
+- `--verbose`: Show detailed information including file sizes and hashes
+- `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+
+**Examples**:
+```sh
+s3lfs ls                          # List all tracked files
+s3lfs ls data/                    # List files in the data directory
+s3lfs ls "*.mp4"                  # List all MP4 files
+s3lfs ls --all --verbose          # List all files with detailed info
+```
+
 ### Remove Files from Tracking
 ```sh
 s3lfs remove <path>
