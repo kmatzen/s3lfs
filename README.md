@@ -25,6 +25,8 @@ poetry install
 
 The CLI tool provides a simplified set of commands for managing large files with S3. All commands automatically use the bucket and prefix configured during initialization.
 
+**Subdirectory Support**: All s3lfs commands work from any subdirectory within the git repository. The tool automatically discovers the git repository root and resolves paths relative to it. For example, running `s3lfs track file.txt` from the `data/` directory will track `data/file.txt`.
+
 ### Initialize Repository
 ```sh
 s3lfs init <bucket-name> <repo-prefix>
@@ -94,6 +96,13 @@ s3lfs ls                          # List all tracked files
 s3lfs ls data/                    # List files in the data directory
 s3lfs ls "*.mp4"                  # List all MP4 files
 s3lfs ls --all --verbose          # List all files with detailed info
+```
+
+**Pipe-friendly Output**: In non-verbose mode, the `ls` command outputs one file path per line without headers or formatting, making it easy to pipe into other commands. Paths are shown relative to your current directory:
+```sh
+s3lfs ls | grep "\.mp4"           # Filter for MP4 files in current directory
+s3lfs ls | wc -l                  # Count tracked files in current directory
+s3lfs ls data/ | xargs -I {} echo "Processing {}"  # Process each file in data/
 ```
 
 ### Remove Files from Tracking
@@ -188,7 +197,22 @@ s3lfs checkout data/                     # Only data directory
 s3lfs checkout "models/*.pkl"            # Only pickle files in models
 ```
 
-### 7. Cleanup
+### 7. Working from Subdirectories
+All commands work from any subdirectory within the git repository:
+```sh
+cd data/
+s3lfs track large_file.zip               # Tracks data/large_file.zip
+s3lfs ls                                 # Lists all tracked files (shows full paths from git root)
+s3lfs checkout large_file.zip            # Downloads data/large_file.zip
+
+cd ../models/
+s3lfs track "*.pkl"                      # Tracks models/*.pkl files
+s3lfs ls --verbose                       # Lists with detailed info (shows full paths)
+```
+
+**Note**: The `ls` command shows paths relative to your current directory when run from a subdirectory. For example, if you're in the `GoProProcessed/` directory, `s3lfs ls` will show `file1.mp4` instead of `GoProProcessed/file1.mp4`. This provides a local view of tracked files. In non-verbose mode, the output is pipe-friendly with one file path per line.
+
+### 8. Cleanup
 Periodically clean up unreferenced files:
 ```sh
 s3lfs cleanup
@@ -258,3 +282,31 @@ MIT License
 
 ## Contributing
 Pull requests are welcome! Please submit issues and suggestions via GitHub.
+
+## Development Setup
+
+### Pre-commit Hooks
+
+This project uses pre-commit hooks to ensure code quality. The hooks include:
+
+- **Code Quality**: Trailing whitespace, end-of-file fixer, YAML validation, large file detection
+- **Python Formatting**: Black code formatter with 88-character line length
+- **Import Sorting**: isort with Black profile
+- **Linting**: flake8 with extended ignore patterns
+- **Type Checking**: mypy with boto3 type stubs
+- **Unit Tests**: Automatic test execution on every commit
+
+To set up pre-commit hooks:
+
+```bash
+# Install pre-commit
+pip install pre-commit
+
+# Install the git hook scripts
+pre-commit install
+
+# Run all hooks on all files
+pre-commit run --all-files
+```
+
+The test hook will automatically run all unit tests before each commit, ensuring that code changes don't break existing functionality.

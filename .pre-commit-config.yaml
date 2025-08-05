@@ -38,3 +38,14 @@ repos:
       - id: mypy
         additional_dependencies: [types-boto3]
         args: ["--config-file=pyproject.toml"]
+
+  # Unit tests
+  - repo: local
+    hooks:
+      - id: unittest
+        name: unittest
+        entry: poetry run python -m unittest
+        language: system
+        pass_filenames: false
+        always_run: true
+        args: ["discover", "-s", ".", "-p", "test_*.py", "-v"]
