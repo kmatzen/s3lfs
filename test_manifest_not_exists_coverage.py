@@ -760,6 +760,253 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         self.assertNotIn("Error: S3LFS not initialized", result.stdout)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_track_command_not_in_git_repo(self):
+        """Test track command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test track command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "track", "test_file.txt"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_track_command_not_in_git_repo_with_modified_flag(self):
+        """Test track command with --modified flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test track command with --modified flag when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "track", "--modified"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_checkout_command_not_in_git_repo(self):
+        """Test checkout command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test checkout command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "checkout", "test_file.txt"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_checkout_command_not_in_git_repo_with_all_flag(self):
+        """Test checkout command with --all flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test checkout command with --all flag when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "checkout", "--all"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_ls_command_not_in_git_repo(self):
+        """Test ls command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test ls command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "ls"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_ls_command_not_in_git_repo_with_all_flag(self):
+        """Test ls command with --all flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test ls command with --all flag when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "ls", "--all"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_remove_command_not_in_git_repo(self):
+        """Test remove command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test remove command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "remove", "test_file.txt"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_remove_command_not_in_git_repo_with_purge_flag(self):
+        """Test remove command with --purge-from-s3 flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test remove command with --purge-from-s3 flag when not in git repo
+            result = subprocess.run(
+                [
+                    "python",
+                    "-m",
+                    "s3lfs.cli",
+                    "remove",
+                    "--purge-from-s3",
+                    "test_file.txt",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_cleanup_command_not_in_git_repo(self):
+        """Test cleanup command when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test cleanup command when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "cleanup"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_cleanup_command_not_in_git_repo_with_force_flag(self):
+        """Test cleanup command with --force flag when not in a git repository."""
+        # Import the necessary functions
+        from unittest.mock import patch
+
+        # Create a directory that is not a git repository
+        non_git_dir = os.path.join(self.temp_dir, "non_git_dir")
+        os.makedirs(non_git_dir)
+        os.chdir(non_git_dir)
+
+        # Mock find_git_root to return None (no git repo found)
+        with patch("s3lfs.cli.find_git_root", return_value=None):
+            # Test cleanup command with --force flag when not in git repo
+            result = subprocess.run(
+                ["python", "-m", "s3lfs.cli", "cleanup", "--force"],
+                capture_output=True,
+                text=True,
+                cwd=non_git_dir,
+            )
+
+            # Should fail with error message
+            self.assertIn("Error: Not in a git repository", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
