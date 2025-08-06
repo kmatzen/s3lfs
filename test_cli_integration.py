@@ -379,6 +379,78 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
             "Error: Must provide either a path or use --all flag", result.output
         )
 
+    def test_track_with_transfer_acceleration(self):
+        """Test track command with transfer acceleration flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(
+            s3lfs_main, ["track", self.test_file, "--use-acceleration"]
+        )
+        self.assertEqual(
+            result.exit_code, 0, "Track command with transfer acceleration failed"
+        )
+
+    def test_checkout_with_transfer_acceleration(self):
+        """Test checkout command with transfer acceleration flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # First track the file
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Remove the file
+        os.remove(self.test_file)
+
+        # Checkout with transfer acceleration
+        result = runner.invoke(
+            s3lfs_main, ["checkout", self.test_file, "--use-acceleration"]
+        )
+        self.assertEqual(
+            result.exit_code, 0, "Checkout command with transfer acceleration failed"
+        )
+        self.assertTrue(os.path.exists(self.test_file))
+
+    def test_ls_with_transfer_acceleration(self):
+        """Test ls command with transfer acceleration flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track a file first
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # List with transfer acceleration
+        result = runner.invoke(s3lfs_main, ["ls", "--use-acceleration"])
+        self.assertEqual(
+            result.exit_code, 0, "Ls command with transfer acceleration failed"
+        )
+
+    def test_remove_with_transfer_acceleration(self):
+        """Test remove command with transfer acceleration flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Track a file first
+        runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        # Remove with transfer acceleration
+        result = runner.invoke(
+            s3lfs_main, ["remove", self.test_file, "--use-acceleration"]
+        )
+        self.assertEqual(
+            result.exit_code, 0, "Remove command with transfer acceleration failed"
+        )
+
+    def test_cleanup_with_transfer_acceleration(self):
+        """Test cleanup command with transfer acceleration flag."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        result = runner.invoke(s3lfs_main, ["cleanup", "--force", "--use-acceleration"])
+        self.assertEqual(
+            result.exit_code, 0, "Cleanup command with transfer acceleration failed"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

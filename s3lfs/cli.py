@@ -102,7 +102,10 @@ def cli():
 @click.argument("bucket", required=True)
 @click.argument("prefix", required=True)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def init(bucket, prefix, no_sign_request):
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+def init(bucket, prefix, no_sign_request, use_acceleration):
     """Initialize S3LFS with a bucket and repo prefix"""
     # Find git root
     git_root = find_git_root()
@@ -112,25 +115,37 @@ def init(bucket, prefix, no_sign_request):
 
     # Create manifest at git root
     manifest_path = get_manifest_path(git_root)
-    versioner = S3LFS(
-        bucket_name=bucket,
-        repo_prefix=prefix,
-        no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
-    )
-    versioner.initialize_repo()
+    if manifest_path.exists():
+        print("Error: Repository already initialized")
+        return
+
+    try:
+        s3lfs = S3LFS(
+            bucket_name=bucket,
+            repo_prefix=prefix,
+            no_sign_request=no_sign_request,
+            use_acceleration=use_acceleration,
+        )
+        s3lfs.initialize_repo()
+        print(f"✅ Repository initialized with bucket '{bucket}' and prefix '{prefix}'")
+    except Exception as e:
+        print(f"Error: {e}")
+        return
 
 
 @cli.command()
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
 @click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
     "--verbose", is_flag=True, help="Show detailed progress and upload information"
 )
 @click.option(
     "--modified", is_flag=True, help="Track only modified files from manifest"
 )
-def track(path, no_sign_request, verbose, modified):
+def track(path, no_sign_request, use_acceleration, verbose, modified):
     """Track files, directories, or globs. Use --modified to track only changed files."""
     # Find git root and resolve path
     git_root = find_git_root()
@@ -146,7 +161,11 @@ def track(path, no_sign_request, verbose, modified):
     # Resolve path if provided
     resolved_path = resolve_path_from_git_root(path, git_root) if path else None
 
-    s3lfs = S3LFS(no_sign_request=no_sign_request, manifest_file=str(manifest_path))
+    s3lfs = S3LFS(
+        no_sign_request=no_sign_request,
+        manifest_file=str(manifest_path),
+        use_acceleration=use_acceleration,
+    )
 
     if modified:
         # Track only modified files using cached version for better performance
@@ -163,12 +182,15 @@ def track(path, no_sign_request, verbose, modified):
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
 @click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
     "--verbose",
     is_flag=True,
     help="Show detailed progress and download size information",
 )
 @click.option("--all", is_flag=True, help="Checkout all files from manifest")
-def checkout(path, no_sign_request, verbose, all):
+def checkout(path, no_sign_request, use_acceleration, verbose, all):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
     # Find git root and resolve path
     git_root = find_git_root()
@@ -184,7 +206,11 @@ def checkout(path, no_sign_request, verbose, all):
     # Resolve path if provided
     resolved_path = resolve_path_from_git_root(path, git_root) if path else None
 
-    s3lfs = S3LFS(no_sign_request=no_sign_request, manifest_file=str(manifest_path))
+    s3lfs = S3LFS(
+        no_sign_request=no_sign_request,
+        manifest_file=str(manifest_path),
+        use_acceleration=use_acceleration,
+    )
 
     if all:
         # Download all files from manifest
@@ -201,12 +227,15 @@ def checkout(path, no_sign_request, verbose, all):
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
 @click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
     "--verbose",
     is_flag=True,
     help="Show detailed information including file sizes and hashes",
 )
 @click.option("--all", is_flag=True, help="List all tracked files from manifest")
-def ls(path, no_sign_request, verbose, all, git_finder_func=None):
+def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=None):
     """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
     # Find git root and resolve path
     git_root = find_git_root(git_finder_func=git_finder_func)
@@ -230,7 +259,11 @@ def ls(path, no_sign_request, verbose, all, git_finder_func=None):
     # But we'll strip the current directory prefix from output
     resolved_path = path
 
-    s3lfs = S3LFS(no_sign_request=no_sign_request, manifest_file=str(manifest_path))
+    s3lfs = S3LFS(
+        no_sign_request=no_sign_request,
+        manifest_file=str(manifest_path),
+        use_acceleration=use_acceleration,
+    )
 
     if all or not resolved_path:
         # List all files from manifest (default behavior when no path provided)
@@ -251,7 +284,10 @@ def ls(path, no_sign_request, verbose, all, git_finder_func=None):
 @click.argument("path", required=True)
 @click.option("--purge-from-s3", is_flag=True, help="Purge file in S3 immediately")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def remove(path, purge_from_s3, no_sign_request):
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+def remove(path, purge_from_s3, no_sign_request, use_acceleration):
     """Remove files or directories from tracking. Supports glob patterns."""
     # Find git root and resolve path
     git_root = find_git_root()
@@ -267,7 +303,11 @@ def remove(path, purge_from_s3, no_sign_request):
     # Resolve path
     resolved_path = resolve_path_from_git_root(path, git_root)
 
-    versioner = S3LFS(no_sign_request=no_sign_request, manifest_file=str(manifest_path))
+    versioner = S3LFS(
+        no_sign_request=no_sign_request,
+        manifest_file=str(manifest_path),
+        use_acceleration=use_acceleration,
+    )
 
     # Check if path is a directory pattern or single file
     if Path(resolved_path).is_dir() or "*" in resolved_path or "?" in resolved_path:
@@ -281,7 +321,10 @@ def remove(path, purge_from_s3, no_sign_request):
 @click.command()
 @click.option("--force", is_flag=True, help="Skip confirmation for cleanup")
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
-def cleanup(force, no_sign_request):
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+def cleanup(force, no_sign_request, use_acceleration):
     """Clean up unreferenced files from S3."""
     # Find git root
     git_root = find_git_root()
@@ -294,7 +337,11 @@ def cleanup(force, no_sign_request):
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    versioner = S3LFS(no_sign_request=no_sign_request, manifest_file=str(manifest_path))
+    versioner = S3LFS(
+        no_sign_request=no_sign_request,
+        manifest_file=str(manifest_path),
+        use_acceleration=use_acceleration,
+    )
     versioner.cleanup_s3(force=force)
 
 
