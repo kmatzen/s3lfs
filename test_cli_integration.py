@@ -59,6 +59,26 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         )
         self.assertEqual(result.exit_code, 0)
 
+    def test_init_repository_already_initialized(self):
+        """Test init when repository is already initialized."""
+        runner = CliRunner()
+
+        # First init
+        result = runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        self.assertEqual(result.exit_code, 0)
+
+        # Second init should fail
+        result = runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+        self.assertIn("Error: Repository already initialized", result.output)
+
+    def test_init_with_exception_handling(self):
+        """Test init command exception handling."""
+        runner = CliRunner()
+
+        # Test with invalid bucket name to trigger exception
+        result = runner.invoke(s3lfs_main, ["init", "", "test_prefix"])
+        self.assertIn("Error:", result.output)
+
     def test_track_command(self):
         """Test the track command (replaces upload)."""
         runner = CliRunner()
