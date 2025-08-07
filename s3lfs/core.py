@@ -45,6 +45,7 @@ ERROR_MESSAGES = {
     "partial_credentials": "Incomplete AWS credentials. Check your AWS configuration.",
     "invalid_credentials": "Invalid AWS credentials. Please verify your access key and secret key.",
     "s3_access_denied": "Invalid or insufficient AWS credentials for bucket '{bucket_name}'.",
+    "acceleration_not_supported": "Transfer acceleration is not supported for unsigned requests.",
 }
 
 
@@ -89,6 +90,7 @@ class S3LFS:
         temp_dir=None,
         chunk_size=DEFAULT_CHUNK_SIZE,
         s3_factory=None,
+        use_acceleration=False,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -99,16 +101,26 @@ class S3LFS:
         :param temp_dir: Path to the temporary directory for compression/decompression
         :param chunk_size: Size of chunks for multipart uploads (default: 5 GB)
         :param s3_factory: Custom S3 client factory function (for testing)
+        :param use_acceleration: If True, enable S3 Transfer Acceleration
         """
         self.chunk_size = chunk_size
+        self.use_acceleration = use_acceleration
 
         def default_s3_factory(no_sign_request):
             """Default S3 client factory with proper boto3 usage."""
             if no_sign_request:
+                if self.use_acceleration:
+                    raise RuntimeError(ERROR_MESSAGES["acceleration_not_supported"])
                 config = Config(signature_version=UNSIGNED)
                 return boto3.client("s3", config=config)
             else:
-                return boto3.client("s3")
+                if self.use_acceleration:
+                    # Use transfer acceleration endpoint
+                    return boto3.client(
+                        "s3", config=Config(s3={"use_accelerate_endpoint": True})
+                    )
+                else:
+                    return boto3.client("s3")
 
         self.s3_factory = s3_factory if s3_factory is not None else default_s3_factory
 

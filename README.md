@@ -3,6 +3,7 @@
 A Python-based version control system for large assets using Amazon S3. This system is designed to work like Git LFS but utilizes S3 for better bandwidth and scalability. It supports file tracking, parallel operations, encryption, and automatic cleanup of unused assets.
 
 ## Features
+
 - Upload and track large files in S3 instead of Git
 - Stores asset versions using SHA-256 hashes
 - Encrypts stored assets with AES256 server-side encryption
@@ -12,6 +13,7 @@ A Python-based version control system for large assets using Amazon S3. This sys
 - **File deduplication**: Prevents redundant uploads using content hashing
 - **Flexible path resolution**: Supports files, directories, and glob patterns
 - **Multiple hashing algorithms**: SHA-256 (default) and MD5 support
+- **Transfer Acceleration**: Optional S3 Transfer Acceleration support for faster transfers
 
 ## Installation
 
@@ -20,6 +22,31 @@ Install the required dependencies:
 pip install poetry
 poetry install
 ```
+
+## Transfer Acceleration
+
+S3LFS supports S3 Transfer Acceleration for faster uploads and downloads. Add the `--use-acceleration` flag to any command that performs S3 operations:
+
+```bash
+# Track files with transfer acceleration
+s3lfs track large-file.zip --use-acceleration
+
+# Checkout files with transfer acceleration
+s3lfs checkout large-file.zip --use-acceleration
+
+# List files with transfer acceleration
+s3lfs ls --use-acceleration
+```
+
+**Requirements:**
+- Transfer acceleration must be enabled on your S3 bucket
+- Cannot be used with `--no-sign-request` (unsigned requests)
+- Requires valid AWS credentials
+
+**Performance Benefits:**
+- 2-4x faster uploads for files larger than 1GB
+- Improved reliability through multiple network paths
+- Better performance for geographically distant regions
 
 ## Command Line Interface (CLI) Usage
 
@@ -40,8 +67,8 @@ s3lfs init my-bucket my-project
 
 ### Track Files
 ```sh
-s3lfs track <path>
-s3lfs track --modified
+s3lfs track <path> [--use-acceleration]
+s3lfs track --modified [--use-acceleration]
 ```
 **Description**: Tracks and uploads files, directories, or glob patterns to S3.
 
@@ -49,6 +76,7 @@ s3lfs track --modified
 - `--modified`: Track only files that have changed since last upload
 - `--verbose`: Show detailed progress information
 - `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+- `--use-acceleration`: Enable S3 Transfer Acceleration
 
 **Examples**:
 ```sh
@@ -60,8 +88,8 @@ s3lfs track --modified                   # Track only changed files
 
 ### Checkout Files
 ```sh
-s3lfs checkout <path>
-s3lfs checkout --all
+s3lfs checkout <path> [--use-acceleration]
+s3lfs checkout --all [--use-acceleration]
 ```
 **Description**: Downloads files, directories, or glob patterns from S3.
 
@@ -69,6 +97,7 @@ s3lfs checkout --all
 - `--all`: Download all files tracked in the manifest
 - `--verbose`: Show detailed progress information
 - `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+- `--use-acceleration`: Enable S3 Transfer Acceleration
 
 **Examples**:
 ```sh
@@ -80,8 +109,8 @@ s3lfs checkout --all                     # Download all tracked files
 
 ### List Tracked Files
 ```sh
-s3lfs ls [<path>]
-s3lfs ls --all
+s3lfs ls [<path>] [--use-acceleration]
+s3lfs ls --all [--use-acceleration]
 ```
 **Description**: Lists files tracked by s3lfs. If no path is provided, all tracked files are listed by default. Supports files, directories, and glob patterns.
 
@@ -89,6 +118,7 @@ s3lfs ls --all
 - `--all`: List all tracked files (default if no path is provided)
 - `--verbose`: Show detailed information including file sizes and hashes
 - `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+- `--use-acceleration`: Enable S3 Transfer Acceleration
 
 **Examples**:
 ```sh
@@ -107,13 +137,14 @@ s3lfs ls data/ | xargs -I {} echo "Processing {}"  # Process each file in data/
 
 ### Remove Files from Tracking
 ```sh
-s3lfs remove <path>
+s3lfs remove <path> [--use-acceleration]
 ```
 **Description**: Removes files or directories from tracking. Supports files, directories, and glob patterns.
 
 **Options**:
 - `--purge-from-s3`: Immediately delete files from S3 (default: keep for history)
 - `--no-sign-request`: Use unsigned S3 requests
+- `--use-acceleration`: Enable S3 Transfer Acceleration
 
 **Examples**:
 ```sh
@@ -125,13 +156,14 @@ s3lfs remove data/ --purge-from-s3       # Remove and delete from S3
 
 ### Cleanup Unreferenced Files
 ```sh
-s3lfs cleanup
+s3lfs cleanup [--use-acceleration]
 ```
 **Description**: Removes files from S3 that are no longer referenced in the current manifest.
 
 **Options**:
 - `--force`: Skip confirmation prompt
 - `--no-sign-request`: Use unsigned S3 requests
+- `--use-acceleration`: Enable S3 Transfer Acceleration
 
 **Example**:
 ```sh
@@ -234,7 +266,7 @@ export AWS_DEFAULT_REGION=us-east-1
 ```
 
 ### Public Buckets
-For public S3 buckets, use the `--no-sign-request` flag:
+For public S3 buckets, use the `--no-sign-request` flag (note: transfer acceleration is not supported with unsigned requests):
 ```sh
 s3lfs init public-bucket my-project --no-sign-request
 s3lfs checkout --all --no-sign-request
