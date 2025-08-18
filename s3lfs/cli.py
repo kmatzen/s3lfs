@@ -165,7 +165,9 @@ def track(path, no_sign_request, use_acceleration, verbose, modified):
         s3lfs.track_modified_files_cached(silence=not verbose)
     elif resolved_path:
         # Track specific path
-        s3lfs.track(resolved_path, silence=not verbose)
+        s3lfs.track(
+            resolved_path, silence=not verbose, interleaved=True, use_cache=False
+        )
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
         raise click.Abort()
