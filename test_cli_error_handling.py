@@ -105,7 +105,8 @@ class TestCLIErrorHandling(unittest.TestCase):
         """Test get_manifest_path function."""
         git_root = Path("/git/root")
         result = get_manifest_path(git_root)
-        expected = git_root / ".s3_manifest.json"
+        # Should return YAML path for new repos (when neither exists)
+        expected = git_root / ".s3_manifest.yaml"
         self.assertEqual(result, expected)
 
     def test_cli_error_handling_not_in_git_repo(self):
