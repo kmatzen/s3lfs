@@ -1021,6 +1021,9 @@ class S3LFS:
                                 print(
                                     f"Skipping upload for {path}, already exists in S3 with matching MD5."
                                 )
+                            # Update progress for skipped file
+                            if progress_callback:
+                                progress_callback(file_size)
                             continue
                         else:
                             if not silence:
