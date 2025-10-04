@@ -24,6 +24,7 @@
 - Write comprehensive unit tests for new features
 - Ensure backward compatibility when making changes
 - All tests must pass before committing
+- New code must have test coverage
 
 ### Git Practices
 - Write clear, descriptive commit messages
