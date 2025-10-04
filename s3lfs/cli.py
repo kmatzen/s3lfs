@@ -165,14 +165,6 @@ def track(
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    # Use PathResolver for consistent path handling
-    path_resolver = PathResolver(git_root)
-
-    # Resolve path to manifest key if provided
-    manifest_key = None
-    if path:
-        manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
-
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
@@ -182,11 +174,11 @@ def track(
     if modified:
         # Track only modified files using cached version for better performance
         s3lfs.track_modified_files_cached(silence=not verbose)
-    elif manifest_key:
-        # Track specific path
-        s3lfs.track(
-            manifest_key, silence=not verbose, interleaved=True, use_cache=False
-        )
+    elif path:
+        # For track, pass the path as-is (don't resolve to manifest key)
+        # The track method's _resolve_filesystem_paths handles glob patterns
+        # and resolves files relative to CWD, which is what we want
+        s3lfs.track(path, silence=not verbose, interleaved=True, use_cache=False)
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
         raise click.Abort()
@@ -334,24 +326,29 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
     # Use PathResolver for consistent path handling
     path_resolver = PathResolver(git_root)
 
-    # Resolve path to manifest key
-    manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
-
     versioner = S3LFS(
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
     )
 
-    # Check if path is a directory pattern or single file
-    # Convert manifest key back to filesystem path for directory check
-    filesystem_path = path_resolver.to_filesystem_path(manifest_key)
-    if filesystem_path.is_dir() or "*" in manifest_key or "?" in manifest_key:
-        # Handle as directory/pattern - use remove_subtree logic
+    # Check if path contains glob characters before resolving
+    has_glob = "*" in path or "?" in path or "[" in path
+
+    if has_glob:
+        # For glob patterns, resolve to manifest key and use remove_subtree
+        manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
         versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
     else:
-        # Handle as single file
-        versioner.remove_file(manifest_key, keep_in_s3=not purge_from_s3)
+        # For single files/directories, resolve and check type
+        manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
+        filesystem_path = path_resolver.to_filesystem_path(manifest_key)
+        if filesystem_path.is_dir():
+            # Handle as directory - use remove_subtree logic
+            versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
+        else:
+            # Handle as single file
+            versioner.remove_file(manifest_key, keep_in_s3=not purge_from_s3)
 
 
 @click.command()
