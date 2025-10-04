@@ -55,30 +55,9 @@ def resolve_path_from_git_root(path_arg, git_root):
     if os.path.isabs(path_arg):
         return path_arg
 
-    # Get current working directory relative to git root
-    cwd = Path.cwd()
-    try:
-        relative_cwd = cwd.relative_to(git_root)
-    except ValueError:
-        # If we're not in the git repository, return the original path
-        return path_arg
-
-    # If we're at the git root, just return the path
-    if relative_cwd == Path("."):
-        return path_arg
-
-    # Prepend the relative path from git root to current directory
-    resolved_path = relative_cwd / path_arg
-
-    # Normalize the path (handle . and ..)
-    resolved_path = resolved_path.resolve()
-
-    # Convert back to relative path from git root
-    try:
-        return str(resolved_path.relative_to(git_root))
-    except ValueError:
-        # If the resolved path is outside the git root, return the original path
-        return path_arg
+    # The path argument should be relative to the git root, not the current directory
+    # So we just return it as-is, since it's already relative to git root
+    return path_arg
 
 
 def get_manifest_path(git_root):
@@ -186,7 +165,9 @@ def track(path, no_sign_request, use_acceleration, verbose, modified):
         s3lfs.track_modified_files_cached(silence=not verbose)
     elif resolved_path:
         # Track specific path
-        s3lfs.track(resolved_path, silence=not verbose)
+        s3lfs.track(
+            resolved_path, silence=not verbose, interleaved=True, use_cache=False
+        )
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
         raise click.Abort()
@@ -217,8 +198,23 @@ def checkout(path, no_sign_request, use_acceleration, verbose, all):
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    # Resolve path if provided
-    resolved_path = resolve_path_from_git_root(path, git_root) if path else None
+    # Get current working directory relative to git root
+    cwd = Path.cwd()
+    try:
+        relative_cwd = cwd.relative_to(git_root)
+    except ValueError:
+        relative_cwd = Path(".")
+
+    # Resolve path if provided, considering current working directory context
+    if path:
+        if relative_cwd != Path("."):
+            # If we're in a subdirectory, prepend the current directory to the path
+            resolved_path = f"{relative_cwd}/{path}"
+        else:
+            # If we're at git root, use the path as-is
+            resolved_path = path
+    else:
+        resolved_path = None
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
