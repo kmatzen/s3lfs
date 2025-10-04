@@ -1451,20 +1451,22 @@ class S3LFS:
                 # Multiple ** or more complex pattern - fall back to fnmatch
                 return fnmatch.fnmatch(file_path, pattern)
         else:
-            # For non-recursive patterns, we need to ensure * doesn't cross directories
-            # Split both the pattern and file path by / and match segment by segment
+            # For non-recursive patterns, ensure * doesn't cross directory boundaries
+            # Match segment-by-segment; if pattern has fewer parts, treat as prefix match
             pattern_parts = pattern.split("/")
             file_parts = file_path.split("/")
 
-            # If pattern has fewer parts than file, it can't match (unless it's just *)
-            if len(pattern_parts) != len(file_parts):
+            # Pattern can't match if it has more segments than the file path
+            if len(pattern_parts) > len(file_parts):
                 return False
 
-            # Match each segment
+            # Match each pattern segment against the corresponding file segment
             for pattern_part, file_part in zip(pattern_parts, file_parts):
                 if not fnmatch.fnmatch(file_part, pattern_part):
                     return False
 
+            # All pattern segments matched - this is either an exact match (same length)
+            # or a prefix match (pattern shorter, file is under the matched directory)
             return True
 
     def track(self, path, silence=True, interleaved=True, use_cache=True):
