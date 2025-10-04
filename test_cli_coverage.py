@@ -490,6 +490,69 @@ class TestCLICoverage(unittest.TestCase):
         finally:
             os.chdir(original_dir)
 
+    def test_checkout_command_value_error_handler(self):
+        """Test checkout command when cwd is outside git root (lines 205-206)."""
+        # Create manifest
+        manifest = self.test_path / ".s3_manifest.yaml"
+        manifest_data = {
+            "bucket_name": "test-bucket",
+            "repo_prefix": "test-prefix",
+            "files": {"test.txt": "hash1"},
+        }
+
+        with open(manifest, "w") as f:
+            yaml.safe_dump(manifest_data, f)
+
+        # Patch Path to return a mock that raises ValueError on relative_to
+        original_path = Path
+
+        class PathWithFailingRelativeTo(type(Path())):  # type: ignore[misc]
+            def relative_to(self, other):
+                # Raise ValueError to trigger the exception handler
+                raise ValueError("not a relative path")
+
+        # We need to patch it carefully to not break find_git_root
+        with patch("s3lfs.cli.Path") as mock_path_class:
+            # Make Path.cwd() return our special path
+            mock_path_class.cwd.return_value = PathWithFailingRelativeTo(self.test_path)
+            # But keep other Path functionality working
+            mock_path_class.side_effect = lambda x: original_path(x)
+
+            # This should trigger the ValueError handler and set relative_cwd to Path(".")
+            self.runner.invoke(cli, ["checkout", "test.txt", "--no-sign-request"])
+
+    def test_ls_command_value_error_handler(self):
+        """Test ls command when cwd is outside git root (lines 265-266)."""
+        # Create manifest
+        manifest = self.test_path / ".s3_manifest.yaml"
+        manifest_data = {
+            "bucket_name": "test-bucket",
+            "repo_prefix": "test-prefix",
+            "files": {"test.txt": "hash1"},
+        }
+
+        with open(manifest, "w") as f:
+            yaml.safe_dump(manifest_data, f)
+
+        # Patch Path to return a mock that raises ValueError on relative_to
+        original_path = Path
+
+        class PathWithFailingRelativeTo(type(Path())):  # type: ignore[misc]
+            def relative_to(self, other):
+                # Raise ValueError to trigger the exception handler
+                raise ValueError("not a relative path")
+
+        with patch("s3lfs.cli.Path") as mock_path_class:
+            # Make Path.cwd() return our special path
+            mock_path_class.cwd.return_value = PathWithFailingRelativeTo(self.test_path)
+            # But keep other Path functionality working
+            mock_path_class.side_effect = lambda x: original_path(x)
+
+            # This should trigger the ValueError handler and set relative_cwd to Path(".")
+            result = self.runner.invoke(cli, ["ls", "--all", "--no-sign-request"])
+            # Should succeed - the exception is caught
+            self.assertEqual(result.exit_code, 0)
+
 
 # Note: Lines 205-206 and 265-266 in cli.py (ValueError exception handlers for relative_to)
 # are defensive error handling that's difficult to test in isolated unit tests without
