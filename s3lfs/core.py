@@ -33,12 +33,14 @@ from botocore.exceptions import (
 from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
+from s3lfs import metrics
+
 # Constants
 DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_BUFFER_SIZE = 1024 * 1024  # 1 MB
-DEFAULT_THREAD_POOL_SIZE = 8
+DEFAULT_THREAD_POOL_SIZE = 8  # Optimal for bandwidth-limited scenarios
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
-DEFAULT_MAX_CONCURRENCY = 10
+DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 
 # Common error messages
 ERROR_MESSAGES = {
@@ -401,7 +403,8 @@ class S3LFS:
         if method == "auto":
             if file_path.stat().st_size == 0:  # Empty file
                 method = "iter"
-            elif sys.platform.startswith("linux") and shutil.which("sha256sum"):
+            elif shutil.which("sha256sum"):
+                # Prefer CLI - no GIL contention, better parallelism
                 method = "cli"
             else:
                 method = "mmap"
@@ -688,21 +691,39 @@ class S3LFS:
         """
         Compute the SHA-256 hash using memory-mapped files.
         """
-        hasher = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                hasher.update(mm)
-        return hasher.hexdigest()
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            with tracker.track_task("hashing", str(file_path)):
+                hasher = hashlib.sha256()
+                with open(file_path, "rb") as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        hasher.update(mm)
+                return hasher.hexdigest()
+        else:
+            hasher = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    hasher.update(mm)
+            return hasher.hexdigest()
 
     def _hash_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
         """
         Compute the SHA-256 hash by iteratively reading the file in chunks.
         """
-        hasher = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            with tracker.track_task("hashing", str(file_path)):
+                hasher = hashlib.sha256()
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(chunk_size):
+                        hasher.update(chunk)
+                return hasher.hexdigest()
+        else:
+            hasher = hashlib.sha256()
+            with open(file_path, "rb") as f:
+                while chunk := f.read(chunk_size):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
 
     def _hash_file_cli(self, file_path):
         """
@@ -820,7 +841,8 @@ class S3LFS:
 
         # Automatically select the best method if "auto" is specified
         if method == "auto":
-            if sys.platform.startswith("linux") and shutil.which("gzip"):
+            if shutil.which("gzip"):
+                # Prefer CLI - no GIL contention, better parallelism
                 method = "cli"
             else:
                 method = "python"
@@ -837,20 +859,40 @@ class S3LFS:
         """
         Compress the file deterministically using Python's gzip module.
         """
-        compressed_path = self.temp_dir / f"{uuid4()}.gz"
-        buffer_size = DEFAULT_BUFFER_SIZE
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            with tracker.track_task("compression", str(file_path)):
+                compressed_path = self.temp_dir / f"{uuid4()}.gz"
+                buffer_size = DEFAULT_BUFFER_SIZE
 
-        with open(file_path, "rb") as f_in, open(compressed_path, "wb") as f_out:
-            with gzip.GzipFile(
-                filename="",  # avoid embedding filename
-                mode="wb",
-                fileobj=f_out,
-                compresslevel=5,
-                mtime=0,  # fixed mtime for determinism
-            ) as gz_out:
-                shutil.copyfileobj(f_in, gz_out, length=buffer_size)
+                with open(file_path, "rb") as f_in, open(
+                    compressed_path, "wb"
+                ) as f_out:
+                    with gzip.GzipFile(
+                        filename="",  # avoid embedding filename
+                        mode="wb",
+                        fileobj=f_out,
+                        compresslevel=5,
+                        mtime=0,  # fixed mtime for determinism
+                    ) as gz_out:
+                        shutil.copyfileobj(f_in, gz_out, length=buffer_size)
 
-        return compressed_path
+                return compressed_path
+        else:
+            compressed_path = self.temp_dir / f"{uuid4()}.gz"
+            buffer_size = DEFAULT_BUFFER_SIZE
+
+            with open(file_path, "rb") as f_in, open(compressed_path, "wb") as f_out:
+                with gzip.GzipFile(
+                    filename="",  # avoid embedding filename
+                    mode="wb",
+                    fileobj=f_out,
+                    compresslevel=5,
+                    mtime=0,  # fixed mtime for determinism
+                ) as gz_out:
+                    shutil.copyfileobj(f_in, gz_out, length=buffer_size)
+
+            return compressed_path
 
     def _compress_file_cli(self, file_path):
         """
@@ -892,7 +934,8 @@ class S3LFS:
 
         # Automatically select the best method if "auto" is specified
         if method == "auto":
-            if sys.platform.startswith("linux") and shutil.which("gzip"):
+            if shutil.which("gzip"):
+                # Prefer CLI - no GIL contention, better parallelism
                 method = "cli"
             else:
                 method = "python"
@@ -909,19 +952,36 @@ class S3LFS:
         """
         Decompress the file using Python's gzip module and save it to the output path.
         """
-        with gzip.open(compressed_path, "rb") as f_in:
-            with open(output_path, "wb") as f_out:
-                # Use manual chunked copy to avoid type issues
-                while True:
-                    chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
-                    if not chunk:
-                        break
-                    # Ensure we have bytes for writing
-                    if isinstance(chunk, str):
-                        chunk = chunk.encode("utf-8")
-                    f_out.write(chunk)
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            with tracker.track_task("decompression", str(output_path)):
+                with gzip.open(compressed_path, "rb") as f_in:
+                    with open(output_path, "wb") as f_out:
+                        # Use manual chunked copy to avoid type issues
+                        while True:
+                            chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                            if not chunk:
+                                break
+                            # Ensure we have bytes for writing
+                            if isinstance(chunk, str):
+                                chunk = chunk.encode("utf-8")
+                            f_out.write(chunk)
 
-        return output_path
+                return output_path
+        else:
+            with gzip.open(compressed_path, "rb") as f_in:
+                with open(output_path, "wb") as f_out:
+                    # Use manual chunked copy to avoid type issues
+                    while True:
+                        chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                        if not chunk:
+                            break
+                        # Ensure we have bytes for writing
+                        if isinstance(chunk, str):
+                            chunk = chunk.encode("utf-8")
+                        f_out.write(chunk)
+
+            return output_path
 
     def _decompress_file_cli(self, compressed_path, output_path):
         """
@@ -1035,15 +1095,30 @@ class S3LFS:
                             raise  # Re-raise if it's not a "Not Found" error
 
                     # Proceed with the upload if MD5 does not match or file does not exist
-                    with open(path, "rb") as f:
-                        self._get_s3_client().upload_fileobj(
-                            f,
-                            self.bucket_name,
-                            s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
-                            ExtraArgs=extra_args,
-                            Config=self.config,
-                            Callback=upload_callback,
-                        )
+                    if metrics.is_enabled():
+                        tracker = metrics.get_tracker()
+                        with tracker.track_task("s3_upload", str(path)):
+                            with open(path, "rb") as f:
+                                self._get_s3_client().upload_fileobj(
+                                    f,
+                                    self.bucket_name,
+                                    s3_key
+                                    if not chunked
+                                    else f"{s3_key}.chunk{chunk_idx}",
+                                    ExtraArgs=extra_args,
+                                    Config=self.config,
+                                    Callback=upload_callback,
+                                )
+                    else:
+                        with open(path, "rb") as f:
+                            self._get_s3_client().upload_fileobj(
+                                f,
+                                self.bucket_name,
+                                s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
+                                ExtraArgs=extra_args,
+                                Config=self.config,
+                                Callback=upload_callback,
+                            )
                 if not silence:
                     print(f"{path} uploaded")
             finally:
@@ -1786,17 +1861,31 @@ class S3LFS:
         try:
             # Check if file exists and has correct hash
             if Path(file_path).exists():
-                if use_cache:
-                    current_hash = self.hash_file_cached(file_path)
+                # Track hashing even when cached (for metrics visibility)
+                if metrics.is_enabled():
+                    tracker = metrics.get_tracker()
+                    with tracker.track_task("hashing", str(file_path)):
+                        if use_cache:
+                            current_hash = self.hash_file_cached(file_path)
+                        else:
+                            current_hash = self.hash_file(file_path)
                 else:
-                    current_hash = self.hash_file(file_path)
+                    if use_cache:
+                        current_hash = self.hash_file_cached(file_path)
+                    else:
+                        current_hash = self.hash_file(file_path)
+
                 if current_hash == expected_hash:
                     # File is up-to-date, don't add to download total since no download is needed
                     return (file_path, False, 0)  # No download needed
 
             # Download the file with progress callback that supports size discovery
+            # Pass expected_hash to avoid lock contention
             bytes_transferred = self.download(
-                file_path, silence=True, progress_callback=progress_callback
+                file_path,
+                silence=True,
+                progress_callback=progress_callback,
+                expected_hash=expected_hash,
             )
             return (file_path, True, bytes_transferred or 0)  # Download completed
 
@@ -1812,12 +1901,19 @@ class S3LFS:
         :param silence: Silences verbose logging.
         :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
+        # Start pipeline metrics if enabled
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            tracker.start_pipeline()
+
         # Phase 1: Resolve filesystem paths
         print("🔍 Resolving filesystem paths...")
         files_to_track = self._resolve_filesystem_paths(path)
 
         if not files_to_track:
             print(f"⚠️ No files found to track for '{path}'.")
+            if metrics.is_enabled():
+                tracker.end_pipeline()
             return
 
         # Test S3 credentials once before starting parallel operations
@@ -1828,6 +1924,12 @@ class S3LFS:
         print(
             f"🚀 Processing {len(files_to_track)} files with interleaved hashing and uploading..."
         )
+
+        # Start tracking stages
+        if metrics.is_enabled():
+            tracker.start_stage("hashing", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("compression", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("s3_upload", max_workers=DEFAULT_THREAD_POOL_SIZE)
 
         # Phase 2: Process files with interleaved hashing and uploading
         files_uploaded = []
@@ -1919,6 +2021,14 @@ class S3LFS:
             f"✅ Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
         )
 
+        # End metrics tracking
+        if metrics.is_enabled():
+            tracker.end_stage("hashing")
+            tracker.end_stage("compression")
+            tracker.end_stage("s3_upload")
+            tracker.end_pipeline()
+            tracker.print_summary(verbose=not silence)
+
     def checkout_interleaved(self, path, silence=True, use_cache=True):
         """
         Checkout files with interleaved hashing and downloading for better performance.
@@ -1927,12 +2037,19 @@ class S3LFS:
         :param silence: Silences verbose logging.
         :param use_cache: If True, use cached hashing for better performance on repeated operations.
         """
+        # Start pipeline metrics if enabled
+        if metrics.is_enabled():
+            tracker = metrics.get_tracker()
+            tracker.start_pipeline()
+
         # Phase 1: Resolve manifest paths
         print("🔒 Resolving paths from manifest...")
         files_to_checkout = self._resolve_manifest_paths(path)
 
         if not files_to_checkout:
             print(f"⚠️ No files found in the manifest for '{path}'.")
+            if metrics.is_enabled():
+                tracker.end_pipeline()
             return
 
         # Test S3 credentials once before starting parallel operations
@@ -1943,6 +2060,12 @@ class S3LFS:
         print(
             f"🚀 Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
         )
+
+        # Start tracking stages
+        if metrics.is_enabled():
+            tracker.start_stage("hashing", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("s3_download", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("decompression", max_workers=DEFAULT_THREAD_POOL_SIZE)
 
         # Phase 2: Start processing immediately - discover sizes during download
         # We'll process ALL files to ensure proper progress tracking, even for up-to-date ones
@@ -2033,21 +2156,33 @@ class S3LFS:
                 f"✅ Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
             )
 
+            # End metrics tracking
+            if metrics.is_enabled():
+                tracker.end_stage("hashing")
+                tracker.end_stage("s3_download")
+                tracker.end_stage("decompression")
+                tracker.end_pipeline()
+                tracker.print_summary(verbose=not silence)
+
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def download(
         self,
         file_path: Union[str, Path],
         silence: bool = False,
         progress_callback: Optional[Callable[[int], None]] = None,
+        expected_hash: Optional[str] = None,
     ) -> Optional[int]:
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
+
+        :param expected_hash: Optional pre-fetched hash to avoid lock contention in parallel downloads
         """
         file_path = Path(file_path)
 
-        # Get the expected hash for the file
-        with self._lock_context():
-            expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
+        # Get the expected hash for the file (use provided hash if available to avoid lock)
+        if expected_hash is None:
+            with self._lock_context():
+                expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
         if not expected_hash:
             print(f"⚠️ File '{file_path}' is not in the manifest.")
             return None
@@ -2144,13 +2279,24 @@ class S3LFS:
                 with context_manager:
                     if not silence:
                         print(f"Downloading {key} to {target_path}")
-                    with open(target_path, "wb") as f:
-                        self._get_s3_client().download_fileobj(
-                            Bucket=self.bucket_name,
-                            Key=key,
-                            Fileobj=f,
-                            Callback=download_callback,
-                        )
+                    if metrics.is_enabled():
+                        tracker = metrics.get_tracker()
+                        with tracker.track_task("s3_download", key):
+                            with open(target_path, "wb") as f:
+                                self._get_s3_client().download_fileobj(
+                                    Bucket=self.bucket_name,
+                                    Key=key,
+                                    Fileobj=f,
+                                    Callback=download_callback,
+                                )
+                    else:
+                        with open(target_path, "wb") as f:
+                            self._get_s3_client().download_fileobj(
+                                Bucket=self.bucket_name,
+                                Key=key,
+                                Fileobj=f,
+                                Callback=download_callback,
+                            )
             except Exception as e:
                 print(f"❌ Error downloading {key}: {e}")
 
@@ -2164,7 +2310,13 @@ class S3LFS:
         if os.path.dirname(file_path):
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
         try:
-            self.decompress_file(compressed_path, file_path)
+            # Track decompression at the call site for better metrics visibility
+            if metrics.is_enabled():
+                tracker = metrics.get_tracker()
+                with tracker.track_task("decompression", str(file_path)):
+                    self.decompress_file(compressed_path, file_path)
+            else:
+                self.decompress_file(compressed_path, file_path)
         except Exception as e:
             print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
             raise

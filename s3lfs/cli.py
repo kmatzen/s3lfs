@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 import yaml
 
+from s3lfs import metrics
 from s3lfs.core import S3LFS
 
 
@@ -138,8 +139,20 @@ def init(bucket, prefix, no_sign_request, use_acceleration):
 @click.option(
     "--modified", is_flag=True, help="Track only modified files from manifest"
 )
-def track(path, no_sign_request, use_acceleration, verbose, modified):
+@click.option(
+    "--metrics",
+    "enable_metrics_flag",
+    is_flag=True,
+    help="Enable parallelism metrics collection",
+)
+def track(
+    path, no_sign_request, use_acceleration, verbose, modified, enable_metrics_flag
+):
     """Track files, directories, or globs. Use --modified to track only changed files."""
+    # Enable metrics if requested
+    if enable_metrics_flag:
+        metrics.enable_metrics()
+
     # Find git root and resolve path
     git_root = find_git_root()
     if not git_root:
@@ -185,8 +198,20 @@ def track(path, no_sign_request, use_acceleration, verbose, modified):
     help="Show detailed progress and download size information",
 )
 @click.option("--all", is_flag=True, help="Checkout all files from manifest")
-def checkout(path, no_sign_request, use_acceleration, verbose, all):
+@click.option(
+    "--metrics",
+    "enable_metrics_flag",
+    is_flag=True,
+    help="Enable parallelism metrics collection",
+)
+def checkout(
+    path, no_sign_request, use_acceleration, verbose, all, enable_metrics_flag
+):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
+    # Enable metrics if requested
+    if enable_metrics_flag:
+        metrics.enable_metrics()
+
     # Find git root and resolve path
     git_root = find_git_root()
     if not git_root:
