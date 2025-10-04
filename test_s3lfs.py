@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import boto3
+import yaml
 from botocore.exceptions import ClientError
 from moto import mock_s3
 
@@ -125,7 +126,13 @@ class TestS3LFS(unittest.TestCase):
         file_hash = self.versioner.hash_file(self.test_file)
 
         with open(self.versioner.manifest_file, "r") as f:
-            manifest_data = json.load(f)
+            # Detect format based on file extension
+            if self.versioner.manifest_file.suffix in [".yaml", ".yml"]:
+                import yaml
+
+                manifest_data = yaml.safe_load(f)
+            else:
+                manifest_data = json.load(f)
 
         # Check that the file path (not hash) is correctly stored in the manifest
         self.assertIn(self.test_file, manifest_data["files"])
@@ -2411,9 +2418,12 @@ class TestS3LFS(unittest.TestCase):
         # Verify file exists
         self.assertTrue(os.path.exists(self.versioner.manifest_file))
 
-        # Verify content
+        # Verify content (handle both YAML and JSON)
         with open(self.versioner.manifest_file, "r") as f:
-            loaded_manifest = json.load(f)
+            if Path(self.versioner.manifest_file).suffix in [".yaml", ".yml"]:
+                loaded_manifest = yaml.safe_load(f)
+            else:
+                loaded_manifest = json.load(f)
 
         self.assertIn("test_save.txt", loaded_manifest["files"])
         self.assertEqual(loaded_manifest["files"]["test_save.txt"], "test_hash")

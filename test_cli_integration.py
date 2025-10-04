@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import boto3
+import yaml
 from click.testing import CliRunner
 from moto import mock_s3
 
@@ -25,16 +26,24 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
             f.write("Hello In-Process Test")
 
         # Remove any leftover manifest
-        self.manifest_path = Path(".s3_manifest.json")
-        if self.manifest_path.exists():
-            self.manifest_path.unlink()
+        # Check for both YAML (new default) and JSON (backward compat)
+        self.yaml_manifest_path = Path(".s3_manifest.yaml")
+        self.json_manifest_path = Path(".s3_manifest.json")
+        self.manifest_path = self.yaml_manifest_path  # Default to YAML
+
+        if self.yaml_manifest_path.exists():
+            self.yaml_manifest_path.unlink()
+        if self.json_manifest_path.exists():
+            self.json_manifest_path.unlink()
 
     def tearDown(self):
         # Clean up the test file and manifest
         if os.path.exists(self.test_file):
             os.remove(self.test_file)
-        if self.manifest_path.exists():
-            self.manifest_path.unlink()
+        if self.yaml_manifest_path.exists():
+            self.yaml_manifest_path.unlink()
+        if self.json_manifest_path.exists():
+            self.json_manifest_path.unlink()
 
     def test_init_command(self):
         """Test the init command."""
@@ -45,9 +54,12 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         # Check if manifest was created
         self.assertTrue(self.manifest_path.exists(), "Manifest file was not created")
 
-        # Check manifest contents
+        # Check manifest contents (handle both YAML and JSON)
         with open(self.manifest_path, "r") as f:
-            manifest = json.load(f)
+            if self.manifest_path.suffix in [".yaml", ".yml"]:
+                manifest = yaml.safe_load(f)
+            else:
+                manifest = json.load(f)
         self.assertEqual(manifest["bucket_name"], TEST_BUCKET)
         self.assertEqual(manifest["repo_prefix"], "test_prefix")
 

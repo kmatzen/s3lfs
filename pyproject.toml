@@ -12,6 +12,7 @@ boto3 = "^1.28.0"
 tqdm = "^4.64.0"
 click = "^8.1.8"
 portalocker = "^3.1.1"
+pyyaml = "^6.0"
 
 [tool.poetry.scripts]
 s3lfs = "s3lfs.cli:main"
@@ -26,6 +27,7 @@ pre-commit = "^4.2.0"
 moto = {extras = ["s3"], version = "^4.0.0"}
 mypy = "^1.0.0"
 types-boto3 = "^1.0.0"
+types-pyyaml = "^6.0.12.20250915"
 
 [tool.mypy]
 python_version = "3.9"

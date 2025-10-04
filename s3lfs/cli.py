@@ -1,7 +1,9 @@
+import json
 import os
 from pathlib import Path
 
 import click
+import yaml
 
 from s3lfs.core import S3LFS
 
@@ -82,14 +84,26 @@ def resolve_path_from_git_root(path_arg, git_root):
 def get_manifest_path(git_root):
     """
     Get the manifest file path relative to the git repository root.
+    Checks for YAML format first (preferred), then falls back to JSON for backward compatibility.
 
     Args:
         git_root: Path to the git repository root
 
     Returns:
-        Path to the manifest file
+        Path to the manifest file (YAML or JSON)
     """
-    return git_root / ".s3_manifest.json"
+    # Check for YAML format first (new default)
+    yaml_manifest = git_root / ".s3_manifest.yaml"
+    if yaml_manifest.exists():
+        return yaml_manifest
+
+    # Fall back to JSON for backward compatibility
+    json_manifest = git_root / ".s3_manifest.json"
+    if json_manifest.exists():
+        return json_manifest
+
+    # If neither exists, return YAML path for new repos
+    return yaml_manifest
 
 
 @click.group()
@@ -345,12 +359,97 @@ def cleanup(force, no_sign_request, use_acceleration):
     versioner.cleanup_s3(force=force)
 
 
+@click.command()
+@click.option("--force", is_flag=True, help="Skip confirmation and migrate immediately")
+def migrate(force):
+    """Migrate manifest from JSON to YAML format."""
+    # Find git root
+    git_root = find_git_root()
+    if not git_root:
+        click.echo("Error: Not in a git repository")
+        raise click.Abort()
+
+    json_manifest = git_root / ".s3_manifest.json"
+    yaml_manifest = git_root / ".s3_manifest.yaml"
+
+    # Check if JSON manifest exists
+    if not json_manifest.exists():
+        click.echo("Error: No JSON manifest found at .s3_manifest.json")
+        click.echo("Nothing to migrate.")
+        raise click.Abort()
+
+    # Check if YAML manifest already exists
+    if yaml_manifest.exists():
+        click.echo("Error: YAML manifest already exists at .s3_manifest.yaml")
+        click.echo("Aborting migration to avoid overwriting existing file.")
+        raise click.Abort()
+
+    # Load JSON manifest
+    try:
+        with open(json_manifest, "r") as f:
+            manifest_data = json.load(f)
+    except Exception as e:
+        click.echo(f"Error: Failed to read JSON manifest: {e}")
+        raise click.Abort()
+
+    # Show migration plan
+    file_count = len(manifest_data.get("files", {}))
+    click.echo("📋 Migration Plan:")
+    click.echo(f"   Source: .s3_manifest.json ({file_count} tracked files)")
+    click.echo("   Target: .s3_manifest.yaml")
+    click.echo()
+
+    if not force:
+        click.echo("This will:")
+        click.echo("  1. Create .s3_manifest.yaml with the same content")
+        click.echo("  2. Keep .s3_manifest.json as backup (you can delete it later)")
+        click.echo()
+        confirm = click.confirm("Do you want to proceed?")
+        if not confirm:
+            click.echo("❌ Migration cancelled.")
+            return
+
+    # Write YAML manifest
+    try:
+        with open(yaml_manifest, "w") as f:
+            yaml.safe_dump(manifest_data, f, default_flow_style=False, sort_keys=True)
+        click.echo(f"✅ Successfully created {yaml_manifest.name}")
+    except Exception as e:
+        click.echo(f"Error: Failed to write YAML manifest: {e}")
+        raise click.Abort()
+
+    # Also migrate cache file if it exists
+    json_cache = git_root / ".s3_manifest_cache.json"
+    yaml_cache = git_root / ".s3_manifest_cache.yaml"
+
+    if json_cache.exists() and not yaml_cache.exists():
+        try:
+            with open(json_cache, "r") as f:
+                cache_data = json.load(f)
+            with open(yaml_cache, "w") as f:
+                yaml.safe_dump(cache_data, f, default_flow_style=False, sort_keys=True)
+            click.echo(f"✅ Successfully migrated cache file to {yaml_cache.name}")
+        except Exception as e:
+            click.echo(f"⚠️  Warning: Failed to migrate cache file: {e}")
+            click.echo("   (Cache will be rebuilt automatically)")
+
+    click.echo()
+    click.echo("🎉 Migration complete!")
+    click.echo()
+    click.echo("Next steps:")
+    click.echo("  1. Test the YAML manifest: s3lfs ls")
+    click.echo("  2. Commit .s3_manifest.yaml to version control")
+    click.echo("  3. Delete .s3_manifest.json: rm .s3_manifest.json")
+    click.echo("  4. Update .gitignore if needed")
+
+
 cli.add_command(init)
 cli.add_command(track)
 cli.add_command(checkout)
 cli.add_command(ls)
 cli.add_command(remove)
 cli.add_command(cleanup)
+cli.add_command(migrate)
 
 
 def main():
