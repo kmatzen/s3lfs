@@ -1361,21 +1361,33 @@ class S3LFS:
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
-        Remove all files under a specified directory from tracking.
+        Remove all files under a specified directory or matching a glob pattern from tracking.
         Optionally keep the files in S3 for historical reference.
 
-        :param directory: The directory to remove from tracking.
+        :param directory: The directory or glob pattern to remove from tracking.
         :param keep_in_s3: If False, delete the files from S3 as well.
         """
         directory = Path(directory)
         directory_str = str(directory.as_posix())
 
+        # Check if this is a glob pattern
+        has_glob = any(char in directory_str for char in ["*", "?", "[", "]"])
+
         with self._lock_context():
-            files_to_remove = [
-                path
-                for path in self.manifest["files"]
-                if path.startswith(directory_str)
-            ]
+            if has_glob:
+                # Use glob matching for patterns
+                files_to_remove = [
+                    path
+                    for path in self.manifest["files"]
+                    if fnmatch.fnmatch(path, directory_str)
+                ]
+            else:
+                # Use prefix matching for directories
+                files_to_remove = [
+                    path
+                    for path in self.manifest["files"]
+                    if path.startswith(directory_str)
+                ]
 
         if not files_to_remove:
             print(f"⚠️ No tracked files found in '{directory}'.")
@@ -1391,7 +1403,9 @@ class S3LFS:
         with self._lock_context():
             self.save_manifest()
 
-        print(f"🗑 Removed tracking for all files under '{directory}'.")
+        print(
+            f"🗑 Removed tracking for {len(files_to_remove)} files matching '{directory}'."
+        )
 
     def test_s3_credentials(self, silence=False):
         """
