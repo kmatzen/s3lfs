@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import boto3
+import yaml
 from click.testing import CliRunner
 from moto import mock_s3
 
@@ -56,8 +57,6 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         # Check manifest contents (handle both YAML and JSON)
         with open(self.manifest_path, "r") as f:
             if self.manifest_path.suffix in [".yaml", ".yml"]:
-                import yaml
-
                 manifest = yaml.safe_load(f)
             else:
                 manifest = json.load(f)

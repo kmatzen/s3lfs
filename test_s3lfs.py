@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import boto3
+import yaml
 from botocore.exceptions import ClientError
 from moto import mock_s3
 
@@ -2420,8 +2421,6 @@ class TestS3LFS(unittest.TestCase):
         # Verify content (handle both YAML and JSON)
         with open(self.versioner.manifest_file, "r") as f:
             if Path(self.versioner.manifest_file).suffix in [".yaml", ".yml"]:
-                import yaml
-
                 loaded_manifest = yaml.safe_load(f)
             else:
                 loaded_manifest = json.load(f)
