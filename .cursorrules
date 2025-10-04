@@ -1,0 +1,31 @@
+# Cursor AI Rules for s3lfs
+
+## Python Style Guidelines
+
+### Imports
+- All imports MUST be at the top of the file
+- Never use inline imports (e.g., `import yaml` inside a function)
+- Follow isort ordering:
+  1. Standard library imports
+  2. Third-party imports
+  3. Local application imports
+- Use alphabetical ordering within each section
+
+### Code Formatting
+- Follow Black formatting with 88 character line length
+- Use double quotes for strings
+- Follow PEP 8 guidelines
+
+### Type Hints
+- Use type hints for function parameters and return values
+- Import types from `typing` module when needed
+
+### Testing
+- Write comprehensive unit tests for new features
+- Ensure backward compatibility when making changes
+- All tests must pass before committing
+
+### Git Practices
+- Write clear, descriptive commit messages
+- Keep commits atomic and focused
+- Run pre-commit hooks before committing
