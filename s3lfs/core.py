@@ -1900,31 +1900,34 @@ class S3LFS:
     ):
         """
         Worker function that checks if a file needs download and downloads it if needed.
-        file_info is (file_path, expected_hash) tuple.
+        file_info is (file_path, expected_hash) tuple where file_path is a manifest key.
         Returns (file_path, downloaded, bytes_transferred) tuple.
 
-        :param file_info: Tuple of (file_path, expected_hash)
+        :param file_info: Tuple of (manifest_key, expected_hash)
         :param silence: Whether to suppress individual file progress bars
         :param progress_callback: Optional callback function for progress updates
         :param use_cache: Whether to use cached hashing for performance
         """
         file_path, expected_hash = file_info
         try:
+            # Convert manifest key to filesystem path for checking existence
+            filesystem_path = self.path_resolver.to_filesystem_path(file_path)
+
             # Check if file exists and has correct hash
-            if Path(file_path).exists():
+            if filesystem_path.exists():
                 # Track hashing even when cached (for metrics visibility)
                 if metrics.is_enabled():
                     tracker = metrics.get_tracker()
-                    with tracker.track_task("hashing", str(file_path)):
+                    with tracker.track_task("hashing", str(filesystem_path)):
                         if use_cache:
-                            current_hash = self.hash_file_cached(file_path)
+                            current_hash = self.hash_file_cached(filesystem_path)
                         else:
-                            current_hash = self.hash_file(file_path)
+                            current_hash = self.hash_file(filesystem_path)
                 else:
                     if use_cache:
-                        current_hash = self.hash_file_cached(file_path)
+                        current_hash = self.hash_file_cached(filesystem_path)
                     else:
-                        current_hash = self.hash_file(file_path)
+                        current_hash = self.hash_file(filesystem_path)
 
                 if current_hash == expected_hash:
                     # File is up-to-date, don't add to download total since no download is needed

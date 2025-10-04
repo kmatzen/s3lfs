@@ -165,8 +165,13 @@ def track(
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    # Resolve path if provided
-    resolved_path = resolve_path_from_git_root(path, git_root) if path else None
+    # Use PathResolver for consistent path handling
+    path_resolver = PathResolver(git_root)
+
+    # Resolve path to manifest key if provided
+    manifest_key = None
+    if path:
+        manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
@@ -177,10 +182,10 @@ def track(
     if modified:
         # Track only modified files using cached version for better performance
         s3lfs.track_modified_files_cached(silence=not verbose)
-    elif resolved_path:
+    elif manifest_key:
         # Track specific path
         s3lfs.track(
-            resolved_path, silence=not verbose, interleaved=True, use_cache=False
+            manifest_key, silence=not verbose, interleaved=True, use_cache=False
         )
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
@@ -326,8 +331,11 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    # Resolve path
-    resolved_path = resolve_path_from_git_root(path, git_root)
+    # Use PathResolver for consistent path handling
+    path_resolver = PathResolver(git_root)
+
+    # Resolve path to manifest key
+    manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
 
     versioner = S3LFS(
         no_sign_request=no_sign_request,
@@ -336,12 +344,14 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
     )
 
     # Check if path is a directory pattern or single file
-    if Path(resolved_path).is_dir() or "*" in resolved_path or "?" in resolved_path:
+    # Convert manifest key back to filesystem path for directory check
+    filesystem_path = path_resolver.to_filesystem_path(manifest_key)
+    if filesystem_path.is_dir() or "*" in manifest_key or "?" in manifest_key:
         # Handle as directory/pattern - use remove_subtree logic
-        versioner.remove_subtree(resolved_path, keep_in_s3=not purge_from_s3)
+        versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
     else:
         # Handle as single file
-        versioner.remove_file(resolved_path, keep_in_s3=not purge_from_s3)
+        versioner.remove_file(manifest_key, keep_in_s3=not purge_from_s3)
 
 
 @click.command()
