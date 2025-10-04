@@ -34,6 +34,7 @@ from tqdm import tqdm
 from urllib3.exceptions import SSLError
 
 from s3lfs import metrics
+from s3lfs.path_resolver import PathResolver
 
 # Constants
 DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -180,6 +181,27 @@ class S3LFS:
             self.save_manifest()
 
         self.encryption = encryption
+
+        # Initialize PathResolver for consistent path handling
+        # Find git root for path resolution
+        from s3lfs.cli import find_git_root
+
+        git_root = find_git_root()
+        manifest_dir = Path(self.manifest_file).parent.resolve()
+
+        # Determine the base directory for PathResolver
+        if git_root:
+            # Check if manifest is within git repo
+            try:
+                manifest_dir.relative_to(git_root)
+                # Manifest is within git repo, use git root
+                self.path_resolver = PathResolver(git_root)
+            except ValueError:
+                # Manifest is outside git repo, use manifest directory
+                self.path_resolver = PathResolver(manifest_dir)
+        else:
+            # If not in a git repo, use manifest directory
+            self.path_resolver = PathResolver(manifest_dir)
 
         self._shutdown_requested = False  # Flag to track shutdown requests
         signal.signal(signal.SIGINT, self._handle_sigint)  # Register signal handler
@@ -1017,7 +1039,9 @@ class S3LFS:
             return
 
         file_hash = self.hash_file(file_path)
-        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
+        # Use manifest key (relative to git root) for S3 key
+        manifest_key = self._get_manifest_key(file_path)
+        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
 
         extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
         compressed_path = self.compress_file(file_path)
@@ -1138,7 +1162,8 @@ class S3LFS:
         if needs_immediate_update:
             with self._lock_context():
                 self.load_manifest()
-                self.manifest["files"][str(file_path.as_posix())] = file_hash
+                manifest_key = self._get_manifest_key(file_path)
+                self.manifest["files"][manifest_key] = file_hash
                 self.save_manifest()
         if not silence:
             print(f"Uploaded {file_path} -> s3://{self.bucket_name}/{s3_key}")
@@ -1399,46 +1424,59 @@ class S3LFS:
                 )
             raise RuntimeError(f"Error testing S3 credentials: {e}")
 
+    def _get_manifest_key(self, file_path: Union[str, Path]) -> str:
+        """
+        Convert a file path to a manifest key (relative to git root).
+
+        :param file_path: Absolute or relative file path
+        :return: Path relative to git root as string (POSIX format)
+        """
+        # Use PathResolver for consistent path handling
+        return self.path_resolver.to_manifest_key(file_path)
+
     def _resolve_filesystem_paths(self, path):
         """
         Resolve a path pattern to actual filesystem paths.
         Used for tracking operations.
 
         :param path: Path object that could be a file, directory, or glob pattern
-        :return: List of Path objects for files found
+        :return: List of Path objects for files found (as absolute paths)
         """
         path = Path(path)
 
         # If it's an existing file, return it directly
         if path.is_file():
-            return [path]
-
+            resolved_files = [path]
         # If it's an existing directory, get all files recursively
-        if path.is_dir():
-            return [f for f in path.rglob("*") if f.is_file()]
-
-        # Otherwise treat as a glob pattern
-        # Handle both absolute and relative patterns properly
-        if path.is_absolute():
-            # For absolute paths, use glob.glob directly
-            matched_paths = glob.glob(str(path), recursive=True)
+        elif path.is_dir():
+            resolved_files = [f for f in path.rglob("*") if f.is_file()]
         else:
-            # For relative paths, use Path.glob for better handling
-            try:
-                if "/" in str(path):
-                    # Multi-level glob pattern like "data/**/*.txt"
-                    parent = Path(".")
-                    pattern = str(path)
-                    matched_paths = [str(p) for p in parent.glob(pattern)]
-                else:
-                    # Simple pattern like "*.txt"
+            # Otherwise treat as a glob pattern
+            # Handle both absolute and relative patterns properly
+            if path.is_absolute():
+                # For absolute paths, use glob.glob directly
+                matched_paths = glob.glob(str(path), recursive=True)
+            else:
+                # For relative paths, use Path.glob for better handling
+                try:
+                    if "/" in str(path):
+                        # Multi-level glob pattern like "data/**/*.txt"
+                        parent = Path(".")
+                        pattern = str(path)
+                        matched_paths = [str(p) for p in parent.glob(pattern)]
+                    else:
+                        # Simple pattern like "*.txt"
+                        matched_paths = glob.glob(str(path))
+                except Exception:
+                    # Fallback to simple glob
                     matched_paths = glob.glob(str(path))
-            except Exception:
-                # Fallback to simple glob
-                matched_paths = glob.glob(str(path))
 
-        # Filter to only return files, not directories
-        return [Path(p) for p in matched_paths if Path(p).is_file()]
+            # Filter to only return files, not directories
+            resolved_files = [Path(p) for p in matched_paths if Path(p).is_file()]
+
+        # Convert all paths to absolute paths for internal use
+        # This ensures they work regardless of current working directory
+        return [p.resolve() for p in resolved_files]
 
     def _resolve_manifest_paths(self, path):
         """
@@ -1448,7 +1486,16 @@ class S3LFS:
         :param path: Path object that could be a file, directory, or glob pattern
         :return: Dictionary of manifest entries {file_path: hash}
         """
-        path_str = str(Path(path).as_posix())
+        # Convert absolute paths to manifest keys (relative to git root)
+        path_obj = Path(path)
+        if path_obj.is_absolute():
+            try:
+                path_str = self.path_resolver.to_manifest_key(path_obj)
+            except ValueError:
+                # Path is outside repository, use as-is
+                path_str = str(path_obj.as_posix())
+        else:
+            path_str = str(path_obj.as_posix())
 
         with self._lock_context():
             manifest_files = self.manifest["files"]
@@ -1641,7 +1688,8 @@ class S3LFS:
             self.load_manifest()
             # Phase 4: Lock the manifest and update it
             for file_path, file_hash in files_to_upload:
-                self.manifest["files"][file_path] = file_hash
+                manifest_key = self._get_manifest_key(file_path)
+                self.manifest["files"][manifest_key] = file_hash
             self.save_manifest()
 
         print(f"✅ Successfully tracked and uploaded files for '{path}'.")
@@ -1705,9 +1753,13 @@ class S3LFS:
                         return self._hash_with_progress(f, pbar)
 
                 future_to_file = {
-                    executor.submit(hash_func, Path(file)): file
+                    executor.submit(
+                        hash_func, self.path_resolver.to_filesystem_path(file)
+                    ): file
                     for file in files_to_checkout.keys()
-                    if Path(file).exists()  # Only hash files that exist on disk
+                    if self.path_resolver.to_filesystem_path(
+                        file
+                    ).exists()  # Only hash files that exist on disk
                 }
 
                 for future in as_completed(future_to_file):
@@ -1719,7 +1771,7 @@ class S3LFS:
 
         # Add files that don't exist on disk to the download list
         for file in files_to_checkout.keys():
-            if not Path(file).exists():
+            if not self.path_resolver.to_filesystem_path(file).exists():
                 files_to_download.append(file)
             elif file_hashes.get(file) != files_to_checkout[file]:
                 files_to_download.append(file)
@@ -1820,10 +1872,9 @@ class S3LFS:
                 current_hash = self.hash_file(file_path)
 
             # Check if upload is needed
+            manifest_key = self._get_manifest_key(file_path)
             with self._lock_context():
-                stored_hash = self.manifest["files"].get(
-                    str(Path(file_path).as_posix())
-                )
+                stored_hash = self.manifest["files"].get(manifest_key)
 
             if current_hash == stored_hash:
                 return (file_path, current_hash, False, 0)  # No upload needed
@@ -2014,7 +2065,8 @@ class S3LFS:
             with self._lock_context():
                 self.load_manifest()
                 for file_path, file_hash in files_uploaded:
-                    self.manifest["files"][file_path] = file_hash
+                    manifest_key = self._get_manifest_key(file_path)
+                    self.manifest["files"][manifest_key] = file_hash
                 self.save_manifest()
 
         print(
@@ -2175,33 +2227,48 @@ class S3LFS:
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
 
+        :param file_path: Manifest key (relative to git root) or filesystem path
         :param expected_hash: Optional pre-fetched hash to avoid lock contention in parallel downloads
         """
-        file_path = Path(file_path)
+        # Store the original path for manifest lookup
+        # If it's already a valid manifest key, use it; otherwise convert
+        manifest_key = str(Path(file_path).as_posix())
+        if not self.path_resolver.validate_manifest_key(manifest_key):
+            # Not a valid manifest key, try to convert it
+            try:
+                manifest_key = self.path_resolver.to_manifest_key(file_path)
+            except ValueError:
+                # Path is outside repo, use as-is
+                manifest_key = str(Path(file_path).as_posix())
+
+        # Convert manifest key to absolute filesystem path for operations
+        filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
 
         # Get the expected hash for the file (use provided hash if available to avoid lock)
         if expected_hash is None:
             with self._lock_context():
-                expected_hash = self.manifest["files"].get(str(file_path.as_posix()))
+                expected_hash = self.manifest["files"].get(manifest_key)
         if not expected_hash:
             print(f"⚠️ File '{file_path}' is not in the manifest.")
             return None
 
         # If the file exists, check its hash
         if not silence:
-            print(f"file_path exists?: {file_path.exists()}")
-        if file_path.exists():
-            current_hash = self.hash_file(file_path)
+            print(f"file_path exists?: {filesystem_path.exists()}")
+        if filesystem_path.exists():
+            current_hash = self.hash_file(filesystem_path)
             if not silence:
                 print(f"current_hash: {current_hash}")
                 print(f"expected_hash: {expected_hash}")
             if current_hash == expected_hash:
                 if not silence:
-                    print(f"✅ Skipping download: '{file_path}' is already up-to-date.")
+                    print(
+                        f"✅ Skipping download: '{filesystem_path}' is already up-to-date."
+                    )
                 return 0  # Skip download if hashes match
 
         # Proceed with download if file is missing or different
-        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{file_path.as_posix()}.gz"
+        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{manifest_key}.gz"
 
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
 
@@ -2307,25 +2374,27 @@ class S3LFS:
         else:
             compressed_path = target_paths[0]
 
-        if os.path.dirname(file_path):
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        if os.path.dirname(filesystem_path):
+            os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
         try:
             # Track decompression at the call site for better metrics visibility
             if metrics.is_enabled():
                 tracker = metrics.get_tracker()
-                with tracker.track_task("decompression", str(file_path)):
-                    self.decompress_file(compressed_path, file_path)
+                with tracker.track_task("decompression", str(filesystem_path)):
+                    self.decompress_file(compressed_path, filesystem_path)
             else:
-                self.decompress_file(compressed_path, file_path)
+                self.decompress_file(compressed_path, filesystem_path)
         except Exception as e:
             print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
             raise
         os.remove(compressed_path)  # Ensure temp file is deleted
         if not silence:
-            print(f"📥 Downloaded {file_path} from s3://{self.bucket_name}/{s3_key}")
+            print(
+                f"📥 Downloaded {filesystem_path} from s3://{self.bucket_name}/{s3_key}"
+            )
 
         # Return bytes transferred for progress tracking
-        return file_path.stat().st_size if file_path.exists() else 0
+        return filesystem_path.stat().st_size if filesystem_path.exists() else 0
 
     def list_files(self, path, verbose=False, strip_prefix=None):
         """

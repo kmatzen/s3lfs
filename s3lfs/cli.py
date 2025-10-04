@@ -7,6 +7,7 @@ import yaml
 
 from s3lfs import metrics
 from s3lfs.core import S3LFS
+from s3lfs.path_resolver import PathResolver
 
 
 def find_git_root(start_path=None, git_finder_func=None):
@@ -223,23 +224,13 @@ def checkout(
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    # Get current working directory relative to git root
-    cwd = Path.cwd()
-    try:
-        relative_cwd = cwd.relative_to(git_root)
-    except ValueError:
-        relative_cwd = Path(".")
+    # Use PathResolver for clean path handling
+    path_resolver = PathResolver(git_root)
 
-    # Resolve path if provided, considering current working directory context
+    # Resolve path to manifest key if provided
+    manifest_key = None
     if path:
-        if relative_cwd != Path("."):
-            # If we're in a subdirectory, prepend the current directory to the path
-            resolved_path = f"{relative_cwd}/{path}"
-        else:
-            # If we're at git root, use the path as-is
-            resolved_path = path
-    else:
-        resolved_path = None
+        manifest_key = path_resolver.from_cli_input(path, cwd=Path.cwd())
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
@@ -250,9 +241,9 @@ def checkout(
     if all:
         # Download all files from manifest
         s3lfs.parallel_download_all(silence=not verbose)
-    elif resolved_path:
+    elif manifest_key:
         # Checkout specific path
-        s3lfs.checkout(resolved_path, silence=not verbose)
+        s3lfs.checkout(manifest_key, silence=not verbose)
     else:
         click.echo("Error: Must provide either a path or use --all flag")
         raise click.Abort()
