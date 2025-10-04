@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import boto3
 import portalocker
+import yaml
 from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -83,7 +84,7 @@ class S3LFS:
     def __init__(
         self,
         bucket_name=None,
-        manifest_file=".s3_manifest.json",
+        manifest_file=".s3_manifest.yaml",
         repo_prefix=None,
         encryption=True,
         no_sign_request=False,
@@ -94,7 +95,7 @@ class S3LFS:
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
-        :param manifest_file: Path to the local manifest (JSON) file
+        :param manifest_file: Path to the local manifest file (YAML or JSON)
         :param repo_prefix: A unique prefix to isolate this repository's files
         :param encryption: If True, use AES256 server-side encryption
         :param no_sign_request: If True, use unsigned requests
@@ -143,7 +144,11 @@ class S3LFS:
         self.manifest_file = Path(manifest_file)
 
         # Separate cache file - should NOT be version controlled
-        cache_file_name = self.manifest_file.stem + "_cache.json"
+        # Use same format as manifest (YAML or JSON)
+        cache_suffix = (
+            ".yaml" if self.manifest_file.suffix in [".yaml", ".yml"] else ".json"
+        )
+        cache_file_name = self.manifest_file.stem + "_cache" + cache_suffix
         self.cache_file = self.manifest_file.parent / cache_file_name
 
         self.no_sign_request = no_sign_request
@@ -239,7 +244,7 @@ class S3LFS:
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
-        print("Manifest file saved as .s3_manifest.json")
+        print(f"Manifest file saved as {self.manifest_file.name}")
 
     def _update_gitignore(self):
         """
@@ -253,6 +258,7 @@ class S3LFS:
             "",  # Empty line for separation
             "# S3LFS cache and temporary files - should not be version controlled",
             "*_cache.json",
+            "*_cache.yaml",
             ".s3lfs_temp/",
             "*.s3lfs.lock",
         ]
@@ -299,22 +305,32 @@ class S3LFS:
             print("✅ .gitignore already contains S3LFS cache exclusions")
 
     def load_manifest(self):
-        """Load the local manifest (.s3_manifest.json)."""
+        """Load the local manifest (YAML or JSON format)."""
         if self.manifest_file.exists():
             with open(self.manifest_file, "r") as f:
-                self.manifest = json.load(f)
+                # Detect format based on extension
+                if self.manifest_file.suffix in [".yaml", ".yml"]:
+                    self.manifest = yaml.safe_load(f) or {"files": {}}
+                else:
+                    self.manifest = json.load(f)
         else:
             self.manifest = {"files": {}}  # Use file paths as keys
 
     def save_manifest(self):
-        """Save the manifest back to disk atomically."""
+        """Save the manifest back to disk atomically (YAML or JSON format)."""
         temp_file = self.manifest_file.with_suffix(
             ".tmp"
         )  # Temporary file in the same directory
         try:
             # Write the manifest to a temporary file
             with open(temp_file, "w") as f:
-                json.dump(self.manifest, f, indent=4, sort_keys=True)
+                # Detect format based on extension
+                if self.manifest_file.suffix in [".yaml", ".yml"]:
+                    yaml.safe_dump(
+                        self.manifest, f, default_flow_style=False, sort_keys=True
+                    )
+                else:
+                    json.dump(self.manifest, f, indent=4, sort_keys=True)
 
             # Atomically move the temporary file to the target location
             temp_file.replace(self.manifest_file)
@@ -324,12 +340,16 @@ class S3LFS:
                 temp_file.unlink()  # Clean up the temporary file
 
     def load_cache(self):
-        """Load the hash cache from a separate cache file."""
+        """Load the hash cache from a separate cache file (YAML or JSON format)."""
         if self.cache_file.exists():
             try:
                 with open(self.cache_file, "r") as f:
-                    self.hash_cache = json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
+                    # Detect format based on extension
+                    if self.cache_file.suffix in [".yaml", ".yml"]:
+                        self.hash_cache = yaml.safe_load(f) or {}
+                    else:
+                        self.hash_cache = json.load(f)
+            except (json.JSONDecodeError, yaml.YAMLError, IOError) as e:
                 print(
                     f"⚠️ Warning: Failed to load cache file, starting with empty cache: {e}"
                 )
@@ -338,12 +358,18 @@ class S3LFS:
             self.hash_cache = {}
 
     def save_cache(self):
-        """Save the hash cache back to disk atomically."""
+        """Save the hash cache back to disk atomically (YAML or JSON format)."""
         temp_file = self.cache_file.with_suffix(".tmp")
         try:
             # Write the cache to a temporary file
             with open(temp_file, "w") as f:
-                json.dump(self.hash_cache, f, indent=4, sort_keys=True)
+                # Detect format based on extension
+                if self.cache_file.suffix in [".yaml", ".yml"]:
+                    yaml.safe_dump(
+                        self.hash_cache, f, default_flow_style=False, sort_keys=True
+                    )
+                else:
+                    json.dump(self.hash_cache, f, indent=4, sort_keys=True)
 
             # Atomically move the temporary file to the target location
             temp_file.replace(self.cache_file)

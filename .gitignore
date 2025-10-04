@@ -11,3 +11,4 @@ coverage.xml
 *.swp
 .coverage*
 .s3lfs_temp/
+*_cache.yaml

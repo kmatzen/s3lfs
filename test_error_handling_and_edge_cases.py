@@ -304,6 +304,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     "",
                     "# S3LFS cache and temporary files - should not be version controlled",
                     "*_cache.json",
+                    "*_cache.yaml",
                     ".s3lfs_temp/",
                     "*.s3lfs.lock",
                     "# Additional content",
@@ -381,6 +382,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     "*.log",
                     "# S3LFS cache and temporary files - should not be version controlled",
                     "*_cache.json",
+                    "*_cache.yaml",
                     ".s3lfs_temp/",
                     "*.s3lfs.lock",
                 ]
@@ -415,6 +417,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                     "# Existing content",
                     "*.log",
                     "*_cache.json",
+                    "*_cache.yaml",
                     ".s3lfs_temp/",
                     "*.s3lfs.lock",
                 ]
