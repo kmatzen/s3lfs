@@ -843,32 +843,36 @@ class TestS3LFS(unittest.TestCase):
             # Test single file
             result = self.versioner._resolve_filesystem_paths("test_glob/file1.txt")
             self.assertEqual(len(result), 1)
-            self.assertEqual(str(result[0]), "test_glob/file1.txt")
+            # _resolve_filesystem_paths now returns absolute paths
+            self.assertEqual(result[0], Path("test_glob/file1.txt").resolve())
 
             # Test directory
             result = self.versioner._resolve_filesystem_paths("test_glob")
             self.assertEqual(len(result), 4)
-            result_strs = [str(p) for p in result]
+            # Results are now absolute paths
+            result_resolved = [p.resolve() for p in result]
             for expected in test_files:
-                self.assertIn(expected, result_strs)
+                self.assertIn(Path(expected).resolve(), result_resolved)
 
             # Test glob pattern
             result = self.versioner._resolve_filesystem_paths("test_glob/*.txt")
             self.assertEqual(len(result), 2)
-            result_strs = [str(p) for p in result]
-            self.assertIn("test_glob/file1.txt", result_strs)
-            self.assertIn("test_glob/file2.txt", result_strs)
+            result_resolved = [p.resolve() for p in result]
+            self.assertIn(Path("test_glob/file1.txt").resolve(), result_resolved)
+            self.assertIn(Path("test_glob/file2.txt").resolve(), result_resolved)
             self.assertNotIn(
-                "test_glob/subdir/nested.txt", result_strs
+                Path("test_glob/subdir/nested.txt").resolve(), result_resolved
             )  # Should not include subdirs
 
             # Test recursive glob
             result = self.versioner._resolve_filesystem_paths("test_glob/**/*.txt")
             self.assertEqual(len(result), 3)
-            result_strs = [str(p) for p in result]
-            self.assertIn("test_glob/file1.txt", result_strs)
-            self.assertIn("test_glob/file2.txt", result_strs)
-            self.assertIn("test_glob/subdir/nested.txt", result_strs)
+            result_resolved = [p.resolve() for p in result]
+            self.assertIn(Path("test_glob/file1.txt").resolve(), result_resolved)
+            self.assertIn(Path("test_glob/file2.txt").resolve(), result_resolved)
+            self.assertIn(
+                Path("test_glob/subdir/nested.txt").resolve(), result_resolved
+            )
 
         finally:
             # Clean up
@@ -2271,7 +2275,8 @@ class TestS3LFS(unittest.TestCase):
         """Test _resolve_filesystem_paths with existing file."""
         result = self.versioner._resolve_filesystem_paths(self.test_file)
         self.assertEqual(len(result), 1)
-        self.assertEqual(str(result[0]), self.test_file)
+        # _resolve_filesystem_paths now returns absolute paths
+        self.assertEqual(result[0], Path(self.test_file).resolve())
 
     def test_resolve_manifest_paths_exact_match(self):
         """Test _resolve_manifest_paths with exact file match."""
@@ -2856,7 +2861,8 @@ class TestS3LFS(unittest.TestCase):
 
             # Should find the file
             self.assertEqual(len(result), 1)
-            self.assertEqual(str(result[0]), str(test_file))
+            # _resolve_filesystem_paths now returns absolute paths (resolved)
+            self.assertEqual(result[0], test_file.resolve())
 
     def test_resolve_filesystem_paths_complex_glob(self):
         """Test _resolve_filesystem_paths with complex glob patterns."""
