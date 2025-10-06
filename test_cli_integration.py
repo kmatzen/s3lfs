@@ -97,72 +97,77 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         """Test that path resolution works correctly when running commands from subdirectories."""
         from pathlib import Path
 
-        from s3lfs.cli import resolve_path_from_git_root
+        from s3lfs.path_resolver import PathResolver
 
         # Mock git root and current directory
         git_root = Path("/test/git/root")
+        path_resolver = PathResolver(git_root)
 
-        # Test 1: When in a subdirectory, path should not be prefixed
-        with patch("pathlib.Path.cwd") as mock_cwd:
-            mock_cwd.return_value = Path("/test/git/root/subdir")
+        # Test 1: When in a subdirectory, relative path should be resolved from CWD
+        cwd = Path("/test/git/root/subdir")
 
-            # Test that a path argument is returned as-is
-            result = resolve_path_from_git_root("file.txt", git_root)
-            self.assertEqual(
-                result, "file.txt", "Path should not be prefixed with current directory"
-            )
-
-            # Test with a subdirectory path
-            result = resolve_path_from_git_root("subdir/file.txt", git_root)
-            self.assertEqual(
-                result, "subdir/file.txt", "Subdirectory path should not be prefixed"
-            )
-
-        # Test 2: Absolute paths should be returned as-is
-        result = resolve_path_from_git_root("/absolute/path/file.txt", git_root)
+        # "file.txt" from subdir should resolve to "subdir/file.txt"
+        result = path_resolver.from_cli_input("file.txt", cwd=cwd)
         self.assertEqual(
-            result, "/absolute/path/file.txt", "Absolute paths should be returned as-is"
+            result, "subdir/file.txt", "Path should be resolved from current directory"
         )
 
-        # Test 3: Empty or None paths should be returned as-is
-        result = resolve_path_from_git_root("", git_root)
-        self.assertEqual(result, "", "Empty path should be returned as-is")
+        # "nested/file.txt" from subdir should resolve to "subdir/nested/file.txt"
+        result = path_resolver.from_cli_input("nested/file.txt", cwd=cwd)
+        self.assertEqual(
+            result, "subdir/nested/file.txt", "Nested path should be resolved from CWD"
+        )
 
-        result = resolve_path_from_git_root(None, git_root)
-        self.assertIsNone(result, "None path should be returned as-is")
+        # Test 2: Absolute paths should be converted to manifest keys
+        abs_path = git_root / "absolute" / "path" / "file.txt"
+        result = path_resolver.from_cli_input(
+            str(abs_path), cwd=cwd, allow_absolute=True
+        )
+        self.assertEqual(
+            result,
+            "absolute/path/file.txt",
+            "Absolute paths should be converted to manifest keys",
+        )
 
     def test_checkout_from_subdirectory_no_prefix_doubling(self):
-        """Test that checkout from subdirectory doesn't double up the prefix."""
+        """Test that checkout from subdirectory correctly resolves paths."""
         from pathlib import Path
 
-        from s3lfs.cli import resolve_path_from_git_root
+        from s3lfs.path_resolver import PathResolver
 
         # Mock git root and current directory (like being in GoProProcessed subdirectory)
         git_root = Path("/test/git/root")
+        path_resolver = PathResolver(git_root)
+        cwd = Path("/test/git/root/GoProProcessed")
 
-        with patch("pathlib.Path.cwd") as mock_cwd:
-            # Simulate being in the GoProProcessed subdirectory
-            mock_cwd.return_value = Path("/test/git/root/GoProProcessed")
+        # When in GoProProcessed and user types "capture157",
+        # it should resolve to "GoProProcessed/capture157"
+        result = path_resolver.from_cli_input("capture157", cwd=cwd)
+        self.assertEqual(
+            result,
+            "GoProProcessed/capture157",
+            "Path should be prefixed with current directory",
+        )
 
-            # Test that when checking out "capture157", it doesn't get prefixed with current directory
-            result = resolve_path_from_git_root("capture157", git_root)
-            self.assertEqual(
-                result,
-                "capture157",
-                "Path should not be prefixed with current directory",
-            )
+        # When in GoProProcessed and user types "../GoProProcessed/capture157",
+        # they can navigate relative to CWD to get to git root paths
+        result = path_resolver.from_cli_input("../GoProProcessed/capture157", cwd=cwd)
+        self.assertEqual(
+            result,
+            "GoProProcessed/capture157",
+            "Parent directory navigation should work",
+        )
 
-            # Test that when checking out "GoProProcessed/capture157", it doesn't get doubled
-            result = resolve_path_from_git_root("GoProProcessed/capture157", git_root)
-            self.assertEqual(
-                result, "GoProProcessed/capture157", "Path should not be doubled"
-            )
-
-            # Test that absolute paths are handled correctly
-            result = resolve_path_from_git_root("/absolute/path", git_root)
-            self.assertEqual(
-                result, "/absolute/path", "Absolute paths should be returned as-is"
-            )
+        # Absolute paths should be converted to manifest keys
+        abs_path = git_root / "absolute" / "path"
+        result = path_resolver.from_cli_input(
+            str(abs_path), cwd=cwd, allow_absolute=True
+        )
+        self.assertEqual(
+            result,
+            "absolute/path",
+            "Absolute paths should be converted to manifest keys",
+        )
 
     def test_checkout_from_subdirectory_with_context(self):
         """Test that checkout from subdirectory considers current working directory context."""

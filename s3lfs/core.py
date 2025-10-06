@@ -6,6 +6,7 @@ import hashlib
 import json
 import mmap
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -35,6 +36,7 @@ from urllib3.exceptions import SSLError
 
 from s3lfs import metrics
 from s3lfs.path_resolver import PathResolver
+from s3lfs.utils import find_git_root
 
 # Constants
 DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -184,10 +186,8 @@ class S3LFS:
 
         # Initialize PathResolver for consistent path handling
         # Find git root for path resolution
-        from s3lfs.cli import find_git_root
-
-        git_root = find_git_root()
         manifest_dir = Path(self.manifest_file).parent.resolve()
+        git_root = find_git_root(start_path=manifest_dir)
 
         # Determine the base directory for PathResolver
         if git_root:
@@ -1361,36 +1361,36 @@ class S3LFS:
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
-        Remove all files under a specified directory or matching a glob pattern from tracking.
+        Remove files matching a pattern from tracking.
+        Handles single files, directories, and glob patterns uniformly.
         Optionally keep the files in S3 for historical reference.
 
-        :param directory: The directory or glob pattern to remove from tracking.
+        :param directory: The path, directory, or glob pattern to remove from tracking.
         :param keep_in_s3: If False, delete the files from S3 as well.
         """
         directory = Path(directory)
-        directory_str = str(directory.as_posix())
-
-        # Check if this is a glob pattern
-        has_glob = any(char in directory_str for char in ["*", "?", "[", "]"])
+        pattern = str(directory.as_posix())
 
         with self._lock_context():
-            if has_glob:
-                # Use glob matching for patterns
+            # Try matching with the pattern as-is (handles files and glob patterns)
+            files_to_remove = [
+                path
+                for path in self.manifest["files"]
+                if fnmatch.fnmatch(path, pattern)
+            ]
+
+            # If no matches, try as directory by appending /*
+            # This handles cases like "dir" -> "dir/*" or "dir*" -> "dir*/*"
+            if not files_to_remove:
+                dir_pattern = pattern.rstrip("/") + "/*"
                 files_to_remove = [
                     path
                     for path in self.manifest["files"]
-                    if fnmatch.fnmatch(path, directory_str)
-                ]
-            else:
-                # Use prefix matching for directories
-                files_to_remove = [
-                    path
-                    for path in self.manifest["files"]
-                    if path.startswith(directory_str)
+                    if fnmatch.fnmatch(path, dir_pattern)
                 ]
 
         if not files_to_remove:
-            print(f"⚠️ No tracked files found in '{directory}'.")
+            print(f"⚠️ No tracked files found matching '{directory}'.")
             return
 
         for file_path in files_to_remove:
@@ -1403,8 +1403,9 @@ class S3LFS:
         with self._lock_context():
             self.save_manifest()
 
+        count = len(files_to_remove)
         print(
-            f"🗑 Removed tracking for {len(files_to_remove)} files matching '{directory}'."
+            f"🗑 Removed tracking for {count} file{'s' if count != 1 else ''} matching '{directory}'."
         )
 
     def test_s3_credentials(self, silence=False):
@@ -1450,159 +1451,190 @@ class S3LFS:
 
     def _resolve_filesystem_paths(self, path):
         """
-        Resolve a path pattern to actual filesystem paths.
-        Used for tracking operations.
+        FILESYSTEM GLOB: Find files on disk matching a pattern.
 
-        :param path: Path object that could be a file, directory, or glob pattern
-        :return: List of Path objects for files found (as absolute paths)
+        This is used for TRACKING operations where we need to find actual files
+        on the filesystem (which may not be in the manifest yet).
+
+        The glob pattern is applied against the filesystem, not the manifest.
+
+        :param path: Either a manifest key (relative to git root) or an absolute path.
+                     Could be:
+                     - A file: "subdir/file.txt" or "/repo/subdir/file.txt"
+                     - A directory: "subdir/" or "/repo/subdir/"
+                     - A glob pattern: "subdir/*.txt" or "/repo/subdir/*.txt"
+        :return: List of Path objects for files found on disk (as absolute paths)
+
+        Example:
+            User in /repo/subdir types: "*.txt"
+            CLI converts to manifest key: "subdir/*.txt"
+            This method converts to filesystem path: "/repo/subdir/*.txt"
+            Glob finds actual files: ["/repo/subdir/a.txt", "/repo/subdir/b.txt"]
         """
-        path = Path(path)
+        # Handle both manifest keys and absolute paths
+        path_obj = Path(path)
+        if path_obj.is_absolute():
+            # Already an absolute path, use as-is
+            filesystem_path = path_obj
+        else:
+            # Convert manifest key to filesystem path (prepends git_root)
+            # For example: "subdir/file.txt" -> "/repo/subdir/file.txt"
+            # For globs: "subdir/*.txt" -> "/repo/subdir/*.txt"
+            filesystem_path = self.path_resolver.to_filesystem_path(path)
 
         # If it's an existing file, return it directly
-        if path.is_file():
-            resolved_files = [path]
+        if filesystem_path.is_file():
+            resolved_files = [filesystem_path]
         # If it's an existing directory, get all files recursively
-        elif path.is_dir():
-            resolved_files = [f for f in path.rglob("*") if f.is_file()]
+        elif filesystem_path.is_dir():
+            resolved_files = [f for f in filesystem_path.rglob("*") if f.is_file()]
         else:
-            # Otherwise treat as a glob pattern
-            # Handle both absolute and relative patterns properly
-            if path.is_absolute():
-                # For absolute paths, use glob.glob directly
-                matched_paths = glob.glob(str(path), recursive=True)
-            else:
-                # For relative paths, use Path.glob for better handling
-                try:
-                    if "/" in str(path):
-                        # Multi-level glob pattern like "data/**/*.txt"
-                        parent = Path(".")
-                        pattern = str(path)
-                        matched_paths = [str(p) for p in parent.glob(pattern)]
-                    else:
-                        # Simple pattern like "*.txt"
-                        matched_paths = glob.glob(str(path))
-                except Exception:
-                    # Fallback to simple glob
-                    matched_paths = glob.glob(str(path))
+            # Otherwise treat as a glob pattern against the filesystem
+            matched_paths = glob.glob(str(filesystem_path), recursive=True)
 
-            # Filter to only return files, not directories
-            resolved_files = [Path(p) for p in matched_paths if Path(p).is_file()]
+            # Handle both files and directories that match the pattern
+            resolved_files = []
+            for p in matched_paths:
+                path_obj = Path(p)
+                if path_obj.is_file():
+                    resolved_files.append(path_obj)
+                elif path_obj.is_dir():
+                    # For directories, find all files recursively
+                    resolved_files.extend(
+                        [f for f in path_obj.rglob("*") if f.is_file()]
+                    )
 
-        # Convert all paths to absolute paths for internal use
-        # This ensures they work regardless of current working directory
+        # Return absolute paths
         return [p.resolve() for p in resolved_files]
 
     def _resolve_manifest_paths(self, path):
         """
-        Resolve a path pattern against the manifest contents.
-        Used for checkout operations.
+        MANIFEST GLOB: Find files in the manifest matching a pattern.
 
-        :param path: Path object that could be a file, directory, or glob pattern
-        :return: Dictionary of manifest entries {file_path: hash}
+        This is used for CHECKOUT, REMOVE, and LS operations where we need to find
+        files that are already tracked in the manifest.
+
+        The glob pattern is applied against manifest keys, not the filesystem.
+
+        :param path: Manifest key (relative to git root) that could be:
+                     - A file: "subdir/file.txt"
+                     - A directory: "subdir/"
+                     - A glob pattern: "subdir/*.txt" or "dir*/file*"
+        :return: Dictionary of manifest entries {manifest_key: hash}
+
+        Example:
+            User in /repo/subdir types: "*.txt"
+            CLI converts to manifest key: "subdir/*.txt"
+            This method matches against manifest keys: {"subdir/a.txt": "hash1", "subdir/b.txt": "hash2"}
+            Files may or may not exist on disk - we're just finding tracked files.
         """
         # Convert absolute paths to manifest keys (relative to git root)
         path_obj = Path(path)
         if path_obj.is_absolute():
-            try:
-                path_str = self.path_resolver.to_manifest_key(path_obj)
-            except ValueError:
-                # Path is outside repository, use as-is
-                path_str = str(path_obj.as_posix())
+            path_str = self.path_resolver.to_manifest_key(path_obj)
         else:
             path_str = str(path_obj.as_posix())
 
         with self._lock_context():
             manifest_files = self.manifest["files"]
 
-            # Check for exact file match first
-            if path_str in manifest_files:
-                return {path_str: manifest_files[path_str]}
+            # Try matching with the pattern as-is (handles files and glob patterns)
+            matched_files = {}
+            for file_path, file_hash in manifest_files.items():
+                if self._glob_match(file_path, path_str):
+                    matched_files[file_path] = file_hash
 
-            # Check if it has glob characters
-            has_glob_chars = any(char in path_str for char in ["*", "?", "[", "]"])
-
-            if has_glob_chars:
-                # Implement proper filesystem-like glob behavior
-                matched_files = {}
+            # If no matches, try as directory by appending /**
+            # This handles cases like "dir" -> "dir/**" (recursive)
+            # This matches filesystem behavior where specifying a directory
+            # returns all files recursively within it
+            if not matched_files:
+                dir_pattern = path_str.rstrip("/") + "/**"
                 for file_path, file_hash in manifest_files.items():
-                    if self._glob_match(file_path, path_str):
+                    if self._glob_match(file_path, dir_pattern):
                         matched_files[file_path] = file_hash
-            else:
-                # Treat as directory prefix - match files that start with the path
-                # Add trailing slash if not present to avoid partial matches
-                prefix = path_str if path_str.endswith("/") else f"{path_str}/"
-                matched_files = {
-                    file_path: file_hash
-                    for file_path, file_hash in manifest_files.items()
-                    if file_path.startswith(prefix)
-                }
-
-                # If no directory matches found, it might be a file without extension
-                # or a directory that was specified without trailing slash
-                if not matched_files:
-                    # Try matching files that start with the exact path (for files)
-                    matched_files = {
-                        file_path: file_hash
-                        for file_path, file_hash in manifest_files.items()
-                        if file_path == path_str
-                    }
 
             return matched_files
 
     def _glob_match(self, file_path, pattern):
         """
-        Custom glob matching that behaves like filesystem glob.
+        Glob matching that behaves like filesystem glob (glob.glob semantics).
 
-        :param file_path: The file path to test
+        Follows glob.glob rules:
+        - * matches within a directory level (doesn't cross /)
+        - ** matches recursively across directories (zero or more levels)
+        - ? matches a single character (not /)
+
+        This ensures MANIFEST GLOB and FILESYSTEM GLOB are consistent.
+
+        :param file_path: The file path to test (manifest key)
         :param pattern: The glob pattern
         :return: True if the file path matches the pattern
         """
         # Handle ** recursive patterns
         if "**" in pattern:
-            # Convert ** patterns to regex-like behavior
-            # Split on ** and handle each part
-            parts = pattern.split("**")
-            if len(parts) == 2:
-                prefix, suffix = parts
-                prefix = prefix.rstrip("/")
-                suffix = suffix.lstrip("/")
+            # Convert pattern to regex for matching
+            # ** can match zero or more directory levels
+            # Examples:
+            #   "**/file.txt" -> matches "file.txt" and "a/b/file.txt"
+            #   "a/**" -> matches "a/b" and "a/b/c"
+            #   "a/**/file.txt" -> matches "a/file.txt" and "a/b/c/file.txt"
 
-                # Check if file starts with prefix (if any) and ends with suffix pattern
-                if prefix and not file_path.startswith(prefix):
-                    return False
+            regex_pattern = pattern
 
-                # For the suffix, we need to match it against the remaining path
-                if suffix:
-                    if prefix:
-                        remaining_path = file_path[len(prefix) :].lstrip("/")
-                    else:
-                        remaining_path = file_path
+            # Replace **/ with marker (zero or more directories with trailing /)
+            regex_pattern = regex_pattern.replace("**/", "\x00DOUBLESTAR_SLASH\x00")
 
-                    # Use fnmatch for the suffix part
-                    return fnmatch.fnmatch(remaining_path, suffix)
-                else:
-                    # Pattern ends with **, so just check prefix
-                    return not prefix or file_path.startswith(prefix)
-            else:
-                # Multiple ** or more complex pattern - fall back to fnmatch
-                return fnmatch.fnmatch(file_path, pattern)
+            # Replace /** with marker (/ followed by zero or more directories)
+            regex_pattern = regex_pattern.replace("/**", "\x00SLASH_DOUBLESTAR\x00")
+
+            # Replace remaining ** (standalone) with marker
+            regex_pattern = regex_pattern.replace("**", "\x00DOUBLESTAR\x00")
+
+            # Escape regex special chars
+            regex_pattern = re.escape(regex_pattern)
+
+            # Replace * with [^/]* (match anything except /)
+            regex_pattern = regex_pattern.replace(r"\*", "[^/]*")
+
+            # Replace ? with [^/] (match single char except /)
+            regex_pattern = regex_pattern.replace(r"\?", "[^/]")
+
+            # Replace markers with appropriate regex
+            # **/ -> (?:.*/)?  (zero or more dirs with trailing /, optional)
+            regex_pattern = regex_pattern.replace(
+                "\x00DOUBLESTAR_SLASH\x00", "(?:.*/)?"
+            )
+
+            # /** -> (?:/.*)?  (optional / with zero or more dirs)
+            regex_pattern = regex_pattern.replace(
+                "\x00SLASH_DOUBLESTAR\x00", "(?:/.*)?"
+            )
+
+            # ** standalone -> .*  (match anything)
+            regex_pattern = regex_pattern.replace("\x00DOUBLESTAR\x00", ".*")
+
+            # Anchor the pattern
+            regex_pattern = f"^{regex_pattern}$"
+
+            return bool(re.match(regex_pattern, file_path))
         else:
-            # For non-recursive patterns, ensure * doesn't cross directory boundaries
-            # Match segment-by-segment; if pattern has fewer parts, treat as prefix match
+            # For non-** patterns, match segment by segment
+            # This ensures * doesn't cross directory boundaries
             pattern_parts = pattern.split("/")
             file_parts = file_path.split("/")
 
-            # Pattern can't match if it has more segments than the file path
-            if len(pattern_parts) > len(file_parts):
+            # Pattern and file must have the same number of segments for exact match
+            # (No prefix matching - that's handled by the caller appending /*)
+            if len(pattern_parts) != len(file_parts):
                 return False
 
-            # Match each pattern segment against the corresponding file segment
+            # Match each pattern segment against corresponding file segment
             for pattern_part, file_part in zip(pattern_parts, file_parts):
                 if not fnmatch.fnmatch(file_part, pattern_part):
                     return False
 
-            # All pattern segments matched - this is either an exact match (same length)
-            # or a prefix match (pattern shorter, file is under the matched directory)
+            # All segments matched
             return True
 
     def track(self, path, silence=True, interleaved=True, use_cache=True):
@@ -2244,19 +2276,11 @@ class S3LFS:
         """
         Download a file from S3 by its recorded hash, but skip if it already exists and matches.
 
-        :param file_path: Manifest key (relative to git root) or filesystem path
+        :param file_path: Manifest key (relative to git root)
         :param expected_hash: Optional pre-fetched hash to avoid lock contention in parallel downloads
         """
-        # Store the original path for manifest lookup
-        # If it's already a valid manifest key, use it; otherwise convert
-        manifest_key = str(Path(file_path).as_posix())
-        if not self.path_resolver.validate_manifest_key(manifest_key):
-            # Not a valid manifest key, try to convert it
-            try:
-                manifest_key = self.path_resolver.to_manifest_key(file_path)
-            except ValueError:
-                # Path is outside repo, use as-is
-                manifest_key = str(Path(file_path).as_posix())
+        # file_path is always a manifest key from _resolve_manifest_paths()
+        manifest_key = str(file_path)
 
         # Convert manifest key to absolute filesystem path for operations
         filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
