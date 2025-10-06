@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import click
 
 # Import CLI functions
-from s3lfs.cli import find_git_root, get_manifest_path, resolve_path_from_git_root
+from s3lfs.cli import find_git_root, get_manifest_path
 
 
 class TestCLIErrorHandling(unittest.TestCase):
@@ -52,54 +52,8 @@ class TestCLIErrorHandling(unittest.TestCase):
         result = find_git_root("/nonexistent/path")
         self.assertIsNone(result)
 
-    def test_resolve_path_from_git_root_absolute_path(self):
-        """Test resolve_path_from_git_root with absolute path."""
-        git_root = Path("/git/root")
-        result = resolve_path_from_git_root("/absolute/path", git_root)
-        self.assertEqual(result, "/absolute/path")
-
-    def test_resolve_path_from_git_root_none_path(self):
-        """Test resolve_path_from_git_root with None path."""
-        git_root = Path("/git/root")
-        result = resolve_path_from_git_root(None, git_root)
-        self.assertIsNone(result)
-
-    def test_resolve_path_from_git_root_empty_path(self):
-        """Test resolve_path_from_git_root with empty path."""
-        git_root = Path("/git/root")
-        result = resolve_path_from_git_root("", git_root)
-        self.assertEqual(result, "")
-
-    def test_resolve_path_from_git_root_outside_git_repo(self):
-        """Test resolve_path_from_git_root when path is outside git repo."""
-        with patch("pathlib.Path.cwd") as mock_cwd:
-            mock_cwd.return_value = Path("/outside/git/repo")
-
-            git_root = Path("/git/root")
-            result = resolve_path_from_git_root("some_file.txt", git_root)
-            self.assertEqual(result, "some_file.txt")
-
-    def test_resolve_path_from_git_root_at_git_root(self):
-        """Test resolve_path_from_git_root when at git root."""
-        with patch("pathlib.Path.cwd") as mock_cwd:
-            git_root = Path("/git/root")
-            mock_cwd.return_value = git_root
-
-            result = resolve_path_from_git_root("some_file.txt", git_root)
-            self.assertEqual(result, "some_file.txt")
-
-    def test_resolve_path_from_git_root_resolved_path_outside_git_root(self):
-        """Test resolve_path_from_git_root when resolved path is outside git root."""
-        with patch("pathlib.Path.cwd") as mock_cwd:
-            git_root = Path("/git/root")
-            mock_cwd.return_value = Path("/git/root/subdir")
-
-            # Mock the resolve() to return a path outside git root
-            with patch("pathlib.Path.resolve") as mock_resolve:
-                mock_resolve.return_value = Path("/outside/git/root/file.txt")
-
-                result = resolve_path_from_git_root("file.txt", git_root)
-                self.assertEqual(result, "file.txt")
+    # Note: Path resolution tests moved to test_path_resolver.py
+    # The old resolve_path_from_git_root() function has been replaced by PathResolver
 
     def test_get_manifest_path(self):
         """Test get_manifest_path function."""
