@@ -565,8 +565,9 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         # Track with cache disabled
         self.versioner.track(str(test_file), use_cache=False, interleaved=False)
 
-        # File should be in manifest
-        self.assertIn(str(test_file), self.versioner.manifest["files"])
+        # File should be in manifest (as relative path)
+        manifest_key = self.versioner.path_resolver.to_manifest_key(test_file)
+        self.assertIn(manifest_key, self.versioner.manifest["files"])
 
         # Cache should be empty since we didn't use it
         self.assertEqual(len(self.versioner.hash_cache), 0)
@@ -579,8 +580,9 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         # Track with cache disabled
         self.versioner.track_interleaved(str(test_file), use_cache=False)
 
-        # File should be in manifest
-        self.assertIn(str(test_file), self.versioner.manifest["files"])
+        # File should be in manifest (as relative path)
+        manifest_key = self.versioner.path_resolver.to_manifest_key(test_file)
+        self.assertIn(manifest_key, self.versioner.manifest["files"])
 
         # Cache should be empty since we didn't use it
         self.assertEqual(len(self.versioner.hash_cache), 0)
@@ -647,6 +649,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         file_path, file_hash, uploaded, bytes_transferred = result
 
         # Should have computed hash and uploaded
+        # file_path should be returned as-is (the input path)
         self.assertEqual(file_path, str(test_file))
         self.assertIsInstance(file_hash, str)
         self.assertTrue(uploaded)  # Should be uploaded since not in manifest
@@ -654,6 +657,9 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
         # Cache should still be empty
         self.assertEqual(len(self.versioner.hash_cache), 0)
+
+        # Note: _hash_and_upload_worker calls upload with needs_immediate_update=False,
+        # so the manifest is not updated immediately. This is by design for batch operations.
 
     def test_hash_and_download_worker_with_cache_disabled(self):
         """Test _hash_and_download_worker with use_cache=False."""
@@ -667,9 +673,12 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         # Remove local file
         test_file.unlink()
 
+        # Get the manifest key for the file
+        manifest_key = self.versioner.path_resolver.to_manifest_key(test_file)
+
         # Test the worker function directly with cache disabled
         result = self.versioner._hash_and_download_worker(
-            (str(test_file), expected_hash),
+            (manifest_key, expected_hash),
             silence=True,
             progress_callback=None,
             use_cache=False,
@@ -678,7 +687,8 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         file_path, downloaded, bytes_transferred = result
 
         # Should have downloaded the file
-        self.assertEqual(file_path, str(test_file))
+        # file_path should be the manifest key (relative path)
+        self.assertEqual(file_path, manifest_key)
         self.assertTrue(downloaded)
         self.assertGreater(bytes_transferred, 0)
 
@@ -709,8 +719,9 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         # Cache should still be empty
         self.assertEqual(len(self.versioner.hash_cache), 0)
 
-        # But file should still be tracked properly
-        self.assertIn(str(test_file), self.versioner.manifest["files"])
+        # But file should still be tracked properly (as manifest key)
+        manifest_key = self.versioner.path_resolver.to_manifest_key(test_file)
+        self.assertIn(manifest_key, self.versioner.manifest["files"])
 
     # Edge Cases and Missing Tests
     def test_hash_file_empty_file_auto_method(self):
