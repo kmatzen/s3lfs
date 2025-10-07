@@ -1,63 +1,51 @@
 import json
-import os
 from pathlib import Path
 
 import click
 import yaml
 
+from s3lfs import metrics
 from s3lfs.core import S3LFS
+from s3lfs.path_resolver import PathResolver
+from s3lfs.utils import find_git_root
 
 
-def find_git_root(start_path=None, git_finder_func=None):
+def _setup_s3lfs_command(cli_path=None, require_manifest=True):
     """
-    Find the git repository root by walking up the directory tree.
+    Common setup for S3LFS CLI commands.
+
+    Finds git root, checks manifest exists, creates PathResolver, and optionally
+    resolves a CLI path argument to a manifest key.
 
     Args:
-        start_path: Starting path to search from (defaults to current directory)
-        git_finder_func: Custom function to find git root (for testing)
+        cli_path: Optional path argument from CLI to resolve to manifest key
+        require_manifest: If True, raises error if manifest doesn't exist
 
     Returns:
-        Path object pointing to the git repository root, or None if not found
+        If cli_path is None: (git_root, manifest_path, path_resolver)
+        If cli_path is provided: (git_root, manifest_path, path_resolver, manifest_key)
+
+    Raises:
+        click.Abort: If git root not found or manifest doesn't exist
     """
-    if git_finder_func:
-        return git_finder_func(start_path)
+    git_root = find_git_root()
+    if not git_root:
+        click.echo("Error: Not in a git repository")
+        raise click.Abort()
 
-    if start_path is None:
-        start_path = Path.cwd()
-    else:
-        start_path = Path(start_path)
+    manifest_path = get_manifest_path(git_root)
+    if require_manifest and not manifest_path.exists():
+        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
+        raise click.Abort()
 
-    current = start_path.resolve()
+    path_resolver = PathResolver(git_root)
 
-    while current != current.parent:
-        if (current / ".git").exists():
-            return current
-        current = current.parent
+    # If a CLI path is provided, resolve it to a manifest key
+    if cli_path is not None:
+        manifest_key = path_resolver.from_cli_input(cli_path, cwd=Path.cwd())
+        return git_root, manifest_path, path_resolver, manifest_key
 
-    return None
-
-
-def resolve_path_from_git_root(path_arg, git_root):
-    """
-    Resolve a path argument relative to the git repository root.
-
-    Args:
-        path_arg: The path argument from the CLI
-        git_root: Path to the git repository root
-
-    Returns:
-        Resolved path relative to git root
-    """
-    if not path_arg:
-        return path_arg
-
-    # If path is absolute, return as-is
-    if os.path.isabs(path_arg):
-        return path_arg
-
-    # The path argument should be relative to the git root, not the current directory
-    # So we just return it as-is, since it's already relative to git root
-    return path_arg
+    return git_root, manifest_path, path_resolver
 
 
 def get_manifest_path(git_root):
@@ -138,21 +126,28 @@ def init(bucket, prefix, no_sign_request, use_acceleration):
 @click.option(
     "--modified", is_flag=True, help="Track only modified files from manifest"
 )
-def track(path, no_sign_request, use_acceleration, verbose, modified):
+@click.option(
+    "--metrics",
+    "enable_metrics_flag",
+    is_flag=True,
+    help="Enable parallelism metrics collection",
+)
+def track(
+    path, no_sign_request, use_acceleration, verbose, modified, enable_metrics_flag
+):
     """Track files, directories, or globs. Use --modified to track only changed files."""
-    # Find git root and resolve path
-    git_root = find_git_root()
-    if not git_root:
-        click.echo("Error: Not in a git repository")
-        raise click.Abort()
+    # Enable metrics if requested
+    if enable_metrics_flag:
+        metrics.enable_metrics()
 
-    manifest_path = get_manifest_path(git_root)
-    if not manifest_path.exists():
-        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
-        raise click.Abort()
-
-    # Resolve path if provided
-    resolved_path = resolve_path_from_git_root(path, git_root) if path else None
+    # Common setup: find git root, check manifest, resolve path
+    if path:
+        git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
+            cli_path=path
+        )
+    else:
+        git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+        manifest_key = None
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
@@ -163,10 +158,11 @@ def track(path, no_sign_request, use_acceleration, verbose, modified):
     if modified:
         # Track only modified files using cached version for better performance
         s3lfs.track_modified_files_cached(silence=not verbose)
-    elif resolved_path:
-        # Track specific path
+    elif manifest_key:
+        # FILESYSTEM GLOB: Find files on disk and upload them
+        # The manifest_key is converted to a filesystem path, then glob is applied
         s3lfs.track(
-            resolved_path, silence=not verbose, interleaved=True, use_cache=False
+            manifest_key, silence=not verbose, interleaved=True, use_cache=False
         )
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
@@ -185,36 +181,28 @@ def track(path, no_sign_request, use_acceleration, verbose, modified):
     help="Show detailed progress and download size information",
 )
 @click.option("--all", is_flag=True, help="Checkout all files from manifest")
-def checkout(path, no_sign_request, use_acceleration, verbose, all):
+@click.option(
+    "--metrics",
+    "enable_metrics_flag",
+    is_flag=True,
+    help="Enable parallelism metrics collection",
+)
+def checkout(
+    path, no_sign_request, use_acceleration, verbose, all, enable_metrics_flag
+):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
-    # Find git root and resolve path
-    git_root = find_git_root()
-    if not git_root:
-        click.echo("Error: Not in a git repository")
-        raise click.Abort()
+    # Enable metrics if requested
+    if enable_metrics_flag:
+        metrics.enable_metrics()
 
-    manifest_path = get_manifest_path(git_root)
-    if not manifest_path.exists():
-        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
-        raise click.Abort()
-
-    # Get current working directory relative to git root
-    cwd = Path.cwd()
-    try:
-        relative_cwd = cwd.relative_to(git_root)
-    except ValueError:
-        relative_cwd = Path(".")
-
-    # Resolve path if provided, considering current working directory context
+    # Common setup: find git root, check manifest, resolve path
     if path:
-        if relative_cwd != Path("."):
-            # If we're in a subdirectory, prepend the current directory to the path
-            resolved_path = f"{relative_cwd}/{path}"
-        else:
-            # If we're at git root, use the path as-is
-            resolved_path = path
+        git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
+            cli_path=path
+        )
     else:
-        resolved_path = None
+        git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+        manifest_key = None
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
@@ -225,9 +213,10 @@ def checkout(path, no_sign_request, use_acceleration, verbose, all):
     if all:
         # Download all files from manifest
         s3lfs.parallel_download_all(silence=not verbose)
-    elif resolved_path:
-        # Checkout specific path
-        s3lfs.checkout(resolved_path, silence=not verbose)
+    elif manifest_key:
+        # MANIFEST GLOB: Find files in manifest and download them
+        # The manifest_key is matched against manifest entries (files may not exist on disk)
+        s3lfs.checkout(manifest_key, silence=not verbose)
     else:
         click.echo("Error: Must provide either a path or use --all flag")
         raise click.Abort()
@@ -247,27 +236,39 @@ def checkout(path, no_sign_request, use_acceleration, verbose, all):
 @click.option("--all", is_flag=True, help="List all tracked files from manifest")
 def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=None):
     """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
-    # Find git root and resolve path
-    git_root = find_git_root(git_finder_func=git_finder_func)
-    if not git_root:
-        click.echo("Error: Not in a git repository")
-        raise click.Abort()
+    # Common setup: find git root, check manifest, resolve path
+    # Note: git_finder_func is for testing purposes only
+    if git_finder_func:
+        # Test mode: use custom git finder
+        git_root = find_git_root(git_finder_func=git_finder_func)
+        if not git_root:
+            click.echo("Error: Not in a git repository")
+            raise click.Abort()
+        manifest_path = get_manifest_path(git_root)
+        if not manifest_path.exists():
+            click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
+            raise click.Abort()
+        path_resolver = PathResolver(git_root)
+        # Resolve path if provided
+        manifest_key = (
+            path_resolver.from_cli_input(path, cwd=Path.cwd()) if path else None
+        )
+    else:
+        # Normal mode: use helper function
+        if path:
+            git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
+                cli_path=path
+            )
+        else:
+            git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+            manifest_key = None
 
-    manifest_path = get_manifest_path(git_root)
-    if not manifest_path.exists():
-        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
-        raise click.Abort()
-
-    # Get current working directory relative to git root
+    # Get current working directory relative to git root for output stripping
     cwd = Path.cwd()
     try:
         relative_cwd = cwd.relative_to(git_root)
     except ValueError:
         relative_cwd = Path(".")
-
-    # For ls command, don't resolve the path - use it as-is for filtering
-    # But we'll strip the current directory prefix from output
-    resolved_path = path
 
     s3lfs = S3LFS(
         no_sign_request=no_sign_request,
@@ -275,16 +276,17 @@ def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=No
         use_acceleration=use_acceleration,
     )
 
-    if all or not resolved_path:
+    if all or not manifest_key:
         # List all files from manifest (default behavior when no path provided)
         s3lfs.list_all_files(
             verbose=verbose,
             strip_prefix=str(relative_cwd) if relative_cwd != Path(".") else None,
         )
     else:
-        # List specific path (using original path argument, not resolved)
+        # MANIFEST GLOB: Find files in manifest and display them
+        # The manifest_key is matched against manifest entries
         s3lfs.list_files(
-            resolved_path,
+            manifest_key,
             verbose=verbose,
             strip_prefix=str(relative_cwd) if relative_cwd != Path(".") else None,
         )
@@ -299,19 +301,10 @@ def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=No
 )
 def remove(path, purge_from_s3, no_sign_request, use_acceleration):
     """Remove files or directories from tracking. Supports glob patterns."""
-    # Find git root and resolve path
-    git_root = find_git_root()
-    if not git_root:
-        click.echo("Error: Not in a git repository")
-        raise click.Abort()
-
-    manifest_path = get_manifest_path(git_root)
-    if not manifest_path.exists():
-        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
-        raise click.Abort()
-
-    # Resolve path
-    resolved_path = resolve_path_from_git_root(path, git_root)
+    # Common setup: find git root, check manifest, resolve path
+    git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
+        cli_path=path
+    )
 
     versioner = S3LFS(
         no_sign_request=no_sign_request,
@@ -319,13 +312,19 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
         use_acceleration=use_acceleration,
     )
 
-    # Check if path is a directory pattern or single file
-    if Path(resolved_path).is_dir() or "*" in resolved_path or "?" in resolved_path:
-        # Handle as directory/pattern - use remove_subtree logic
-        versioner.remove_subtree(resolved_path, keep_in_s3=not purge_from_s3)
+    # Check if this is a single file (no glob, not a directory)
+    has_glob = "*" in manifest_key or "?" in manifest_key or "[" in manifest_key
+    filesystem_path = path_resolver.to_filesystem_path(manifest_key)
+    is_single_file = not has_glob and filesystem_path.is_file()
+
+    if is_single_file:
+        # Optimize single file removal
+        versioner.remove_file(manifest_key, keep_in_s3=not purge_from_s3)
     else:
-        # Handle as single file
-        versioner.remove_file(resolved_path, keep_in_s3=not purge_from_s3)
+        # MANIFEST GLOB: Find files in manifest and remove them
+        # The manifest_key is matched against manifest entries
+        # Note: This is manifest-only; files on disk are not affected
+        versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
 
 
 @click.command()
