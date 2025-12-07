@@ -221,7 +221,7 @@ s3lfs track "*.pkl"                      # Tracks models/*.pkl files
 s3lfs ls --verbose                       # Lists with detailed info (shows full paths)
 ```
 
-**Note**: The `ls` command shows paths relative to your current directory when run from a subdirectory. For example, if you're in the `GoProProcessed/` directory, `s3lfs ls` will show `file1.mp4` instead of `GoProProcessed/file1.mp4`. This provides a local view of tracked files. In non-verbose mode, the output is pipe-friendly with one file path per line.
+**Note**: The `ls` command shows paths relative to your current directory when run from a subdirectory. For example, if you're in the `foo/` directory, `s3lfs ls` will show `file1.mp4` instead of `foo/file1.mp4`. This provides a local view of tracked files. In non-verbose mode, the output is pipe-friendly with one file path per line.
 
 ### 8. Cleanup (Experimental)
 Periodically clean up unreferenced files (use with caution - this feature is untested):
