@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parallel uploads/downloads with multi-threading
 - Gzip compression before upload
 - Flexible path resolution (files, directories, glob patterns)
-- S3 Transfer Acceleration support
+- YAML-based manifest file (`.s3_manifest.yaml`)
 - CLI commands: `init`, `track`, `checkout`, `ls`, `remove`, `cleanup`
 - Subdirectory support - all commands work from any directory within git repo
 - `--modified` flag to track only changed files

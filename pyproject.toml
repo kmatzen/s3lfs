@@ -1,13 +1,11 @@
-[tool.poetry]
+[project]
 name = "s3lfs"
 version = "0.1.0"
 description = "A Python-based version control system for large assets using Amazon S3."
-authors = ["Kevin Blackburn-Matzen <kmatzen@gmail.com>"]
-license = "MIT"
+authors = [{name = "Kevin Blackburn-Matzen", email = "kmatzen@gmail.com"}]
+license = {text = "MIT"}
 readme = "README.md"
-homepage = "https://github.com/kmatzen/s3lfs"
-repository = "https://github.com/kmatzen/s3lfs"
-documentation = "https://github.com/kmatzen/s3lfs#readme"
+requires-python = ">=3.9"
 keywords = ["s3", "lfs", "git", "large-files", "aws", "storage", "version-control"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -24,48 +22,54 @@ classifiers = [
     "Topic :: System :: Archiving",
     "Typing :: Typed",
 ]
-packages = [{include = "s3lfs"}]
+dependencies = [
+    "boto3>=1.28.0",
+    "tqdm>=4.64.0",
+    "click>=8.1.8",
+    "portalocker>=3.1.1",
+    "pyyaml>=6.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-boto3 = "^1.28.0"
-tqdm = "^4.64.0"
-click = "^8.1.8"
-portalocker = "^3.1.1"
-pyyaml = "^6.0"
-
-[tool.poetry.scripts]
+[project.scripts]
 s3lfs = "s3lfs.cli:main"
 
-[tool.poetry.group.dev.dependencies]
-pytest-cov = "<6.0.0"
-pytest = "^7.0"
-pytest-mock = "^3.7.0"
-coverage = "^6.0"
-black = "^22.0"
-pre-commit = "^4.2.0"
-moto = {extras = ["s3"], version = "^4.0.0"}
-mypy = "^1.0.0"
-types-boto3 = "^1.0.0"
-types-pyyaml = "^6.0.12.20250915"
+[project.urls]
+Homepage = "https://github.com/kmatzen/s3lfs"
+Repository = "https://github.com/kmatzen/s3lfs"
+Documentation = "https://github.com/kmatzen/s3lfs#readme"
+"Bug Tracker" = "https://github.com/kmatzen/s3lfs/issues"
+Changelog = "https://github.com/kmatzen/s3lfs/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov<6.0.0",
+    "pytest-mock>=3.7.0",
+    "coverage>=6.0",
+    "black>=22.0",
+    "pre-commit>=4.2.0",
+    "moto[s3]>=4.0.0,<5.0.0",
+    "mypy>=1.0.0",
+    "types-boto3>=1.0.0",
+    "types-pyyaml>=6.0.12",
+]
 
 [tool.mypy]
 python_version = "3.9"
-warn_return_any = false  # Start lenient
+warn_return_any = false
 warn_unused_configs = true
-disallow_untyped_defs = false  # Start lenient, can be made stricter later
+disallow_untyped_defs = false
 disallow_incomplete_defs = false
 check_untyped_defs = true
 disallow_untyped_decorators = false
 no_implicit_optional = true
 warn_redundant_casts = true
-warn_unused_ignores = false  # Allow unused ignores for now
-warn_no_return = false  # Allow missing returns for now
-warn_unreachable = false  # Allow unreachable code for now
+warn_unused_ignores = false
+warn_no_return = false
+warn_unreachable = false
 strict_equality = true
 ignore_missing_imports = true
 
-# Specific module configurations
 [[tool.mypy.overrides]]
 module = [
     "moto.*",
@@ -74,10 +78,9 @@ module = [
 ]
 ignore_missing_imports = true
 
-[tool.poetry.urls]
-"Bug Tracker" = "https://github.com/kmatzen/s3lfs/issues"
-"Changelog" = "https://github.com/kmatzen/s3lfs/blob/main/CHANGELOG.md"
-
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["s3lfs"]

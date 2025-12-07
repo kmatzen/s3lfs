@@ -33,8 +33,8 @@ This project uses pre-commit hooks to ensure code quality and type safety. The h
 The hooks are already configured and can be installed with:
 
 ```bash
-poetry install
-poetry run pre-commit install
+uv sync
+uv run pre-commit install
 ```
 
 ## Running Hooks
@@ -45,13 +45,13 @@ Hooks run automatically on `git commit`. If any hook fails, the commit is blocke
 ### Manual
 Run all hooks on all files:
 ```bash
-poetry run pre-commit run --all-files
+uv run pre-commit run --all-files
 ```
 
 Run specific hook:
 ```bash
-poetry run pre-commit run mypy --all-files
-poetry run pre-commit run black --all-files
+uv run pre-commit run mypy --all-files
+uv run pre-commit run black --all-files
 ```
 
 ## Type Checking Configuration
