@@ -12,3 +12,9 @@ coverage.xml
 .coverage*
 .s3lfs_temp/
 *_cache.yaml
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
