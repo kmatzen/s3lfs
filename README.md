@@ -17,7 +17,14 @@ A Python-based version control system for large assets using Amazon S3. This sys
 
 ## Installation
 
-Install the required dependencies:
+### From PyPI (Recommended)
+
+```sh
+pip install s3lfs
+```
+
+### From Source
+
 ```sh
 pip install poetry
 poetry install

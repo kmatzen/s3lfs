@@ -2,9 +2,29 @@
 name = "s3lfs"
 version = "0.1.0"
 description = "A Python-based version control system for large assets using Amazon S3."
-authors = ["Kevin Blackburn-Matzen <matzen@adobe.com>"]
+authors = ["Kevin Blackburn-Matzen <kmatzen@gmail.com>"]
 license = "MIT"
 readme = "README.md"
+homepage = "https://github.com/kmatzen/s3lfs"
+repository = "https://github.com/kmatzen/s3lfs"
+documentation = "https://github.com/kmatzen/s3lfs#readme"
+keywords = ["s3", "lfs", "git", "large-files", "aws", "storage", "version-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control",
+    "Topic :: System :: Archiving",
+    "Typing :: Typed",
+]
+packages = [{include = "s3lfs"}]
 
 [tool.poetry.dependencies]
 python = "^3.9"
@@ -53,6 +73,10 @@ module = [
     "tqdm.*",
 ]
 ignore_missing_imports = true
+
+[tool.poetry.urls]
+"Bug Tracker" = "https://github.com/kmatzen/s3lfs/issues"
+"Changelog" = "https://github.com/kmatzen/s3lfs/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
