@@ -1,0 +1,28 @@
+# Example: Checkout all s3lfs-tracked files in CI
+#
+# Copy this file to .github/workflows/ and adjust to your needs.
+# Requires AWS credentials configured via aws-actions/configure-aws-credentials
+# or environment variables.
+
+name: Build with s3lfs assets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - uses: kmatzen/s3lfs@main
+        with:
+          checkout: all
