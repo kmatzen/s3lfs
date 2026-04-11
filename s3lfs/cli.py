@@ -86,7 +86,12 @@ def cli():
 @click.option(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
-def init(bucket, prefix, no_sign_request, use_acceleration):
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage (e.g. MinIO, R2, Wasabi)",
+)
+def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
     """Initialize S3LFS with a bucket and repo prefix"""
     # Find git root
     git_root = find_git_root()
@@ -106,6 +111,7 @@ def init(bucket, prefix, no_sign_request, use_acceleration):
             repo_prefix=prefix,
             no_sign_request=no_sign_request,
             use_acceleration=use_acceleration,
+            endpoint_url=endpoint_url,
         )
         s3lfs.initialize_repo()
         print(f"✅ Repository initialized with bucket '{bucket}' and prefix '{prefix}'")
@@ -121,6 +127,11 @@ def init(bucket, prefix, no_sign_request, use_acceleration):
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
 @click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option(
     "--verbose", is_flag=True, help="Show detailed progress and upload information"
 )
 @click.option(
@@ -133,7 +144,13 @@ def init(bucket, prefix, no_sign_request, use_acceleration):
     help="Enable parallelism metrics collection",
 )
 def track(
-    path, no_sign_request, use_acceleration, verbose, modified, enable_metrics_flag
+    path,
+    no_sign_request,
+    use_acceleration,
+    endpoint_url,
+    verbose,
+    modified,
+    enable_metrics_flag,
 ):
     """Track files, directories, or globs. Use --modified to track only changed files."""
     # Enable metrics if requested
@@ -153,6 +170,7 @@ def track(
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
     )
 
     if modified:
@@ -176,6 +194,11 @@ def track(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
 @click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option(
     "--verbose",
     is_flag=True,
     help="Show detailed progress and download size information",
@@ -188,7 +211,13 @@ def track(
     help="Enable parallelism metrics collection",
 )
 def checkout(
-    path, no_sign_request, use_acceleration, verbose, all, enable_metrics_flag
+    path,
+    no_sign_request,
+    use_acceleration,
+    endpoint_url,
+    verbose,
+    all,
+    enable_metrics_flag,
 ):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
     # Enable metrics if requested
@@ -208,6 +237,7 @@ def checkout(
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
     )
 
     if all:
@@ -234,7 +264,14 @@ def checkout(
     help="Show detailed information including file sizes and hashes",
 )
 @click.option("--all", is_flag=True, help="List all tracked files from manifest")
-def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=None):
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def ls(
+    path, no_sign_request, use_acceleration, verbose, all, endpoint_url, git_finder_func=None
+):
     """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
     # Common setup: find git root, check manifest, resolve path
     # Note: git_finder_func is for testing purposes only
@@ -274,6 +311,7 @@ def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=No
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
     )
 
     if all or not manifest_key:
@@ -299,7 +337,12 @@ def ls(path, no_sign_request, use_acceleration, verbose, all, git_finder_func=No
 @click.option(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
-def remove(path, purge_from_s3, no_sign_request, use_acceleration):
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url):
     """Remove files or directories from tracking. Supports glob patterns."""
     # Common setup: find git root, check manifest, resolve path
     git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
@@ -310,6 +353,7 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
     )
 
     # Check if this is a single file (no glob, not a directory)
@@ -333,7 +377,12 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration):
 @click.option(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
-def cleanup(force, no_sign_request, use_acceleration):
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def cleanup(force, no_sign_request, use_acceleration, endpoint_url):
     """Clean up unreferenced files from S3."""
     # Find git root
     git_root = find_git_root()
@@ -350,6 +399,7 @@ def cleanup(force, no_sign_request, use_acceleration):
         no_sign_request=no_sign_request,
         manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
     )
     versioner.cleanup_s3(force=force)
 
