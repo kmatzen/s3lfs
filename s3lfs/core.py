@@ -238,8 +238,8 @@ class S3LFS:
             # If not in a git repo, use manifest directory
             self.path_resolver = PathResolver(manifest_dir)
 
-        self._shutdown_requested = False  # Flag to track shutdown requests
-        signal.signal(signal.SIGINT, self._handle_sigint)  # Register signal handler
+        self._shutdown_requested = False
+        signal.signal(signal.SIGINT, self._handle_sigint)
 
     def _handle_sigint(self, signum, frame):
         """
@@ -1197,8 +1197,9 @@ class S3LFS:
                     context_manager = contextlib.nullcontext()
 
                 with context_manager:
-                    # Compute the local MD5 checksum (streaming to avoid
-                    # loading the entire chunk into memory)
+                    upload_key = s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}"
+
+                    # Compute the local MD5 checksum (streaming)
                     md5_hash = hashlib.md5()
                     with open(path, "rb") as f:
                         while True:
@@ -1208,35 +1209,25 @@ class S3LFS:
                             md5_hash.update(block)
                     local_md5 = md5_hash.hexdigest()
 
-                    # Check if the file already exists in S3 with the same MD5
+                    # Check if the file already exists in S3
                     try:
                         s3_object = self._get_s3_client().head_object(
                             Bucket=self.bucket_name,
-                            Key=s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
+                            Key=upload_key,
                         )
-                        s3_etag = s3_object["ETag"].strip(
-                            '"'
-                        )  # Remove quotes from ETag
+                        s3_etag = s3_object["ETag"].strip('"')
                         if local_md5 == s3_etag:
                             if not silence:
                                 print(
-                                    f"Skipping upload for {path}, already exists in S3 with matching MD5."
+                                    f"Skipping upload for {path}, "
+                                    f"already exists in S3."
                                 )
-                            # Update progress for skipped file
                             if progress_callback:
                                 progress_callback(file_size)
                             continue
-                        else:
-                            if not silence:
-                                print(
-                                    f"MD5 mismatch for {path}: {local_md5}/{s3_etag}, uploading new version."
-                                )
                     except ClientError as e:
                         if e.response["Error"]["Code"] != "404":
-                            raise  # Re-raise if it's not a "Not Found" error
-
-                    # Proceed with the upload if MD5 does not match or file does not exist
-                    upload_key = s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}"
+                            raise
                     with metrics.track("s3_upload", str(path)):
                         with open(path, "rb") as f:
                             self._get_s3_client().upload_fileobj(
@@ -2698,48 +2689,44 @@ class S3LFS:
 
         compressed_path = self.temp_dir / f"{uuid4()}.gz"
 
-        chunk_keys = self._get_s3_client().list_objects_v2(
+        chunk_resp = self._get_s3_client().list_objects_v2(
             Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
         )
-        chunk_keys = [ck["Key"] for ck in chunk_keys.get("Contents", [])]
-        chunk_keys_sorted = []
-        for i in range(len(chunk_keys)):
-            chunk_keys_sorted.append(f"{s3_key}.chunk{i}")
-        chunk_keys = chunk_keys_sorted
+        chunk_contents = chunk_resp.get("Contents", [])
 
-        if chunk_keys:
-            keys = chunk_keys
+        # Build key list and size map from list_objects_v2 response
+        # (avoids separate head_object calls for chunked files)
+        key_sizes = {}
+        if chunk_contents:
+            for i in range(len(chunk_contents)):
+                k = f"{s3_key}.chunk{i}"
+                for obj in chunk_contents:
+                    if obj["Key"] == k:
+                        key_sizes[k] = obj["Size"]
+                        break
+            keys = list(key_sizes.keys())
         else:
             keys = [s3_key]
+            obj = self._get_s3_client().head_object(Bucket=self.bucket_name, Key=s3_key)
+            key_sizes[s3_key] = obj["ContentLength"]
 
-        base_directrory = os.path.dirname(compressed_path)
-        os.makedirs(base_directrory, exist_ok=True)
+        base_directory = os.path.dirname(compressed_path)
+        os.makedirs(base_directory, exist_ok=True)
 
         target_paths = []
-        total_file_size = 0
+        total_file_size = sum(key_sizes.values())
 
-        # First pass: discover total size and notify progress callback
-        for idx, key in enumerate(keys):
-            obj = self._get_s3_client().head_object(Bucket=self.bucket_name, Key=key)
-            total_file_size += obj["ContentLength"]
-
-        # Notify progress callback of total size discovery (for dynamic progress bar)
         if progress_callback:
             try:
-                # Try to call with file_size parameter for dynamic progress bar
                 progress_callback(0, **{"file_size": total_file_size})
             except TypeError:
-                # Fallback: callback doesn't support file_size parameter
                 pass
 
         for idx, key in enumerate(keys):
             try:
                 target_path = self.temp_dir / f"{uuid4()}.gz"
                 target_paths.append(target_path)
-                obj = self._get_s3_client().head_object(
-                    Bucket=self.bucket_name, Key=key
-                )
-                file_size = obj["ContentLength"]
+                file_size = key_sizes[key]
 
                 # Set up progress callback and context manager
                 if progress_callback:
@@ -2783,7 +2770,7 @@ class S3LFS:
             except Exception as e:
                 print(f"❌ Error downloading {key}: {e}")
 
-        if chunk_keys:
+        if chunk_contents:
             compressed_path = self.merge_files(compressed_path, target_paths)
             for path in target_paths:
                 os.remove(path)
