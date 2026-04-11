@@ -270,7 +270,13 @@ def checkout(
     help="Custom S3 endpoint URL for S3-compatible storage",
 )
 def ls(
-    path, no_sign_request, use_acceleration, verbose, all, endpoint_url, git_finder_func=None
+    path,
+    no_sign_request,
+    use_acceleration,
+    verbose,
+    all,
+    endpoint_url,
+    git_finder_func=None,
 ):
     """List tracked files, directories, or globs. If no path is provided, lists all tracked files."""
     # Common setup: find git root, check manifest, resolve path
