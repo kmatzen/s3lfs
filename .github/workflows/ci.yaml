@@ -90,4 +90,4 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           S3LFS_TEST_ENDPOINT: http://localhost:9000
           S3LFS_TEST_BUCKET: integration-test
-        run: uv run pytest test_integration_minio.py -v
+        run: uv run pytest tests/test_integration_minio.py -v
