@@ -1,4 +1,3 @@
-import json
 import os
 import tempfile
 import unittest
@@ -119,7 +118,7 @@ class TestEndpointUrl(unittest.TestCase):
             mock_client = Mock()
             mock_boto3_client.return_value = mock_client
 
-            s3lfs = S3LFS(
+            S3LFS(
                 bucket_name="test-bucket",
                 repo_prefix="test-prefix",
                 endpoint_url="http://localhost:9000",
@@ -157,9 +156,7 @@ class TestEndpointUrl(unittest.TestCase):
             s3lfs._get_s3_client()
 
             call_args = mock_boto3_client.call_args
-            self.assertEqual(
-                call_args[1]["endpoint_url"], "http://minio.internal:9000"
-            )
+            self.assertEqual(call_args[1]["endpoint_url"], "http://minio.internal:9000")
 
     def test_endpoint_url_parameter_overrides_manifest(self):
         """Test that endpoint_url parameter takes precedence over manifest value."""
@@ -188,9 +185,7 @@ class TestEndpointUrl(unittest.TestCase):
             # Manifest should be updated with the new value
             with open(self.manifest_file, "r") as f:
                 saved_manifest = yaml.safe_load(f)
-            self.assertEqual(
-                saved_manifest["endpoint_url"], "http://new-endpoint:9000"
-            )
+            self.assertEqual(saved_manifest["endpoint_url"], "http://new-endpoint:9000")
 
     def test_endpoint_url_stored_by_initialize_repo(self):
         """Test that initialize_repo persists endpoint_url to manifest."""
@@ -309,9 +304,7 @@ class TestEndpointUrlCli(unittest.TestCase):
             mock_client = Mock()
             mock_boto3_client.return_value = mock_client
             mock_client.upload_fileobj = Mock()
-            mock_client.head_object = Mock(
-                side_effect=Exception("not found")
-            )
+            mock_client.head_object = Mock(side_effect=Exception("not found"))
 
             result = runner.invoke(
                 cli,
