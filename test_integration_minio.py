@@ -22,17 +22,16 @@ from pathlib import Path
 import yaml
 from click.testing import CliRunner
 
-# Skip the entire module if MinIO is not configured
+from s3lfs.cli import cli
+from s3lfs.core import S3LFS
+
 ENDPOINT = os.environ.get("S3LFS_TEST_ENDPOINT")
 BUCKET = os.environ.get("S3LFS_TEST_BUCKET")
 
-if not ENDPOINT or not BUCKET:
-    raise unittest.SkipTest("S3LFS_TEST_ENDPOINT and S3LFS_TEST_BUCKET not set")
-
-from s3lfs.cli import cli  # noqa: E402
-from s3lfs.core import S3LFS  # noqa: E402
+_skip_reason = "S3LFS_TEST_ENDPOINT and S3LFS_TEST_BUCKET not set"
 
 
+@unittest.skipUnless(ENDPOINT and BUCKET, _skip_reason)
 class TestMinIOWorkflow(unittest.TestCase):
     """Full workflow against a real MinIO server."""
 
@@ -285,6 +284,7 @@ class TestMinIOWorkflow(unittest.TestCase):
         self.assertFalse(Path(".git/hooks/pre-push").exists())
 
 
+@unittest.skipUnless(ENDPOINT and BUCKET, _skip_reason)
 class TestMinIOCoreAPI(unittest.TestCase):
     """Test the S3LFS Python API against a real MinIO server."""
 

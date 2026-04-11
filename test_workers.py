@@ -76,7 +76,7 @@ class TestWorkersParameter(unittest.TestCase):
         with patch("boto3.client") as mock_boto3:
             mock_boto3.return_value = Mock()
             s3lfs = S3LFS(bucket_name="test-bucket", workers=32)
-            concurrency = s3lfs.config.max_concurrency  # type: ignore[attr-defined]
+            concurrency = getattr(s3lfs.config, "max_concurrency")
             self.assertGreaterEqual(concurrency, 32)
 
     def test_max_concurrency_minimum_preserved(self):
@@ -84,7 +84,7 @@ class TestWorkersParameter(unittest.TestCase):
         with patch("boto3.client") as mock_boto3:
             mock_boto3.return_value = Mock()
             s3lfs = S3LFS(bucket_name="test-bucket", workers=2)
-            concurrency = s3lfs.config.max_concurrency  # type: ignore[attr-defined]
+            concurrency = getattr(s3lfs.config, "max_concurrency")
             self.assertGreaterEqual(concurrency, 15)
 
 

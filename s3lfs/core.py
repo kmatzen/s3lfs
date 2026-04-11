@@ -292,11 +292,11 @@ class S3LFS:
         with self._lock_context():
             # Store configuration in manifest
             if self.bucket_name is not None:
-                self.manifest["bucket_name"] = str(self.bucket_name)  # type: ignore
+                self.manifest["bucket_name"] = str(self.bucket_name)
             if self.repo_prefix is not None:
-                self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
+                self.manifest["repo_prefix"] = str(self.repo_prefix)
             if self.endpoint_url is not None:
-                self.manifest["endpoint_url"] = str(self.endpoint_url)  # type: ignore
+                self.manifest["endpoint_url"] = str(self.endpoint_url)
             self.save_manifest()
 
         # Update .gitignore to exclude cache files
