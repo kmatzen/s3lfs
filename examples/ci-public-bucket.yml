@@ -1,0 +1,21 @@
+# Example: Checkout from a public S3 bucket (no AWS credentials needed)
+#
+# Use --no-sign-request for public buckets. No aws-actions/configure-aws-credentials needed.
+
+name: Build with public assets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: kmatzen/s3lfs@main
+        with:
+          checkout: all
+          no-sign-request: "true"
