@@ -125,7 +125,7 @@ class TestCacheDirtyTracking(unittest.TestCase):
                 yaml.safe_dump(external_cache, f)
 
             # Force a different mtime
-            new_mtime = s3lfs._cache_mtime + 1
+            new_mtime = (s3lfs._cache_mtime or 0) + 1
             os.utime(s3lfs.cache_file, (new_mtime, new_mtime))
 
             s3lfs.load_cache()
@@ -159,28 +159,23 @@ class TestCacheDirtyTracking(unittest.TestCase):
         """hash_file_cached writes to cache file when computing a new hash."""
         with patch("boto3.client") as mock_boto3:
             mock_boto3.return_value = Mock()
-            s3lfs = S3LFS(bucket_name="test-bucket")
+            s3lfs_obj = S3LFS(bucket_name="test-bucket")
 
             test_file = Path("test_data.bin")
             test_file.write_bytes(b"hello")
 
             save_count = [0]
-            original_save = s3lfs.save_cache
+            original_save = s3lfs_obj.save_cache
 
             def counting_save():
                 save_count[0] += 1
                 return original_save()
 
-            s3lfs.save_cache = counting_save
+            with patch.object(s3lfs_obj, "save_cache", side_effect=counting_save):
+                s3lfs_obj.hash_file_cached(test_file)
 
-            s3lfs.hash_file_cached(test_file)
-
-            # save_cache should have been called because a new entry
-            # was added to the cache
             self.assertEqual(save_count[0], 1)
-
-            # After save, dirty flag is cleared
-            self.assertFalse(s3lfs._cache_dirty)
+            self.assertFalse(s3lfs_obj._cache_dirty)
 
 
 if __name__ == "__main__":
