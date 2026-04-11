@@ -164,6 +164,8 @@ class S3LFS:
         self.cache_file = self.manifest_file.parent / cache_file_name
 
         self.no_sign_request = no_sign_request
+        self._cache_mtime = None
+        self._cache_dirty = False
         self.load_manifest()
         self.load_cache()
 
@@ -381,31 +383,60 @@ class S3LFS:
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
-    def load_cache(self):
-        """Load the hash cache from a separate cache file (YAML or JSON format)."""
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, "r") as f:
-                    # Detect format based on extension
-                    if self.cache_file.suffix in [".yaml", ".yml"]:
-                        self.hash_cache = yaml.safe_load(f) or {}
-                    else:
-                        self.hash_cache = json.load(f)
-            except (json.JSONDecodeError, yaml.YAMLError, IOError) as e:
-                print(
-                    f"⚠️ Warning: Failed to load cache file, starting with empty cache: {e}"
-                )
+    def load_cache(self, force=False):
+        """Load the hash cache from a separate cache file.
+
+        Skips the disk read when the file's mtime has not changed since
+        the last load, unless *force* is True.
+        """
+        if not self.cache_file.exists():
+            # Only reset if we haven't already established that the
+            # file is absent (avoids clearing in-memory mutations
+            # between load-save cycles when the file doesn't exist yet).
+            if self._cache_mtime is not None or not hasattr(self, "hash_cache"):
                 self.hash_cache = {}
-        else:
+                self._cache_mtime = None
+                self._cache_dirty = False
+            return
+
+        try:
+            current_mtime = self.cache_file.stat().st_mtime
+        except OSError:
+            current_mtime = None
+
+        # Skip re-read if on-disk file hasn't changed
+        if (
+            not force
+            and self._cache_mtime is not None
+            and current_mtime == self._cache_mtime
+        ):
+            return
+
+        try:
+            with open(self.cache_file, "r") as f:
+                if self.cache_file.suffix in [".yaml", ".yml"]:
+                    self.hash_cache = yaml.safe_load(f) or {}
+                else:
+                    self.hash_cache = json.load(f)
+        except (json.JSONDecodeError, yaml.YAMLError, IOError) as e:
+            print(f"Warning: Failed to load cache file, starting with empty cache: {e}")
             self.hash_cache = {}
 
+        self._cache_mtime = current_mtime
+        self._cache_dirty = False
+
     def save_cache(self):
-        """Save the hash cache back to disk atomically (YAML or JSON format)."""
+        """Save the hash cache back to disk atomically.
+
+        Skips the write when nothing has changed since the last
+        load or save.
+        """
+        if hasattr(self, "_cache_dirty") and not self._cache_dirty:
+            return
+
         temp_file = self.cache_file.with_suffix(".tmp")
         try:
-            # Write the cache to a temporary file
             with open(temp_file, "w") as f:
-                # Detect format based on extension
                 if self.cache_file.suffix in [".yaml", ".yml"]:
                     yaml.safe_dump(
                         self.hash_cache, f, default_flow_style=False, sort_keys=True
@@ -413,12 +444,18 @@ class S3LFS:
                 else:
                     json.dump(self.hash_cache, f, indent=4, sort_keys=True)
 
-            # Atomically move the temporary file to the target location
             temp_file.replace(self.cache_file)
+
+            # Update mtime so subsequent load_cache() calls are no-ops
+            try:
+                self._cache_mtime = self.cache_file.stat().st_mtime
+            except OSError:
+                self._cache_mtime = None
+            self._cache_dirty = False
         except Exception as e:
-            print(f"❌ Failed to save cache: {e}")
+            print(f"Failed to save cache: {e}")
             if temp_file.exists():
-                temp_file.unlink()  # Clean up the temporary file
+                temp_file.unlink()
 
     def hash_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
         """
@@ -535,8 +572,9 @@ class S3LFS:
             self.hash_cache[file_path_str] = {
                 "hash": new_hash,
                 "metadata": current_metadata,
-                "timestamp": time.time(),  # When hash was computed
+                "timestamp": time.time(),
             }
+            self._cache_dirty = True
 
             # Save cache with updated data
             self.save_cache()
@@ -603,13 +641,15 @@ class S3LFS:
             if file_path is None:
                 # Clear all cache
                 self.hash_cache = {}
-                print("🗑 Cleared all hash cache entries.")
+                self._cache_dirty = True
+                print("Cleared all hash cache entries.")
             else:
                 # Clear cache for specific file
                 file_path_str = str(Path(file_path).as_posix())
                 if file_path_str in self.hash_cache:
                     del self.hash_cache[file_path_str]
-                    print(f"🗑 Cleared hash cache for '{file_path}'.")
+                    self._cache_dirty = True
+                    print(f"Cleared hash cache for '{file_path}'.")
 
             self.save_cache()
 
@@ -642,10 +682,11 @@ class S3LFS:
             # Remove stale entries
             for file_path_str in stale_entries:
                 del self.hash_cache[file_path_str]
+                self._cache_dirty = True
 
             if stale_entries:
-                print(f"🗑 Cleaned up {len(stale_entries)} stale cache entries.")
-                self.save_cache()  # Only save if changes were made
+                print(f"Cleaned up {len(stale_entries)} stale cache entries.")
+                self.save_cache()
 
     def track_modified_files_cached(self, silence=True):
         """
