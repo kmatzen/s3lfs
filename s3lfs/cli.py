@@ -771,6 +771,162 @@ def _remove_lfs_from_gitattributes(gitattributes_path, lfs_patterns):
     gitattributes_path.write_text(text)
 
 
+S3LFS_HOOK_START = "# >>> s3lfs hook >>>"
+S3LFS_HOOK_END = "# <<< s3lfs hook <<<"
+
+_POST_MERGE_BODY = """\
+# Auto-checkout s3lfs files after merge
+if command -v s3lfs >/dev/null 2>&1; then
+    s3lfs checkout --all 2>&1 || echo "s3lfs: warning: post-merge checkout failed"
+fi"""
+
+_POST_CHECKOUT_BODY = """\
+# Auto-checkout s3lfs files after checkout
+# Only run on branch checkouts ($3 == 1), not file checkouts
+if [ "$3" = "1" ] && command -v s3lfs >/dev/null 2>&1; then
+    s3lfs checkout --all 2>&1 || echo "s3lfs: warning: post-checkout checkout failed"
+fi"""
+
+_PRE_PUSH_BODY = """\
+# Auto-track modified s3lfs files before push
+if command -v s3lfs >/dev/null 2>&1; then
+    s3lfs track --modified 2>&1 || echo "s3lfs: warning: pre-push track failed"
+fi"""
+
+HOOK_SCRIPTS = {
+    "post-merge": S3LFS_HOOK_START + "\n" + _POST_MERGE_BODY + "\n" + S3LFS_HOOK_END,
+    "post-checkout": (
+        S3LFS_HOOK_START + "\n" + _POST_CHECKOUT_BODY + "\n" + S3LFS_HOOK_END
+    ),
+    "pre-push": S3LFS_HOOK_START + "\n" + _PRE_PUSH_BODY + "\n" + S3LFS_HOOK_END,
+}
+
+
+def _get_hooks_dir(git_root):
+    """Get the git hooks directory, respecting core.hooksPath config."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "core.hooksPath"],
+            capture_output=True,
+            text=True,
+            cwd=str(git_root),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            hooks_path = Path(result.stdout.strip())
+            if not hooks_path.is_absolute():
+                hooks_path = git_root / hooks_path
+            return hooks_path
+    except Exception:
+        pass
+    return git_root / ".git" / "hooks"
+
+
+def _install_hook(hooks_dir, hook_name, hook_block):
+    """Install an s3lfs hook block into a git hook file."""
+    hook_path = hooks_dir / hook_name
+    shebang = "#!/bin/sh\n"
+
+    if hook_path.exists():
+        content = hook_path.read_text()
+        if S3LFS_HOOK_START in content:
+            import re
+
+            pattern = re.escape(S3LFS_HOOK_START) + r".*?" + re.escape(S3LFS_HOOK_END)
+            content = re.sub(pattern, hook_block, content, flags=re.DOTALL)
+        else:
+            content = content.rstrip("\n") + "\n\n" + hook_block + "\n"
+    else:
+        content = shebang + "\n" + hook_block + "\n"
+
+    hook_path.write_text(content)
+    hook_path.chmod(0o755)
+    return hook_path
+
+
+def _uninstall_hook(hooks_dir, hook_name):
+    """Remove the s3lfs hook block from a git hook file."""
+    import re
+
+    hook_path = hooks_dir / hook_name
+    if not hook_path.exists():
+        return False
+
+    content = hook_path.read_text()
+    if S3LFS_HOOK_START not in content:
+        return False
+
+    pattern = (
+        r"\n*"
+        + re.escape(S3LFS_HOOK_START)
+        + r".*?"
+        + re.escape(S3LFS_HOOK_END)
+        + r"\n*"
+    )
+    new_content = re.sub(pattern, "\n", content, flags=re.DOTALL)
+
+    stripped = new_content.strip()
+    if stripped == "" or stripped == "#!/bin/sh":
+        hook_path.unlink()
+    else:
+        hook_path.write_text(new_content)
+
+    return True
+
+
+@click.command()
+def install():
+    """Install git hooks for automatic s3lfs checkout and track."""
+    git_root = find_git_root()
+    if not git_root:
+        click.echo("Error: Not in a git repository")
+        raise click.Abort()
+
+    manifest_path = get_manifest_path(git_root)
+    if not manifest_path.exists():
+        click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
+        raise click.Abort()
+
+    hooks_dir = _get_hooks_dir(git_root)
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    for hook_name, hook_block in HOOK_SCRIPTS.items():
+        hook_path = _install_hook(hooks_dir, hook_name, hook_block)
+        click.echo(f"  Installed {hook_name} hook -> {hook_path}")
+
+    click.echo()
+    click.echo("s3lfs hooks installed. Your git workflow now automatically:")
+    click.echo(
+        "  - Downloads tracked files after checkout/merge (post-checkout, post-merge)"
+    )
+    click.echo("  - Uploads modified files before push (pre-push)")
+    click.echo()
+    click.echo("Run 's3lfs uninstall' to remove hooks.")
+
+
+@click.command()
+def uninstall():
+    """Remove s3lfs git hooks."""
+    git_root = find_git_root()
+    if not git_root:
+        click.echo("Error: Not in a git repository")
+        raise click.Abort()
+
+    hooks_dir = _get_hooks_dir(git_root)
+    removed = False
+    for hook_name in HOOK_SCRIPTS:
+        if _uninstall_hook(hooks_dir, hook_name):
+            click.echo(f"  Removed {hook_name} hook")
+            removed = True
+
+    if removed:
+        click.echo()
+        click.echo("s3lfs hooks removed.")
+    else:
+        click.echo("No s3lfs hooks found.")
+
+
 cli.add_command(init)
 cli.add_command(track)
 cli.add_command(checkout)
@@ -779,6 +935,8 @@ cli.add_command(remove)
 cli.add_command(cleanup)
 cli.add_command(migrate)
 cli.add_command(migrate_from_lfs)
+cli.add_command(install)
+cli.add_command(uninstall)
 
 
 def main():
