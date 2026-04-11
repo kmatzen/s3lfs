@@ -1106,9 +1106,16 @@ class S3LFS:
                     context_manager = contextlib.nullcontext()
 
                 with context_manager:
-                    # Compute the local MD5 checksum
+                    # Compute the local MD5 checksum (streaming to avoid
+                    # loading the entire chunk into memory)
+                    md5_hash = hashlib.md5()
                     with open(path, "rb") as f:
-                        local_md5 = hashlib.md5(f.read()).hexdigest()
+                        while True:
+                            block = f.read(DEFAULT_BUFFER_SIZE)
+                            if not block:
+                                break
+                            md5_hash.update(block)
+                    local_md5 = md5_hash.hexdigest()
 
                     # Check if the file already exists in S3 with the same MD5
                     try:
@@ -1902,16 +1909,31 @@ class S3LFS:
         file_path = Path(file_path)
         chunk_paths = []
 
+        max_chunk_bytes = self.chunk_size - 1
         with open(file_path, "rb") as f:
             chunk_index = 0
             while True:
-                chunk_data = f.read(self.chunk_size - 1)
-                if not chunk_data:
-                    break
-
                 chunk_path = Path(f"{file_path}.chunk{chunk_index}")
+                bytes_written = 0
+                wrote_any = False
+
                 with open(chunk_path, "wb") as chunk_file:
-                    chunk_file.write(chunk_data)
+                    while bytes_written < max_chunk_bytes:
+                        to_read = min(
+                            DEFAULT_BUFFER_SIZE,
+                            max_chunk_bytes - bytes_written,
+                        )
+                        block = f.read(to_read)
+                        if not block:
+                            break
+                        chunk_file.write(block)
+                        bytes_written += len(block)
+                        wrote_any = True
+
+                if not wrote_any:
+                    # Nothing left to read; remove the empty file
+                    chunk_path.unlink(missing_ok=True)
+                    break
 
                 chunk_paths.append(chunk_path)
                 chunk_index += 1
