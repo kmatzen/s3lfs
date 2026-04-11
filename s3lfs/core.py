@@ -245,7 +245,7 @@ class S3LFS:
         """
         Handle SIGINT (Ctrl+C) to gracefully shut down parallel operations.
         """
-        print("\n⚠️ Interrupt received. Shutting down...")
+        print("\nInterrupt received. Shutting down...")
         self._shutdown_requested = True
         sys.exit(1)  # Exit the program
 
@@ -292,17 +292,17 @@ class S3LFS:
         with self._lock_context():
             # Store configuration in manifest
             if self.bucket_name is not None:
-                self.manifest["bucket_name"] = str(self.bucket_name)  # type: ignore
+                self.manifest["bucket_name"] = str(self.bucket_name)
             if self.repo_prefix is not None:
-                self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
+                self.manifest["repo_prefix"] = str(self.repo_prefix)
             if self.endpoint_url is not None:
-                self.manifest["endpoint_url"] = str(self.endpoint_url)  # type: ignore
+                self.manifest["endpoint_url"] = str(self.endpoint_url)
             self.save_manifest()
 
         # Update .gitignore to exclude cache files
         self._update_gitignore()
 
-        print("✅ Successfully initialized S3LFS with:")
+        print("Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         if self.endpoint_url:
@@ -351,7 +351,7 @@ class S3LFS:
                 with open(gitignore_path, "a") as f:
                     for pattern in patterns_to_add:
                         f.write(f"{pattern}\n")
-                print("📝 Updated .gitignore to exclude S3LFS cache files")
+                print("Updated .gitignore to exclude S3LFS cache files")
             else:
                 # Only add missing patterns (without header)
                 missing_patterns = [
@@ -362,10 +362,10 @@ class S3LFS:
                         for pattern in missing_patterns:
                             f.write(f"{pattern}\n")
                     print(
-                        f"📝 Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
+                        f"Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
                     )
         else:
-            print("✅ .gitignore already contains S3LFS cache exclusions")
+            print(".gitignore already contains S3LFS cache exclusions")
 
     def load_manifest(self):
         """Load the local manifest (YAML or JSON format)."""
@@ -398,7 +398,7 @@ class S3LFS:
             # Atomically move the temporary file to the target location
             temp_file.replace(self.manifest_file)
         except Exception as e:
-            print(f"❌ Failed to save manifest: {e}")
+            print(f"Failed to save manifest: {e}")
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
@@ -1277,22 +1277,22 @@ class S3LFS:
 
         with self._lock_context():
             if file_path_str not in self.manifest["files"]:
-                print(f"⚠️ File '{file_path}' is not currently tracked.")
+                print(f"File '{file_path}' is not currently tracked.")
                 return
 
             # Retrieve the file hash before removal
             file_hash = self.manifest["files"].pop(file_path_str, None)
             self.save_manifest()
 
-        print(f"🗑 Removed tracking for '{file_path}'.")
+        print(f"Removed tracking for '{file_path}'.")
 
         if not keep_in_s3:
             s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
             self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-            print(f"🗑 File removed from S3: s3://{self.bucket_name}/{s3_key}")
+            print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
         else:
             print(
-                f"⚠️ File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path.as_posix()}"
+                f"File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path.as_posix()}"
             )
 
     def cleanup_s3(self, force=False):
@@ -1326,24 +1326,24 @@ class S3LFS:
                         unreferenced_files.append(key)
 
         if not unreferenced_files:
-            print("✅ No unreferenced files found in S3.")
+            print("No unreferenced files found in S3.")
             return
 
-        print(f"⚠️ Found {len(unreferenced_files)} unreferenced files in S3.")
+        print(f"Found {len(unreferenced_files)} unreferenced files in S3.")
 
         # If not in test mode, ask for confirmation
         if not force:
             confirm = input("Do you want to delete them? (yes/no): ").strip().lower()
             if confirm != "yes":
-                print("❌ Cleanup aborted. No files were deleted.")
+                print("Cleanup aborted. No files were deleted.")
                 return
 
         # Proceed with deletion
         for key in unreferenced_files:
             self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
-            print(f"🗑 Deleted {key}")
+            print(f"Deleted {key}")
 
-        print("✅ S3 cleanup completed.")
+        print("S3 cleanup completed.")
 
     def track_modified_files(self, silence=True):
         """Check manifest for outdated hashes and upload changed files in parallel."""
@@ -1789,7 +1789,7 @@ class S3LFS:
                 ]
 
         if not files_to_remove:
-            print(f"⚠️ No tracked files found matching '{directory}'.")
+            print(f"No tracked files found matching '{directory}'.")
             return
 
         for file_path in files_to_remove:
@@ -1797,14 +1797,14 @@ class S3LFS:
             if not keep_in_s3 and file_hash:
                 s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path}.gz"
                 self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-                print(f"🗑 File removed from S3: s3://{self.bucket_name}/{s3_key}")
+                print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
 
         with self._lock_context():
             self.save_manifest()
 
         count = len(files_to_remove)
         print(
-            f"🗑 Removed tracking for {count} file{'s' if count != 1 else ''} matching '{directory}'."
+            f"Removed tracking for {count} file{'s' if count != 1 else ''} matching '{directory}'."
         )
 
     def test_s3_credentials(self, silence=False):
@@ -1820,7 +1820,7 @@ class S3LFS:
                 Bucket=self.bucket_name, MaxKeys=1, Prefix=""
             )
             if not silence:
-                print(f"✅ S3 credentials are valid for bucket '{self.bucket_name}'.")
+                print(f"S3 credentials are valid for bucket '{self.bucket_name}'.")
         except NoCredentialsError:
             raise RuntimeError(ERROR_MESSAGES["no_credentials"])
         except PartialCredentialsError:
@@ -2050,11 +2050,11 @@ class S3LFS:
 
         # Original two-stage implementation
         # Phase 1: Resolve filesystem paths and compute hashes
-        print("🔍 Resolving filesystem paths and computing hashes...")
+        print("Resolving filesystem paths and computing hashes...")
         files_to_track = self._resolve_filesystem_paths(path)
 
         if not files_to_track:
-            print(f"⚠️ No files found to track for '{path}'.")
+            print(f"No files found to track for '{path}'.")
             return
 
         # Compute hashes in parallel with a progress bar
@@ -2079,7 +2079,7 @@ class S3LFS:
                 }
 
         # Phase 2: Lock the manifest and determine which files need updates
-        print("🔒 Locking manifest to determine files needing updates...")
+        print("Locking manifest to determine files needing updates...")
         with self._lock_context():
             files_to_upload = []
             for file_path, current_hash in file_hashes.items():
@@ -2088,18 +2088,18 @@ class S3LFS:
                     files_to_upload.append((file_path, current_hash))
 
         if not files_to_upload:
-            print("✅ All files are up-to-date. No uploads needed.")
+            print("All files are up-to-date. No uploads needed.")
             return
 
-        print(f"📤 {len(files_to_upload)} files need to be uploaded.")
+        print(f"{len(files_to_upload)} files need to be uploaded.")
 
         # Test S3 credentials once before starting parallel operations
         if not silence:
-            print("🔐 Testing S3 credentials...")
+            print("Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
         # Phase 3: Upload files needing updates
-        print("🚀 Uploading files...")
+        print("Uploading files...")
         try:
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = [
@@ -2116,7 +2116,7 @@ class S3LFS:
                     as_completed(futures), total=len(futures), desc="Uploading files"
                 ):
                     if self._shutdown_requested:
-                        print("⚠️ Shutdown requested. Cancelling remaining uploads...")
+                        print("Shutdown requested. Cancelling remaining uploads...")
                         return
 
                     try:
@@ -2126,7 +2126,7 @@ class S3LFS:
                         raise
 
         except KeyboardInterrupt:
-            print("\n⚠️ Upload interrupted by user.")
+            print("\nUpload interrupted by user.")
             return
 
         with self._lock_context():
@@ -2137,7 +2137,7 @@ class S3LFS:
                 self.manifest["files"][manifest_key] = file_hash
             self.save_manifest()
 
-        print(f"✅ Successfully tracked and uploaded files for '{path}'.")
+        print(f"Successfully tracked and uploaded files for '{path}'.")
 
     def _hash_with_progress_cached(self, file_path, progress_bar):
         """
@@ -2169,17 +2169,17 @@ class S3LFS:
 
         # Original two-stage implementation
         # Phase 1: Resolve manifest paths using improved globbing
-        print("🔒 Resolving paths from manifest...")
+        print("Resolving paths from manifest...")
         files_to_checkout = self._resolve_manifest_paths(path)
 
         if not files_to_checkout:
-            print(f"⚠️ No files found in the manifest for '{path}'.")
+            print(f"No files found in the manifest for '{path}'.")
             return
 
-        print(f"🔍 Found {len(files_to_checkout)} files to check out.")
+        print(f"Found {len(files_to_checkout)} files to check out.")
 
         # Phase 2: Hash files to determine which need to be downloaded
-        print("🔍 Hashing files to determine which need to be downloaded...")
+        print("Hashing files to determine which need to be downloaded...")
         files_to_download = []
         file_hashes = {}
 
@@ -2387,22 +2387,22 @@ class S3LFS:
             tracker.start_pipeline()
 
         # Phase 1: Resolve filesystem paths
-        print("🔍 Resolving filesystem paths...")
+        print("Resolving filesystem paths...")
         files_to_track = self._resolve_filesystem_paths(path)
 
         if not files_to_track:
-            print(f"⚠️ No files found to track for '{path}'.")
+            print(f"No files found to track for '{path}'.")
             if metrics.is_enabled():
                 tracker.end_pipeline()
             return
 
         # Test S3 credentials once before starting parallel operations
         if not silence:
-            print("🔐 Testing S3 credentials...")
+            print("Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
         print(
-            f"🚀 Processing {len(files_to_track)} files with interleaved hashing and uploading..."
+            f"Processing {len(files_to_track)} files with interleaved hashing and uploading..."
         )
 
         # Start tracking stages
@@ -2418,14 +2418,21 @@ class S3LFS:
 
         try:
             # Create unified progress bars
-            with tqdm(
-                total=len(files_to_track),
-                desc="Files processed",
-                unit="file",
-                position=0,
-            ) as file_pbar, tqdm(
-                total=0, desc="Data transferred", unit="B", unit_scale=True, position=1
-            ) as bytes_pbar:
+            with (
+                tqdm(
+                    total=len(files_to_track),
+                    desc="Files processed",
+                    unit="file",
+                    position=0,
+                ) as file_pbar,
+                tqdm(
+                    total=0,
+                    desc="Data transferred",
+                    unit="B",
+                    unit_scale=True,
+                    position=1,
+                ) as bytes_pbar,
+            ):
 
                 def progress_callback(bytes_chunk):
                     """Callback to update the bytes progress bar"""
@@ -2448,7 +2455,7 @@ class S3LFS:
                     for future in as_completed(future_to_file):
                         if self._shutdown_requested:
                             print(
-                                "⚠️ Shutdown requested. Cancelling remaining operations..."
+                                "Shutdown requested. Cancelling remaining operations..."
                             )
                             return
 
@@ -2483,12 +2490,12 @@ class S3LFS:
                             raise
 
         except KeyboardInterrupt:
-            print("\n⚠️ Processing interrupted by user.")
+            print("\nProcessing interrupted by user.")
             return
 
         # Phase 3: Update manifest with all changes
         if files_uploaded:
-            print(f"📝 Updating manifest with {len(files_uploaded)} uploaded files...")
+            print(f"Updating manifest with {len(files_uploaded)} uploaded files...")
             with self._lock_context():
                 self.load_manifest()
                 for file_path, file_hash in files_uploaded:
@@ -2497,7 +2504,7 @@ class S3LFS:
                 self.save_manifest()
 
         print(
-            f"✅ Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
+            f"Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
         )
 
         # End metrics tracking
@@ -2522,22 +2529,22 @@ class S3LFS:
             tracker.start_pipeline()
 
         # Phase 1: Resolve manifest paths
-        print("🔒 Resolving paths from manifest...")
+        print("Resolving paths from manifest...")
         files_to_checkout = self._resolve_manifest_paths(path)
 
         if not files_to_checkout:
-            print(f"⚠️ No files found in the manifest for '{path}'.")
+            print(f"No files found in the manifest for '{path}'.")
             if metrics.is_enabled():
                 tracker.end_pipeline()
             return
 
         # Test S3 credentials once before starting parallel operations
         if not silence:
-            print("🔐 Testing S3 credentials...")
+            print("Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
         print(
-            f"🚀 Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
+            f"Processing {len(files_to_checkout)} files with interleaved hashing and downloading..."
         )
 
         # Start tracking stages
@@ -2552,12 +2559,12 @@ class S3LFS:
 
         if not files_to_process:
             if not silence:
-                print("✅ No files to process.")
+                print("No files to process.")
             return
 
         if not silence:
             print(
-                f"📥 Processing {len(files_to_process)} files (calculating sizes during processing...)",
+                f"Processing {len(files_to_process)} files (calculating sizes during processing...)",
                 flush=True,
             )
 
@@ -2568,14 +2575,21 @@ class S3LFS:
 
         try:
             # Create unified progress bars with dynamic total for bytes
-            with tqdm(
-                total=len(files_to_process),
-                desc="Files processed",
-                unit="file",
-                position=0,
-            ) as file_pbar, tqdm(
-                total=0, desc="Data downloaded", unit="B", unit_scale=True, position=1
-            ) as bytes_pbar:
+            with (
+                tqdm(
+                    total=len(files_to_process),
+                    desc="Files processed",
+                    unit="file",
+                    position=0,
+                ) as file_pbar,
+                tqdm(
+                    total=0,
+                    desc="Data downloaded",
+                    unit="B",
+                    unit_scale=True,
+                    position=1,
+                ) as bytes_pbar,
+            ):
 
                 def progress_callback(bytes_chunk, file_size=None):
                     """Callback to update the bytes progress bar and optionally set total"""
@@ -2602,7 +2616,7 @@ class S3LFS:
                     for future in as_completed(future_to_file):
                         if self._shutdown_requested:
                             print(
-                                "⚠️ Shutdown requested. Cancelling remaining operations..."
+                                "Shutdown requested. Cancelling remaining operations..."
                             )
                             break
 
@@ -2627,10 +2641,10 @@ class S3LFS:
                             raise
 
         except KeyboardInterrupt:
-            print("\n⚠️ Processing interrupted by user.")
+            print("\nProcessing interrupted by user.")
         finally:
             print(
-                f"✅ Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
+                f"Successfully processed {files_processed} files ({files_downloaded} downloaded) for '{path}'."
             )
 
             # End metrics tracking
@@ -2666,7 +2680,7 @@ class S3LFS:
             with self._lock_context():
                 expected_hash = self.manifest["files"].get(manifest_key)
         if not expected_hash:
-            print(f"⚠️ File '{file_path}' is not in the manifest.")
+            print(f"File '{file_path}' is not in the manifest.")
             return None
 
         # If the file exists, check its hash
@@ -2680,7 +2694,7 @@ class S3LFS:
             if current_hash == expected_hash:
                 if not silence:
                     print(
-                        f"✅ Skipping download: '{filesystem_path}' is already up-to-date."
+                        f"Skipping download: '{filesystem_path}' is already up-to-date."
                     )
                 return 0  # Skip download if hashes match
 
@@ -2768,7 +2782,7 @@ class S3LFS:
                                 Callback=download_callback,
                             )
             except Exception as e:
-                print(f"❌ Error downloading {key}: {e}")
+                print(f"Error downloading {key}: {e}")
 
         if chunk_contents:
             compressed_path = self.merge_files(compressed_path, target_paths)
@@ -2783,13 +2797,11 @@ class S3LFS:
             with metrics.track("decompression", str(filesystem_path)):
                 self.decompress_file(compressed_path, filesystem_path)
         except Exception as e:
-            print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
+            print(f"Error decompressing {compressed_path} for key {keys}: {e}")
             raise
         os.remove(compressed_path)  # Ensure temp file is deleted
         if not silence:
-            print(
-                f"📥 Downloaded {filesystem_path} from s3://{self.bucket_name}/{s3_key}"
-            )
+            print(f"Downloaded {filesystem_path} from s3://{self.bucket_name}/{s3_key}")
 
         # Return bytes transferred for progress tracking
         return filesystem_path.stat().st_size if filesystem_path.exists() else 0
@@ -2807,11 +2819,11 @@ class S3LFS:
 
         if not files_to_list:
             if verbose:
-                print(f"⚠️ No tracked files found for '{path}'.")
+                print(f"No tracked files found for '{path}'.")
             return
 
         if verbose:
-            print(f"📋 Found {len(files_to_list)} tracked file(s) for '{path}':")
+            print(f"Found {len(files_to_list)} tracked file(s) for '{path}':")
             print()
 
         # Sort files for consistent output
@@ -2828,10 +2840,10 @@ class S3LFS:
                 file_status = self.get_file_status(file_path)
                 if file_status["exists"]:
                     size_str = f"{file_status['size']:,} bytes"
-                    status = "✅" if file_status["cache_valid"] else "⚠️"
+                    status = "" if file_status["cache_valid"] else ""
                 else:
                     size_str = "missing"
-                    status = "❌"
+                    status = ""
 
                 print(f"{status} {display_path}")
                 print(f"    Hash: {file_hash}")
@@ -2852,11 +2864,11 @@ class S3LFS:
 
         if not all_files:
             if verbose:
-                print("⚠️ No files are currently tracked.")
+                print("No files are currently tracked.")
             return
 
         if verbose:
-            print(f"📋 All tracked files ({len(all_files)} total):")
+            print(f"All tracked files ({len(all_files)} total):")
             print()
 
         # Sort files for consistent output
@@ -2873,10 +2885,10 @@ class S3LFS:
                 file_status = self.get_file_status(file_path)
                 if file_status["exists"]:
                     size_str = f"{file_status['size']:,} bytes"
-                    status = "✅" if file_status["cache_valid"] else "⚠️"
+                    status = "" if file_status["cache_valid"] else ""
                 else:
                     size_str = "missing"
-                    status = "❌"
+                    status = ""
 
                 print(f"{status} {display_path}")
                 print(f"    Hash: {file_hash}")

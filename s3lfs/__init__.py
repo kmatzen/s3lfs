@@ -10,5 +10,5 @@ automatic cleanup of unused assets.
 from . import metrics
 from .core import S3LFS
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["S3LFS", "metrics", "__version__"]

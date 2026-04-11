@@ -26,7 +26,7 @@ class TestS3LFS(unittest.TestCase):
         self.s3_mock.start()
 
         self.bucket_name = "testbucket"
-        self.s3 = boto3.client("s3")
+        self.s3 = boto3.client("s3", region_name="us-east-1")
         self.s3.create_bucket(Bucket=self.bucket_name)
 
         # Create our S3LFS instance
@@ -1219,9 +1219,7 @@ class TestS3LFS(unittest.TestCase):
             self.versioner.track_interleaved("*.nonexistent")
 
             # Should print warning message
-            mock_print.assert_any_call(
-                "⚠️ No files found to track for '*.nonexistent'."
-            )
+            mock_print.assert_any_call("No files found to track for '*.nonexistent'.")
 
     def test_checkout_interleaved_no_files_found(self):
         """Test checkout_interleaved when no files match the pattern in manifest."""
@@ -1231,7 +1229,7 @@ class TestS3LFS(unittest.TestCase):
 
             # Should print warning message
             mock_print.assert_any_call(
-                "⚠️ No files found in the manifest for '*.nonexistent'."
+                "No files found in the manifest for '*.nonexistent'."
             )
 
     def test_track_interleaved_with_shutdown_signal(self):
@@ -1263,7 +1261,7 @@ class TestS3LFS(unittest.TestCase):
 
                     # Should print shutdown message
                     mock_print.assert_any_call(
-                        "⚠️ Shutdown requested. Cancelling remaining operations..."
+                        "Shutdown requested. Cancelling remaining operations..."
                     )
 
             # Restore original shutdown state
@@ -1311,7 +1309,7 @@ class TestS3LFS(unittest.TestCase):
 
                     # Should print shutdown message
                     mock_print.assert_any_call(
-                        "⚠️ Shutdown requested. Cancelling remaining operations..."
+                        "Shutdown requested. Cancelling remaining operations..."
                     )
 
             # Restore original shutdown state
@@ -1347,7 +1345,7 @@ class TestS3LFS(unittest.TestCase):
                     self.versioner.track_interleaved("interrupt_test_*.txt")
 
                     # Should print interrupt message
-                    mock_print.assert_any_call("\n⚠️ Processing interrupted by user.")
+                    mock_print.assert_any_call("\nProcessing interrupted by user.")
 
         finally:
             # Cleanup
@@ -1383,7 +1381,7 @@ class TestS3LFS(unittest.TestCase):
                     self.versioner.checkout_interleaved("interrupt_checkout_test_*.txt")
 
                     # Should print interrupt message
-                    mock_print.assert_any_call("\n⚠️ Processing interrupted by user.")
+                    mock_print.assert_any_call("\nProcessing interrupted by user.")
 
         finally:
             # Cleanup
@@ -1717,9 +1715,10 @@ class TestS3LFS(unittest.TestCase):
                 )
 
                 # Content should be the same
-                with open(decompressed_cli, "r") as f1, open(
-                    decompressed_python, "r"
-                ) as f2:
+                with (
+                    open(decompressed_cli, "r") as f1,
+                    open(decompressed_python, "r") as f2,
+                ):
                     self.assertEqual(f1.read(), f2.read())
 
             finally:
@@ -2799,13 +2798,16 @@ class TestS3LFS(unittest.TestCase):
         }
         mock_paginator.paginate.return_value = [mock_page]
 
-        with patch.object(
-            self.versioner._get_s3_client(),
-            "get_paginator",
-            return_value=mock_paginator,
-        ), patch.object(
-            self.versioner._get_s3_client(), "delete_object"
-        ) as mock_delete:
+        with (
+            patch.object(
+                self.versioner._get_s3_client(),
+                "get_paginator",
+                return_value=mock_paginator,
+            ),
+            patch.object(
+                self.versioner._get_s3_client(), "delete_object"
+            ) as mock_delete,
+        ):
             self.versioner.cleanup_s3(force=True)
             # Should only try to delete the valid key, not the short one
             mock_delete.assert_called_once()
@@ -3063,11 +3065,14 @@ class TestS3LFS(unittest.TestCase):
         }
         mock_paginator.paginate.return_value = [mock_page]
 
-        with patch.object(
-            self.versioner._get_s3_client(),
-            "get_paginator",
-            return_value=mock_paginator,
-        ), patch("builtins.input", return_value="no"):
+        with (
+            patch.object(
+                self.versioner._get_s3_client(),
+                "get_paginator",
+                return_value=mock_paginator,
+            ),
+            patch("builtins.input", return_value="no"),
+        ):
             # Should abort cleanup
             self.versioner.cleanup_s3(force=False)
 
