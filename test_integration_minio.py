@@ -19,7 +19,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
 from click.testing import CliRunner
 
 from s3lfs.cli import cli
@@ -49,7 +48,13 @@ def _init_repo_no_encryption(prefix):
 
 @unittest.skipUnless(ENDPOINT and BUCKET, _skip_reason)
 class TestMinIOWorkflow(unittest.TestCase):
-    """Full workflow against a real MinIO server."""
+    """Full workflow against a real MinIO server using the Python API.
+
+    Uses the Python API (not CLI) for all S3 operations so we can
+    disable encryption, which MinIO does not support by default.
+    CLI commands like ls, remove, install/uninstall that don't touch
+    S3 directly still use the CLI.
+    """
 
     def setUp(self):
         self.temp_dir = os.path.realpath(tempfile.mkdtemp())
@@ -69,6 +74,7 @@ class TestMinIOWorkflow(unittest.TestCase):
         import uuid
 
         self.prefix = f"test-{uuid.uuid4().hex[:8]}"
+        self.s3lfs = _init_repo_no_encryption(self.prefix)
 
     def tearDown(self):
         os.chdir(self.original_cwd)
@@ -76,124 +82,63 @@ class TestMinIOWorkflow(unittest.TestCase):
 
     def test_init_track_checkout_roundtrip(self):
         """Track files, delete them, checkout, verify content."""
-        runner = CliRunner()
-        _init_repo_no_encryption(self.prefix)
-
-        # Create files
         os.makedirs("data", exist_ok=True)
         Path("data/hello.txt").write_text("hello world")
         Path("data/binary.bin").write_bytes(b"\x00\x01\x02" * 1000)
 
-        # Track
-        result = runner.invoke(cli, ["track", "data/"])
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.s3lfs.track("data/", silence=True)
 
-        # Verify manifest has entries
-        with open(".s3_manifest.yaml") as f:
-            manifest = yaml.safe_load(f)
-        self.assertIn("data/hello.txt", manifest["files"])
-        self.assertIn("data/binary.bin", manifest["files"])
+        self.assertIn("data/hello.txt", self.s3lfs.manifest["files"])
+        self.assertIn("data/binary.bin", self.s3lfs.manifest["files"])
 
-        # Delete files
         os.remove("data/hello.txt")
         os.remove("data/binary.bin")
-        self.assertFalse(Path("data/hello.txt").exists())
 
-        # Checkout all
-        result = runner.invoke(cli, ["checkout", "--all"])
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.s3lfs.parallel_download_all(silence=True)
 
-        # Verify content
         self.assertEqual(Path("data/hello.txt").read_text(), "hello world")
         self.assertEqual(Path("data/binary.bin").read_bytes(), b"\x00\x01\x02" * 1000)
 
     def test_selective_checkout(self):
         """Checkout a single file by path."""
-        runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-
         Path("a.txt").write_text("file a")
         Path("b.txt").write_text("file b")
 
-        runner.invoke(cli, ["track", "a.txt"])
-        runner.invoke(cli, ["track", "b.txt"])
+        self.s3lfs.upload("a.txt", silence=True)
+        self.s3lfs.upload("b.txt", silence=True)
 
         os.remove("a.txt")
         os.remove("b.txt")
 
-        # Checkout only a.txt
-        result = runner.invoke(cli, ["checkout", "a.txt"])
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.s3lfs.download("a.txt", silence=True)
         self.assertTrue(Path("a.txt").exists())
         self.assertFalse(Path("b.txt").exists())
         self.assertEqual(Path("a.txt").read_text(), "file a")
 
     def test_track_modified(self):
-        """--modified detects and re-uploads changed files."""
-        runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-
+        """track_modified_files_cached detects and re-uploads changed files."""
         Path("doc.txt").write_text("version 1")
-        runner.invoke(cli, ["track", "doc.txt"])
+        self.s3lfs.upload("doc.txt", silence=True)
+        hash_v1 = self.s3lfs.manifest["files"]["doc.txt"]
 
-        with open(".s3_manifest.yaml") as f:
-            manifest = yaml.safe_load(f)
-        hash_v1 = manifest["files"]["doc.txt"]
-
-        # Modify
         Path("doc.txt").write_text("version 2")
-
-        result = runner.invoke(cli, ["track", "--modified"])
-        self.assertEqual(result.exit_code, 0, result.output)
-
-        with open(".s3_manifest.yaml") as f:
-            manifest = yaml.safe_load(f)
-        hash_v2 = manifest["files"]["doc.txt"]
+        self.s3lfs.track_modified_files_cached(silence=True)
+        hash_v2 = self.s3lfs.manifest["files"]["doc.txt"]
 
         self.assertNotEqual(hash_v1, hash_v2)
 
-        # Delete and checkout to verify v2 content
         os.remove("doc.txt")
-        runner.invoke(cli, ["checkout", "doc.txt"])
+        self.s3lfs.download("doc.txt", silence=True)
         self.assertEqual(Path("doc.txt").read_text(), "version 2")
 
     def test_ls(self):
-        """ls lists tracked files."""
-        runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-
+        """ls lists tracked files via CLI."""
         Path("x.txt").write_text("x")
         Path("y.txt").write_text("y")
-        runner.invoke(cli, ["track", "x.txt"])
-        runner.invoke(cli, ["track", "y.txt"])
+        self.s3lfs.upload("x.txt", silence=True)
+        self.s3lfs.upload("y.txt", silence=True)
 
+        runner = CliRunner()
         result = runner.invoke(cli, ["ls"])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("x.txt", result.output)
@@ -201,21 +146,10 @@ class TestMinIOWorkflow(unittest.TestCase):
 
     def test_remove(self):
         """remove stops tracking a file."""
-        runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-
         Path("temp.txt").write_text("temporary")
-        runner.invoke(cli, ["track", "temp.txt"])
+        self.s3lfs.upload("temp.txt", silence=True)
 
+        runner = CliRunner()
         result = runner.invoke(cli, ["remove", "temp.txt"])
         self.assertEqual(result.exit_code, 0)
 
@@ -223,46 +157,28 @@ class TestMinIOWorkflow(unittest.TestCase):
         self.assertNotIn("temp.txt", result.output)
 
     def test_deduplication(self):
-        """Two files with identical content share the same S3 object."""
-        runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-
+        """Two files with identical content share the same hash."""
         content = b"identical content across files"
         Path("copy1.bin").write_bytes(content)
         Path("copy2.bin").write_bytes(content)
 
-        runner.invoke(cli, ["track", "copy1.bin"])
-        runner.invoke(cli, ["track", "copy2.bin"])
+        self.s3lfs.upload("copy1.bin", silence=True)
+        self.s3lfs.upload("copy2.bin", silence=True)
 
-        with open(".s3_manifest.yaml") as f:
-            manifest = yaml.safe_load(f)
-
-        # Same content -> same hash
         self.assertEqual(
-            manifest["files"]["copy1.bin"],
-            manifest["files"]["copy2.bin"],
+            self.s3lfs.manifest["files"]["copy1.bin"],
+            self.s3lfs.manifest["files"]["copy2.bin"],
         )
 
-        # Both restore correctly
         os.remove("copy1.bin")
         os.remove("copy2.bin")
-        runner.invoke(cli, ["checkout", "--all"])
+        self.s3lfs.parallel_download_all(silence=True)
         self.assertEqual(Path("copy1.bin").read_bytes(), content)
         self.assertEqual(Path("copy2.bin").read_bytes(), content)
 
     def test_install_uninstall_hooks(self):
         """install/uninstall create and remove git hooks."""
         runner = CliRunner()
-        _init_repo_no_encryption(self.prefix)
 
         result = runner.invoke(cli, ["install"])
         self.assertEqual(result.exit_code, 0)
