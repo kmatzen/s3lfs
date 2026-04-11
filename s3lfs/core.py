@@ -731,15 +731,7 @@ class S3LFS:
         """
         Compute the SHA-256 hash using memory-mapped files.
         """
-        if metrics.is_enabled():
-            tracker = metrics.get_tracker()
-            with tracker.track_task("hashing", str(file_path)):
-                hasher = hashlib.sha256()
-                with open(file_path, "rb") as f:
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        hasher.update(mm)
-                return hasher.hexdigest()
-        else:
+        with metrics.track("hashing", str(file_path)):
             hasher = hashlib.sha256()
             with open(file_path, "rb") as f:
                 with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -750,15 +742,7 @@ class S3LFS:
         """
         Compute the SHA-256 hash by iteratively reading the file in chunks.
         """
-        if metrics.is_enabled():
-            tracker = metrics.get_tracker()
-            with tracker.track_task("hashing", str(file_path)):
-                hasher = hashlib.sha256()
-                with open(file_path, "rb") as f:
-                    while chunk := f.read(chunk_size):
-                        hasher.update(chunk)
-                return hasher.hexdigest()
-        else:
+        with metrics.track("hashing", str(file_path)):
             hasher = hashlib.sha256()
             with open(file_path, "rb") as f:
                 while chunk := f.read(chunk_size):
@@ -899,26 +883,7 @@ class S3LFS:
         """
         Compress the file deterministically using Python's gzip module.
         """
-        if metrics.is_enabled():
-            tracker = metrics.get_tracker()
-            with tracker.track_task("compression", str(file_path)):
-                compressed_path = self.temp_dir / f"{uuid4()}.gz"
-                buffer_size = DEFAULT_BUFFER_SIZE
-
-                with open(file_path, "rb") as f_in, open(
-                    compressed_path, "wb"
-                ) as f_out:
-                    with gzip.GzipFile(
-                        filename="",  # avoid embedding filename
-                        mode="wb",
-                        fileobj=f_out,
-                        compresslevel=5,
-                        mtime=0,  # fixed mtime for determinism
-                    ) as gz_out:
-                        shutil.copyfileobj(f_in, gz_out, length=buffer_size)
-
-                return compressed_path
-        else:
+        with metrics.track("compression", str(file_path)):
             compressed_path = self.temp_dir / f"{uuid4()}.gz"
             buffer_size = DEFAULT_BUFFER_SIZE
 
@@ -992,31 +957,13 @@ class S3LFS:
         """
         Decompress the file using Python's gzip module and save it to the output path.
         """
-        if metrics.is_enabled():
-            tracker = metrics.get_tracker()
-            with tracker.track_task("decompression", str(output_path)):
-                with gzip.open(compressed_path, "rb") as f_in:
-                    with open(output_path, "wb") as f_out:
-                        # Use manual chunked copy to avoid type issues
-                        while True:
-                            chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
-                            if not chunk:
-                                break
-                            # Ensure we have bytes for writing
-                            if isinstance(chunk, str):
-                                chunk = chunk.encode("utf-8")
-                            f_out.write(chunk)
-
-                return output_path
-        else:
+        with metrics.track("decompression", str(output_path)):
             with gzip.open(compressed_path, "rb") as f_in:
                 with open(output_path, "wb") as f_out:
-                    # Use manual chunked copy to avoid type issues
                     while True:
-                        chunk = f_in.read(DEFAULT_BUFFER_SIZE)  # 1MB chunks
+                        chunk = f_in.read(DEFAULT_BUFFER_SIZE)
                         if not chunk:
                             break
-                        # Ensure we have bytes for writing
                         if isinstance(chunk, str):
                             chunk = chunk.encode("utf-8")
                         f_out.write(chunk)
@@ -1144,26 +1091,13 @@ class S3LFS:
                             raise  # Re-raise if it's not a "Not Found" error
 
                     # Proceed with the upload if MD5 does not match or file does not exist
-                    if metrics.is_enabled():
-                        tracker = metrics.get_tracker()
-                        with tracker.track_task("s3_upload", str(path)):
-                            with open(path, "rb") as f:
-                                self._get_s3_client().upload_fileobj(
-                                    f,
-                                    self.bucket_name,
-                                    s3_key
-                                    if not chunked
-                                    else f"{s3_key}.chunk{chunk_idx}",
-                                    ExtraArgs=extra_args,
-                                    Config=self.config,
-                                    Callback=upload_callback,
-                                )
-                    else:
+                    upload_key = s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}"
+                    with metrics.track("s3_upload", str(path)):
                         with open(path, "rb") as f:
                             self._get_s3_client().upload_fileobj(
                                 f,
                                 self.bucket_name,
-                                s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}",
+                                upload_key,
                                 ExtraArgs=extra_args,
                                 Config=self.config,
                                 Callback=upload_callback,
@@ -2001,15 +1935,7 @@ class S3LFS:
 
             # Check if file exists and has correct hash
             if filesystem_path.exists():
-                # Track hashing even when cached (for metrics visibility)
-                if metrics.is_enabled():
-                    tracker = metrics.get_tracker()
-                    with tracker.track_task("hashing", str(filesystem_path)):
-                        if use_cache:
-                            current_hash = self.hash_file_cached(filesystem_path)
-                        else:
-                            current_hash = self.hash_file(filesystem_path)
-                else:
+                with metrics.track("hashing", str(filesystem_path)):
                     if use_cache:
                         current_hash = self.hash_file_cached(filesystem_path)
                     else:
@@ -2427,17 +2353,7 @@ class S3LFS:
                 with context_manager:
                     if not silence:
                         print(f"Downloading {key} to {target_path}")
-                    if metrics.is_enabled():
-                        tracker = metrics.get_tracker()
-                        with tracker.track_task("s3_download", key):
-                            with open(target_path, "wb") as f:
-                                self._get_s3_client().download_fileobj(
-                                    Bucket=self.bucket_name,
-                                    Key=key,
-                                    Fileobj=f,
-                                    Callback=download_callback,
-                                )
-                    else:
+                    with metrics.track("s3_download", key):
                         with open(target_path, "wb") as f:
                             self._get_s3_client().download_fileobj(
                                 Bucket=self.bucket_name,
@@ -2458,12 +2374,7 @@ class S3LFS:
         if os.path.dirname(filesystem_path):
             os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
         try:
-            # Track decompression at the call site for better metrics visibility
-            if metrics.is_enabled():
-                tracker = metrics.get_tracker()
-                with tracker.track_task("decompression", str(filesystem_path)):
-                    self.decompress_file(compressed_path, filesystem_path)
-            else:
+            with metrics.track("decompression", str(filesystem_path)):
                 self.decompress_file(compressed_path, filesystem_path)
         except Exception as e:
             print(f"❌ Error decompressing {compressed_path} for key {keys}: {e}")
