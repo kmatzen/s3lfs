@@ -41,9 +41,23 @@ from s3lfs.utils import find_git_root
 # Constants
 DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_BUFFER_SIZE = 1024 * 1024  # 1 MB
-DEFAULT_THREAD_POOL_SIZE = 8  # Optimal for bandwidth-limited scenarios
+DEFAULT_THREAD_POOL_SIZE = 8  # Fallback when os.cpu_count() is unavailable
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
+
+
+def _default_workers():
+    """Compute a sensible default worker count based on available CPUs.
+
+    Uses the same heuristic as Python's ThreadPoolExecutor default:
+    min(32, cpu_count + 4).  Falls back to DEFAULT_THREAD_POOL_SIZE if
+    cpu_count is unavailable.
+    """
+    cpu = os.cpu_count()
+    if cpu is None:
+        return DEFAULT_THREAD_POOL_SIZE
+    return min(32, cpu + 4)
+
 
 # Common error messages
 ERROR_MESSAGES = {
@@ -97,6 +111,7 @@ class S3LFS:
         s3_factory=None,
         use_acceleration=False,
         endpoint_url=None,
+        workers=None,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -109,10 +124,12 @@ class S3LFS:
         :param s3_factory: Custom S3 client factory function (for testing)
         :param use_acceleration: If True, enable S3 Transfer Acceleration
         :param endpoint_url: Custom S3 endpoint URL for S3-compatible storage (e.g. MinIO, R2, Wasabi)
+        :param workers: Number of parallel workers for uploads/downloads (default: auto-detected)
         """
         self.chunk_size = chunk_size
         self.use_acceleration = use_acceleration
         self.endpoint_url = endpoint_url
+        self.workers = workers if workers is not None else _default_workers()
 
         def default_s3_factory(no_sign_request):
             """Default S3 client factory with proper boto3 usage."""
@@ -144,14 +161,15 @@ class S3LFS:
         # Use a file-based lock for cross-process synchronization
         self._lock_file = self.temp_dir / ".s3lfs.lock"
 
+        max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
             self.config = TransferConfig(
                 multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
-                max_concurrency=DEFAULT_MAX_CONCURRENCY,
+                max_concurrency=max_concurrency,
             )
         else:
-            self.config = TransferConfig(max_concurrency=DEFAULT_MAX_CONCURRENCY)
+            self.config = TransferConfig(max_concurrency=max_concurrency)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
 
@@ -1302,7 +1320,7 @@ class S3LFS:
             )  # Files listed in the manifest
 
         # Compute hashes in parallel
-        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
             results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
 
         # Process results
@@ -1336,7 +1354,7 @@ class S3LFS:
             print("🔐 Testing S3 credentials...")
         self.test_s3_credentials(silence=silence)
 
-        with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
             # Submit each download task; unpack key from matching_files.items()
             futures = [
                 executor.submit(
@@ -1372,7 +1390,7 @@ class S3LFS:
         self.test_s3_credentials()
 
         try:
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 # Submit all tasks and collect futures
                 futures = [
                     executor.submit(self.download, kv[0], silence=silence)
@@ -1702,7 +1720,7 @@ class S3LFS:
 
         # Compute hashes in parallel with a progress bar
         with tqdm(total=len(files_to_track), desc="Hashing files", unit="file") as pbar:
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 if use_cache:
 
                     def hash_func(f):
@@ -1744,7 +1762,7 @@ class S3LFS:
         # Phase 3: Upload files needing updates
         print("🚀 Uploading files...")
         try:
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = [
                     executor.submit(
                         self.upload,
@@ -1829,7 +1847,7 @@ class S3LFS:
         with tqdm(
             total=len(files_to_checkout), desc="Hashing files", unit="file"
         ) as pbar:
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 if use_cache:
 
                     def hash_func(f):
@@ -1873,7 +1891,7 @@ class S3LFS:
         # Phase 3: Download files that need updates
         print("🚀 Downloading files...")
         try:
-            with ThreadPoolExecutor(max_workers=DEFAULT_THREAD_POOL_SIZE) as executor:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = [
                     executor.submit(self.download, file, silence=silence)
                     for file in files_to_download
@@ -2076,9 +2094,9 @@ class S3LFS:
 
         # Start tracking stages
         if metrics.is_enabled():
-            tracker.start_stage("hashing", max_workers=DEFAULT_THREAD_POOL_SIZE)
-            tracker.start_stage("compression", max_workers=DEFAULT_THREAD_POOL_SIZE)
-            tracker.start_stage("s3_upload", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("hashing", max_workers=self.workers)
+            tracker.start_stage("compression", max_workers=self.workers)
+            tracker.start_stage("s3_upload", max_workers=self.workers)
 
         # Phase 2: Process files with interleaved hashing and uploading
         files_uploaded = []
@@ -2100,9 +2118,7 @@ class S3LFS:
                     """Callback to update the bytes progress bar"""
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(
-                    max_workers=DEFAULT_THREAD_POOL_SIZE
-                ) as executor:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
                     # Submit all hash-and-upload tasks
                     future_to_file = {
                         executor.submit(
@@ -2213,9 +2229,9 @@ class S3LFS:
 
         # Start tracking stages
         if metrics.is_enabled():
-            tracker.start_stage("hashing", max_workers=DEFAULT_THREAD_POOL_SIZE)
-            tracker.start_stage("s3_download", max_workers=DEFAULT_THREAD_POOL_SIZE)
-            tracker.start_stage("decompression", max_workers=DEFAULT_THREAD_POOL_SIZE)
+            tracker.start_stage("hashing", max_workers=self.workers)
+            tracker.start_stage("s3_download", max_workers=self.workers)
+            tracker.start_stage("decompression", max_workers=self.workers)
 
         # Phase 2: Start processing immediately - discover sizes during download
         # We'll process ALL files to ensure proper progress tracking, even for up-to-date ones
@@ -2256,9 +2272,7 @@ class S3LFS:
                         bytes_pbar.refresh()
                     bytes_pbar.update(bytes_chunk)
 
-                with ThreadPoolExecutor(
-                    max_workers=DEFAULT_THREAD_POOL_SIZE
-                ) as executor:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
                     # Submit hash-and-download tasks for all files (including up-to-date ones for progress tracking)
                     future_to_file = {
                         executor.submit(
