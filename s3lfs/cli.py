@@ -453,7 +453,7 @@ def _parse_lfs_patterns(git_root):
 
     Returns a list of glob patterns that have the 'filter=lfs' attribute.
     """
-    patterns = []
+    patterns: list = []
     gitattributes = Path(git_root) / ".gitattributes"
     if not gitattributes.exists():
         return patterns
@@ -475,8 +475,6 @@ def _find_lfs_files(git_root, patterns):
 
     Returns list of Path objects relative to git_root.
     """
-    import fnmatch
-
     git_root = Path(git_root)
     matched_files = []
 
@@ -484,7 +482,9 @@ def _find_lfs_files(git_root, patterns):
         # Use glob to find matching files
         if "**" in pattern or "*" in pattern or "?" in pattern:
             for match in git_root.glob(pattern):
-                if match.is_file() and not str(match.relative_to(git_root)).startswith(".git"):
+                if match.is_file() and not str(match.relative_to(git_root)).startswith(
+                    ".git"
+                ):
                     matched_files.append(match)
         else:
             # Exact path
@@ -509,13 +509,17 @@ def _find_lfs_files(git_root, patterns):
 @click.option(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
 )
-@click.option("--dry-run", is_flag=True, help="Show what would be migrated without making changes")
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be migrated without making changes"
+)
 @click.option(
     "--remove-lfs/--keep-lfs",
     default=False,
     help="Remove LFS tracking from .gitattributes after migration (default: keep)",
 )
-def migrate_from_lfs(bucket, prefix, no_sign_request, use_acceleration, dry_run, remove_lfs):
+def migrate_from_lfs(
+    bucket, prefix, no_sign_request, use_acceleration, dry_run, remove_lfs
+):
     """Migrate a Git LFS repository to s3lfs.
 
     Detects LFS-tracked files from .gitattributes, verifies they contain
@@ -574,13 +578,17 @@ def migrate_from_lfs(bucket, prefix, no_sign_request, use_acceleration, dry_run,
     # Step 3: Check for un-smudged pointer files
     pointers = [f for f in lfs_files if _is_lfs_pointer(f)]
     if pointers:
-        click.echo(f"Error: {len(pointers)} file(s) are LFS pointer files (not actual content):")
+        click.echo(
+            f"Error: {len(pointers)} file(s) are LFS pointer files (not actual content):"
+        )
         for f in pointers[:10]:
             click.echo(f"  {f.relative_to(git_root)}")
         if len(pointers) > 10:
             click.echo(f"  ... and {len(pointers) - 10} more")
         click.echo()
-        click.echo("Run 'git lfs pull' to download the actual file content, then retry.")
+        click.echo(
+            "Run 'git lfs pull' to download the actual file content, then retry."
+        )
         raise click.Abort()
 
     if dry_run:
@@ -619,9 +627,13 @@ def migrate_from_lfs(bucket, prefix, no_sign_request, use_acceleration, dry_run,
     click.echo()
     click.echo("Next steps:")
     click.echo("  1. Review the changes: git diff")
-    click.echo("  2. Commit: git add .s3_manifest.yaml .gitignore .gitattributes && git commit -m 'Migrate from Git LFS to s3lfs'")
+    click.echo(
+        "  2. Commit: git add .s3_manifest.yaml .gitignore .gitattributes && git commit -m 'Migrate from Git LFS to s3lfs'"
+    )
     if not remove_lfs:
-        click.echo("  3. (Optional) Remove LFS: run again with --remove-lfs, or manually edit .gitattributes")
+        click.echo(
+            "  3. (Optional) Remove LFS: run again with --remove-lfs, or manually edit .gitattributes"
+        )
     click.echo("  4. (Optional) Uninstall Git LFS: git lfs uninstall")
 
 
