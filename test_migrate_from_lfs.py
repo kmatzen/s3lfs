@@ -145,8 +145,7 @@ class TestRemoveLfsFromGitattributes(unittest.TestCase):
 
     def test_removes_lfs_lines(self):
         self.ga_path.write_text(
-            "*.bin filter=lfs diff=lfs merge=lfs -text\n"
-            "*.txt text\n"
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n" "*.txt text\n"
         )
         _remove_lfs_from_gitattributes(self.ga_path, ["*.bin"])
         content = self.ga_path.read_text()
@@ -155,8 +154,7 @@ class TestRemoveLfsFromGitattributes(unittest.TestCase):
 
     def test_preserves_comments(self):
         self.ga_path.write_text(
-            "# Important comment\n"
-            "*.bin filter=lfs diff=lfs -text\n"
+            "# Important comment\n" "*.bin filter=lfs diff=lfs -text\n"
         )
         _remove_lfs_from_gitattributes(self.ga_path, ["*.bin"])
         content = self.ga_path.read_text()
@@ -257,9 +255,7 @@ class TestMigrateFromLfsCommand(unittest.TestCase):
                 )
             )
 
-            result = runner.invoke(
-                cli, ["migrate-from-lfs", "my-bucket", "my-prefix"]
-            )
+            result = runner.invoke(cli, ["migrate-from-lfs", "my-bucket", "my-prefix"])
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             self.assertIn("Migration complete", result.output)
@@ -272,8 +268,7 @@ class TestMigrateFromLfsCommand(unittest.TestCase):
 
     def test_remove_lfs_flag(self):
         Path(".gitattributes").write_text(
-            "*.bin filter=lfs diff=lfs -text\n"
-            "*.txt text\n"
+            "*.bin filter=lfs diff=lfs -text\n" "*.txt text\n"
         )
         Path("data.bin").write_bytes(b"real binary content")
 
