@@ -149,6 +149,32 @@ s3lfs cleanup
 s3lfs cleanup --force                    # Clean up without confirmation
 ```
 
+### Migrate from Git LFS
+```sh
+s3lfs migrate-from-lfs <bucket-name> <repo-prefix>
+```
+**Description**: Converts a Git LFS repository to s3lfs in one step. Detects LFS-tracked patterns from `.gitattributes`, verifies files contain real content (not pointer files), initializes s3lfs, and uploads all files to S3.
+
+**Options**:
+- `--dry-run`: Preview what would be migrated without making changes
+- `--remove-lfs/--keep-lfs`: Remove LFS entries from `.gitattributes` after migration (default: keep)
+- `--no-sign-request`: Use unsigned S3 requests
+- `--use-acceleration`: Enable S3 Transfer Acceleration
+
+**Examples**:
+```sh
+# Preview migration
+s3lfs migrate-from-lfs my-bucket my-project --dry-run
+
+# Migrate and keep LFS entries (safe, reversible)
+s3lfs migrate-from-lfs my-bucket my-project
+
+# Migrate and remove LFS tracking
+s3lfs migrate-from-lfs my-bucket my-project --remove-lfs
+```
+
+**Prerequisites**: Run `git lfs pull` first to ensure all LFS files contain actual content (not pointer files). The command will error if any pointer files are detected.
+
 ## Git Workflow Integration
 
 ### 1. Initialize S3LFS
