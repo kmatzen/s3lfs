@@ -865,8 +865,9 @@ class S3LFS:
 
         # Automatically select the best method if "auto" is specified
         if method == "auto":
-            if shutil.which("gzip"):
-                # Prefer CLI - no GIL contention, better parallelism
+            if shutil.which("pigz"):
+                method = "pigz"
+            elif shutil.which("gzip"):
                 method = "cli"
             else:
                 method = "python"
@@ -874,6 +875,8 @@ class S3LFS:
         # Use the selected compression method
         if method == "python":
             return self._compress_file_python(file_path)
+        elif method == "pigz":
+            return self._compress_file_pigz(file_path)
         elif method == "cli":
             return self._compress_file_cli(file_path)
         else:
@@ -914,6 +917,24 @@ class S3LFS:
 
         return compressed_path
 
+    def _compress_file_pigz(self, file_path):
+        """
+        Compress the file deterministically using pigz (parallel gzip).
+
+        pigz uses all available CPU cores and produces gzip-compatible
+        output, so existing stored files remain readable.
+        """
+        compressed_path = self.temp_dir / f"{uuid4()}.gz"
+
+        with open(compressed_path, "wb") as f_out:
+            subprocess.run(
+                ["pigz", "-n", "-c", "-5", str(file_path)],
+                stdout=f_out,
+                check=True,
+            )
+
+        return compressed_path
+
     def decompress_file(self, compressed_path, output_path=None, method="auto"):
         """
         Decompress a file using gzip and return the path of the decompressed file.
@@ -939,8 +960,9 @@ class S3LFS:
 
         # Automatically select the best method if "auto" is specified
         if method == "auto":
-            if shutil.which("gzip"):
-                # Prefer CLI - no GIL contention, better parallelism
+            if shutil.which("pigz"):
+                method = "pigz"
+            elif shutil.which("gzip"):
                 method = "cli"
             else:
                 method = "python"
@@ -948,6 +970,8 @@ class S3LFS:
         # Use the selected decompression method
         if method == "python":
             return self._decompress_file_python(compressed_path, output_path)
+        elif method == "pigz":
+            return self._decompress_file_pigz(compressed_path, output_path)
         elif method == "cli":
             return self._decompress_file_cli(compressed_path, output_path)
         else:
@@ -983,6 +1007,23 @@ class S3LFS:
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to decompress file using gzip CLI: {compressed_path}"
+            )
+
+        return output_path
+
+    def _decompress_file_pigz(self, compressed_path, output_path):
+        """
+        Decompress the file using pigz (parallel gzip) and save it to the output path.
+        """
+        result = subprocess.run(
+            ["pigz", "-d", "-c", str(compressed_path)],
+            stdout=open(output_path, "wb"),
+            check=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to decompress file using pigz: {compressed_path}"
             )
 
         return output_path
