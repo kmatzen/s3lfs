@@ -5,9 +5,29 @@ import click
 import yaml
 
 from s3lfs import metrics
+from s3lfs.config import load_config
 from s3lfs.core import S3LFS
 from s3lfs.path_resolver import PathResolver
 from s3lfs.utils import find_git_root
+
+
+def _make_s3lfs(
+    git_root, manifest_path, no_sign_request=False, use_acceleration=False, **extra
+):
+    """Create an S3LFS instance with .s3lfsconfig defaults applied.
+
+    CLI flags (when True) override config-file values.
+    """
+    config = load_config(git_root)
+    # CLI True overrides config; CLI False falls back to config
+    effective_no_sign = no_sign_request or config.get("no_sign_request", False)
+    effective_accel = use_acceleration or config.get("use_acceleration", False)
+    return S3LFS(
+        no_sign_request=effective_no_sign,
+        manifest_file=str(manifest_path),
+        use_acceleration=effective_accel,
+        **extra,
+    )
 
 
 def _setup_s3lfs_command(cli_path=None, require_manifest=True):
@@ -166,9 +186,10 @@ def track(
         git_root, manifest_path, path_resolver = _setup_s3lfs_command()
         manifest_key = None
 
-    s3lfs = S3LFS(
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
         no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )
@@ -233,9 +254,10 @@ def checkout(
         git_root, manifest_path, path_resolver = _setup_s3lfs_command()
         manifest_key = None
 
-    s3lfs = S3LFS(
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
         no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )
@@ -313,9 +335,10 @@ def ls(
     except ValueError:
         relative_cwd = Path(".")
 
-    s3lfs = S3LFS(
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
         no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )
@@ -355,9 +378,10 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
         cli_path=path
     )
 
-    versioner = S3LFS(
+    versioner = _make_s3lfs(
+        git_root,
+        manifest_path,
         no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )
@@ -401,9 +425,10 @@ def cleanup(force, no_sign_request, use_acceleration, endpoint_url):
         click.echo("Error: S3LFS not initialized. Run 's3lfs init' first.")
         raise click.Abort()
 
-    versioner = S3LFS(
+    versioner = _make_s3lfs(
+        git_root,
+        manifest_path,
         no_sign_request=no_sign_request,
-        manifest_file=str(manifest_path),
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )

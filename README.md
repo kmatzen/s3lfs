@@ -311,10 +311,24 @@ s3lfs init my-bucket my-project --endpoint-url https://s3.us-west-004.backblazeb
 s3lfs init my-bucket my-project --endpoint-url https://s3.wasabisys.com
 ```
 
-The endpoint URL is stored in the manifest, so subsequent commands pick it up automatically — no need to pass `--endpoint-url` on every invocation. You can override it per-command if needed.
+The endpoint URL is stored in the manifest, so subsequent commands pick it up automatically. You can override it per-command if needed.
+
+### Per-Repo Config File
+Create a `.s3lfsconfig` file at the git root to set defaults for the whole team:
+```yaml
+# .s3lfsconfig - commit this to version control
+no_sign_request: true
+use_acceleration: false
+```
+
+When `.s3lfsconfig` exists, its values are used as defaults for all commands. CLI flags still override config values - for example, `s3lfs track --no-sign-request` always uses unsigned requests regardless of the config.
+
+**Supported keys**:
+- `no_sign_request`: Use unsigned S3 requests (default: `false`)
+- `use_acceleration`: Enable S3 Transfer Acceleration (default: `false`)
 
 ### Public Buckets
-For public S3 buckets, use the `--no-sign-request` flag:
+For public S3 buckets, use the `--no-sign-request` flag or set it in `.s3lfsconfig`:
 ```sh
 s3lfs init public-bucket my-project --no-sign-request
 s3lfs checkout --all --no-sign-request
