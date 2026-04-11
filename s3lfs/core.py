@@ -707,58 +707,92 @@ class S3LFS:
                 print(f"Cleaned up {len(stale_entries)} stale cache entries.")
                 self.save_cache()
 
+    def _check_cache_hit(self, file_path_str, current_metadata):
+        """Check if the in-memory cache has a valid entry for this file.
+
+        Does NOT acquire the lock or reload cache from disk.
+        Returns the cached hash if valid, or None.
+        """
+        cached_data = self.hash_cache.get(file_path_str)
+        if not cached_data:
+            return None
+        cached_meta = cached_data.get("metadata", {})
+        if (
+            cached_meta.get("size") == current_metadata["size"]
+            and cached_meta.get("mtime") == current_metadata["mtime"]
+            and cached_meta.get("inode") == current_metadata["inode"]
+        ):
+            return cached_data["hash"]
+        return None
+
     def track_modified_files_cached(self, silence=True):
         """
-        Check manifest for outdated hashes using cached hashing and upload changed files in parallel.
-        This is an optimized version of track_modified_files that uses hash caching.
+        Check manifest for outdated hashes using cached hashing and upload
+        changed files in parallel.
+
+        Loads the manifest and cache once at the start, checks all files
+        against the in-memory snapshot without holding the lock, and
+        batch-writes cache updates at the end.
         """
         files_to_upload = []
         cache_hits = 0
         cache_misses = 0
 
+        # Load manifest and cache once, snapshot stored hashes
         with self._lock_context():
-            files_to_check = list(
-                self.manifest["files"].keys()
-            )  # Files listed in the manifest
+            files_to_check = list(self.manifest["files"].keys())
+            stored_hashes = dict(self.manifest["files"])
+            self.load_cache()
 
         if not files_to_check:
             print(
-                "⚠️ No files found in manifest. Use 's3lfs track <path>' to track files first."
+                "No files found in manifest. "
+                "Use 's3lfs track <path>' to track files first."
             )
             return
 
-        print(f"🔍 Checking {len(files_to_check)} tracked files for modifications...")
+        print(f"Checking {len(files_to_check)} tracked files for modifications...")
 
-        # Use cached hashing for better performance with progress indication
+        cache_updates = {}
+
         with tqdm(
             total=len(files_to_check), desc="Checking files", unit="file"
         ) as pbar:
             for file_path in files_to_check:
                 try:
-                    # Get file status to check cache validity
-                    status = self.get_file_status(file_path)
+                    fp = Path(file_path)
+                    filesystem_path = self.path_resolver.to_filesystem_path(file_path)
 
-                    if not status["exists"]:
-                        print(f"⚠️ Warning: File {file_path} is missing. Skipping.")
+                    if not filesystem_path.exists():
+                        print(f"Warning: File {file_path} is missing. Skipping.")
                         pbar.update(1)
                         continue
 
-                    # Use cached hash if available and valid
-                    if status["cache_valid"]:
-                        current_hash = status["cached_hash"]
+                    stat = filesystem_path.stat()
+                    metadata = {
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "inode": getattr(stat, "st_ino", None),
+                    }
+                    file_path_str = str(fp.as_posix())
+
+                    cached_hash = self._check_cache_hit(file_path_str, metadata)
+                    if cached_hash is not None:
+                        current_hash = cached_hash
                         cache_hits += 1
                     else:
-                        current_hash = self.hash_file_cached(file_path)
+                        current_hash = self.hash_file(filesystem_path)
                         cache_misses += 1
+                        cache_updates[file_path_str] = {
+                            "hash": current_hash,
+                            "metadata": metadata,
+                            "timestamp": time.time(),
+                        }
 
-                    with self._lock_context():
-                        stored_hash = self.manifest["files"].get(file_path)
-
-                    if current_hash != stored_hash:
-                        print(f"📝 File {file_path} has changed. Marking for upload.")
+                    if current_hash != stored_hashes.get(file_path):
+                        print(f"File {file_path} has changed. " f"Marking for upload.")
                         files_to_upload.append(file_path)
 
-                    # Update progress bar with current status
                     pbar.set_postfix(
                         {
                             "changed": len(files_to_upload),
@@ -769,23 +803,33 @@ class S3LFS:
                     pbar.update(1)
 
                 except Exception as e:
-                    print(f"❌ Error processing {file_path}: {e}")
+                    print(f"Error processing {file_path}: {e}")
                     pbar.update(1)
                     continue
 
+        # Batch-write cache updates in a single lock acquisition
+        if cache_updates:
+            with self._lock_context():
+                self.hash_cache.update(cache_updates)
+                self._cache_dirty = True
+                self.save_cache()
+
         if not silence:
-            print(f"📊 Hash cache performance: {cache_hits} hits, {cache_misses} misses")
+            print(
+                f"Hash cache performance: " f"{cache_hits} hits, {cache_misses} misses"
+            )
 
         # Upload files in parallel if needed
         if files_to_upload:
-            print(f"📤 Uploading {len(files_to_upload)} modified file(s) in parallel...")
+            print(
+                f"Uploading {len(files_to_upload)} modified file(s) " f"in parallel..."
+            )
             self.parallel_upload(files_to_upload, silence=silence)
 
-            # Save updated manifest (including cache)
             with self._lock_context():
                 self.save_manifest()
         else:
-            print("✅ No modified files needing upload.")
+            print("No modified files needing upload.")
 
     def _hash_file_mmap(self, file_path):
         """
