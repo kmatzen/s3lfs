@@ -38,17 +38,13 @@ class TestLoadConfig(unittest.TestCase):
 
     def test_loads_recognized_keys(self):
         config_path = Path(self.temp_dir) / CONFIG_FILENAME
-        config_path.write_text(
-            "no_sign_request: true\nuse_acceleration: true\n"
-        )
+        config_path.write_text("no_sign_request: true\nuse_acceleration: true\n")
         config = load_config(self.temp_dir)
         self.assertEqual(config, {"no_sign_request": True, "use_acceleration": True})
 
     def test_ignores_unknown_keys(self):
         config_path = Path(self.temp_dir) / CONFIG_FILENAME
-        config_path.write_text(
-            "no_sign_request: true\nfuture_option: some_value\n"
-        )
+        config_path.write_text("no_sign_request: true\nfuture_option: some_value\n")
         config = load_config(self.temp_dir)
         self.assertNotIn("future_option", config)
         self.assertTrue(config["no_sign_request"])
@@ -138,7 +134,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             }
             mock_instance.list_all_files = Mock()
 
-            result = runner.invoke(cli, ["ls"])
+            runner.invoke(cli, ["ls"])
 
             # S3LFS should have been called with no_sign_request=True
             call_kwargs = mock_cls.call_args[1]
@@ -162,7 +158,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             }
             mock_instance.list_all_files = Mock()
 
-            result = runner.invoke(cli, ["ls", "--no-sign-request"])
+            runner.invoke(cli, ["ls", "--no-sign-request"])
 
             call_kwargs = mock_cls.call_args[1]
             self.assertTrue(call_kwargs["no_sign_request"])
@@ -187,7 +183,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             }
             mock_instance.track = Mock()
 
-            result = runner.invoke(cli, ["track", "testfile.txt"])
+            runner.invoke(cli, ["track", "testfile.txt"])
 
             call_kwargs = mock_cls.call_args[1]
             self.assertTrue(call_kwargs["use_acceleration"])
@@ -233,7 +229,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             }
             mock_instance.parallel_download_all = Mock()
 
-            result = runner.invoke(cli, ["checkout", "--all"])
+            runner.invoke(cli, ["checkout", "--all"])
 
             call_kwargs = mock_cls.call_args[1]
             self.assertTrue(call_kwargs["no_sign_request"])
@@ -256,7 +252,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             }
             mock_instance.cleanup_s3 = Mock()
 
-            result = runner.invoke(cli, ["cleanup", "--force"])
+            runner.invoke(cli, ["cleanup", "--force"])
 
             call_kwargs = mock_cls.call_args[1]
             self.assertTrue(call_kwargs["no_sign_request"])
@@ -285,7 +281,7 @@ class TestConfigCLIIntegration(unittest.TestCase):
             mock_instance.remove_subtree = Mock()
             mock_instance.path_resolver = Mock()
 
-            result = runner.invoke(cli, ["remove", "somefile.txt"])
+            runner.invoke(cli, ["remove", "somefile.txt"])
 
             call_kwargs = mock_cls.call_args[1]
             self.assertTrue(call_kwargs["no_sign_request"])
