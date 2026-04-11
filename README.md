@@ -1,6 +1,6 @@
 # s3lfs
 
-A Python-based version control system for large assets using Amazon S3. This system is designed to work like Git LFS but utilizes S3 for better bandwidth and scalability. It supports file tracking, parallel operations, and encryption.
+A Python-based version control system for large assets using Amazon S3 and S3-compatible storage. This system is designed to work like Git LFS but utilizes S3 for better bandwidth and scalability. It supports file tracking, parallel operations, encryption, and any S3-compatible backend (MinIO, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, etc.).
 
 ## Features
 
@@ -294,6 +294,24 @@ export AWS_ACCESS_KEY_ID=your_access_key
 export AWS_SECRET_ACCESS_KEY=your_secret_key
 export AWS_DEFAULT_REGION=us-east-1
 ```
+
+### S3-Compatible Storage
+Use the `--endpoint-url` flag to connect to any S3-compatible storage provider:
+```sh
+# MinIO
+s3lfs init my-bucket my-project --endpoint-url http://localhost:9000
+
+# Cloudflare R2
+s3lfs init my-bucket my-project --endpoint-url https://<account-id>.r2.cloudflarestorage.com
+
+# Backblaze B2
+s3lfs init my-bucket my-project --endpoint-url https://s3.us-west-004.backblazeb2.com
+
+# Wasabi
+s3lfs init my-bucket my-project --endpoint-url https://s3.wasabisys.com
+```
+
+The endpoint URL is stored in the manifest, so subsequent commands pick it up automatically — no need to pass `--endpoint-url` on every invocation. You can override it per-command if needed.
 
 ### Public Buckets
 For public S3 buckets, use the `--no-sign-request` flag:
