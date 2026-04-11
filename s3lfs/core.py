@@ -164,8 +164,9 @@ class S3LFS:
         self.cache_file = self.manifest_file.parent / cache_file_name
 
         self.no_sign_request = no_sign_request
-        self._cache_mtime = None
+        self._cache_mtime: Optional[float] = None
         self._cache_dirty = False
+        self.hash_cache: dict = {}
         self.load_manifest()
         self.load_cache()
 
