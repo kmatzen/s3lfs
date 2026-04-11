@@ -163,6 +163,12 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
     is_flag=True,
     help="Enable parallelism metrics collection",
 )
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
 def track(
     path,
     no_sign_request,
@@ -171,6 +177,7 @@ def track(
     verbose,
     modified,
     enable_metrics_flag,
+    workers,
 ):
     """Track files, directories, or globs. Use --modified to track only changed files."""
     # Enable metrics if requested
@@ -192,6 +199,7 @@ def track(
         no_sign_request=no_sign_request,
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
+        workers=workers,
     )
 
     if modified:
@@ -231,6 +239,12 @@ def track(
     is_flag=True,
     help="Enable parallelism metrics collection",
 )
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
 def checkout(
     path,
     no_sign_request,
@@ -239,6 +253,7 @@ def checkout(
     verbose,
     all,
     enable_metrics_flag,
+    workers,
 ):
     """Checkout files, directories, or globs. Use --all to checkout all tracked files."""
     # Enable metrics if requested
@@ -260,6 +275,7 @@ def checkout(
         no_sign_request=no_sign_request,
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
+        workers=workers,
     )
 
     if all:
@@ -412,7 +428,13 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
     default=None,
     help="Custom S3 endpoint URL for S3-compatible storage",
 )
-def cleanup(force, no_sign_request, use_acceleration, endpoint_url):
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
+def cleanup(force, no_sign_request, use_acceleration, endpoint_url, workers):
     """Clean up unreferenced files from S3."""
     # Find git root
     git_root = find_git_root()
@@ -431,6 +453,7 @@ def cleanup(force, no_sign_request, use_acceleration, endpoint_url):
         no_sign_request=no_sign_request,
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
+        workers=workers,
     )
     versioner.cleanup_s3(force=force)
 

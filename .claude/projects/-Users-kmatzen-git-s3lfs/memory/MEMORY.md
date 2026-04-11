@@ -1,0 +1,1 @@
+- [No emojis or emdashes](feedback_no_emojis_emdashes.md) - User prefers plain text, no emojis or emdashes in code/output
