@@ -31,6 +31,22 @@ BUCKET = os.environ.get("S3LFS_TEST_BUCKET")
 _skip_reason = "S3LFS_TEST_ENDPOINT and S3LFS_TEST_BUCKET not set"
 
 
+def _init_repo_no_encryption(prefix):
+    """Initialize s3lfs via the Python API with encryption disabled.
+
+    MinIO does not support AES256 server-side encryption by default,
+    so integration tests must disable it.
+    """
+    s3 = S3LFS(
+        bucket_name=BUCKET,
+        repo_prefix=prefix,
+        endpoint_url=ENDPOINT,
+        encryption=False,
+    )
+    s3.initialize_repo()
+    return s3
+
+
 @unittest.skipUnless(ENDPOINT and BUCKET, _skip_reason)
 class TestMinIOWorkflow(unittest.TestCase):
     """Full workflow against a real MinIO server."""
@@ -50,7 +66,6 @@ class TestMinIOWorkflow(unittest.TestCase):
             capture_output=True,
         )
 
-        # Use a unique prefix per test run to avoid collisions
         import uuid
 
         self.prefix = f"test-{uuid.uuid4().hex[:8]}"
@@ -62,20 +77,7 @@ class TestMinIOWorkflow(unittest.TestCase):
     def test_init_track_checkout_roundtrip(self):
         """Track files, delete them, checkout, verify content."""
         runner = CliRunner()
-
-        # Init
-        result = runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertTrue(Path(".s3_manifest.yaml").exists())
+        _init_repo_no_encryption(self.prefix)
 
         # Create files
         os.makedirs("data", exist_ok=True)
@@ -260,16 +262,7 @@ class TestMinIOWorkflow(unittest.TestCase):
     def test_install_uninstall_hooks(self):
         """install/uninstall create and remove git hooks."""
         runner = CliRunner()
-        runner.invoke(
-            cli,
-            [
-                "init",
-                BUCKET,
-                self.prefix,
-                "--endpoint-url",
-                ENDPOINT,
-            ],
-        )
+        _init_repo_no_encryption(self.prefix)
 
         result = runner.invoke(cli, ["install"])
         self.assertEqual(result.exit_code, 0)
@@ -299,12 +292,7 @@ class TestMinIOCoreAPI(unittest.TestCase):
 
         self.prefix = f"test-{uuid.uuid4().hex[:8]}"
 
-        self.s3lfs = S3LFS(
-            bucket_name=BUCKET,
-            repo_prefix=self.prefix,
-            endpoint_url=ENDPOINT,
-        )
-        self.s3lfs.initialize_repo()
+        self.s3lfs = _init_repo_no_encryption(self.prefix)
 
     def tearDown(self):
         os.chdir(self.original_cwd)
