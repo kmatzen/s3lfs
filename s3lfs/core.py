@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -1374,50 +1374,225 @@ class S3LFS:
                     print(f"An error occurred: {e}")
 
     def parallel_download_all(self, silence=True):
-        """Download all files listed in the manifest in parallel."""
+        """Download all files using block-level parallelism."""
         with self._lock_context():
-            items = list(
-                self.manifest["files"].items()
-            )  # File paths as keys, hashes as values
+            items = list(self.manifest["files"].items())
 
         if not items:
-            print("⚠️ Manifest is empty. Nothing to download.")
+            print("Manifest is empty. Nothing to download.")
             return
 
-        print("📥 Starting parallel download of all tracked files...")
+        print("Starting block-level parallel download of all tracked files...")
 
-        # Test S3 credentials once before starting the parallel download
-        self.test_s3_credentials()
+        files_to_download = []
+        for manifest_key, file_hash in items:
+            filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
+            if filesystem_path.exists():
+                current_hash = self.hash_file(filesystem_path)
+                if current_hash == file_hash:
+                    if not silence:
+                        print(f"  Skipping {manifest_key} (up-to-date)")
+                    continue
+            files_to_download.append((manifest_key, file_hash))
+
+        if not files_to_download:
+            print("All files are up-to-date.")
+            return
+
+        self.parallel_download_chunked(files_to_download, silence=silence)
+
+    def _discover_chunks_for_file(self, manifest_key, file_hash):
+        """Discover S3 chunks for a single file."""
+        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+
+        resp = self._get_s3_client().list_objects_v2(
+            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
+        )
+        chunk_keys = [ck["Key"] for ck in resp.get("Contents", [])]
+
+        if chunk_keys:
+            return [
+                {
+                    "manifest_key": manifest_key,
+                    "file_hash": file_hash,
+                    "s3_key": f"{s3_key}.chunk{i}",
+                    "chunk_index": i,
+                    "is_chunked": True,
+                    "num_chunks": len(chunk_keys),
+                }
+                for i in range(len(chunk_keys))
+            ]
+        else:
+            return [
+                {
+                    "manifest_key": manifest_key,
+                    "file_hash": file_hash,
+                    "s3_key": s3_key,
+                    "chunk_index": 0,
+                    "is_chunked": False,
+                    "num_chunks": 1,
+                }
+            ]
+
+    def _download_chunk(self, chunk_info, target_path):
+        """Download a single S3 chunk to a target path."""
+        with open(target_path, "wb") as f:
+            self._get_s3_client().download_fileobj(
+                Bucket=self.bucket_name,
+                Key=chunk_info["s3_key"],
+                Fileobj=f,
+            )
+        return (
+            chunk_info["manifest_key"],
+            chunk_info["chunk_index"],
+            target_path,
+            target_path.stat().st_size,
+            chunk_info["is_chunked"],
+            chunk_info["num_chunks"],
+        )
+
+    def _finalize_file(self, manifest_key, chunk_paths, is_chunked, silence=True):
+        """Merge chunks (if needed) and decompress to final location."""
+        filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
+
+        if is_chunked and len(chunk_paths) > 1:
+            compressed_path = self.temp_dir / f"{uuid4()}.gz"
+            self.merge_files(compressed_path, chunk_paths)
+            for p in chunk_paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        else:
+            compressed_path = chunk_paths[0]
+
+        os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
+        try:
+            self.decompress_file(compressed_path, filesystem_path)
+        finally:
+            try:
+                os.remove(compressed_path)
+            except OSError:
+                pass
+
+    def parallel_download_chunked(self, file_items, silence=True):
+        """Download files with dynamic block-level parallelism.
+
+        Uses a single shared thread pool for both chunk discovery and
+        chunk download. As each file's chunks are discovered, download
+        tasks are submitted immediately.
+        """
+        if not file_items:
+            print("Nothing to download.")
+            return
+
+        self.test_s3_credentials(silence=silence)
+
+        lock = threading.Lock()
+        file_tracker = {}
+        files_finalized = 0
+        counters = {"total_bytes": 0, "total_chunks": 0, "chunks_done": 0}
 
         try:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                # Submit all tasks and collect futures
-                futures = [
-                    executor.submit(self.download, kv[0], silence=silence)
-                    for kv in items
-                ]
+            with tqdm(desc="Downloading", unit="chunk") as pbar:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                    pending = set()
 
-                # Iterate over futures as they complete
-                for future in tqdm(
-                    as_completed(futures), total=len(futures), desc="Downloading files"
-                ):
-                    if self._shutdown_requested:
-                        print(
-                            "⚠️ Shutdown requested. Cancelling remaining downloads..."
+                    def on_discovery_done(future):
+                        try:
+                            chunks = future.result()
+                        except Exception as e:
+                            print(f"Error discovering chunks: {e}")
+                            return
+
+                        mk = chunks[0]["manifest_key"]
+                        with lock:
+                            file_tracker[mk] = {
+                                "expected": len(chunks),
+                                "received": [],
+                                "is_chunked": chunks[0]["is_chunked"],
+                            }
+                            counters["total_chunks"] += len(chunks)
+                            pbar.total = counters["total_chunks"]
+                            pbar.refresh()
+
+                        for chunk in chunks:
+                            target = self.temp_dir / f"{uuid4()}.gz"
+                            dl_future = executor.submit(
+                                self._download_chunk, chunk, target
+                            )
+                            pending.add(dl_future)
+
+                    for manifest_key, file_hash in file_items:
+                        disc_future = executor.submit(
+                            self._discover_chunks_for_file,
+                            manifest_key,
+                            file_hash,
                         )
-                        break
+                        disc_future.add_done_callback(on_discovery_done)
+                        pending.add(disc_future)
 
-                    try:
-                        future.result()  # This will re-raise any exceptions from the thread.
-                    except CancelledError:
-                        print("⚠️ Task was cancelled.")
-                    except Exception as e:
-                        print(f"An unexpected error occurred: {e}")
+                    while pending:
+                        if self._shutdown_requested:
+                            print(
+                                "Shutdown requested. "
+                                "Cancelling remaining downloads..."
+                            )
+                            break
+
+                        done = {f for f in list(pending) if f.done()}
+                        if not done:
+                            time.sleep(0.01)
+                            continue
+
+                        for future in done:
+                            pending.discard(future)
+                            try:
+                                result = future.result()
+                            except Exception:
+                                continue
+
+                            if isinstance(result, list):
+                                continue
+
+                            (
+                                manifest_key,
+                                chunk_index,
+                                target_path,
+                                bytes_downloaded,
+                                is_chunked,
+                                num_chunks,
+                            ) = result
+
+                            with lock:
+                                counters["total_bytes"] += bytes_downloaded
+                                counters["chunks_done"] += 1
+                                pbar.update(1)
+
+                                entry = file_tracker.get(manifest_key)
+                                if entry is None:
+                                    continue
+                                entry["received"].append((chunk_index, target_path))
+
+                                if len(entry["received"]) == entry["expected"]:
+                                    entry["received"].sort(key=lambda x: x[0])
+                                    chunk_paths = [p for _, p in entry["received"]]
+                                    self._finalize_file(
+                                        manifest_key,
+                                        chunk_paths,
+                                        entry["is_chunked"],
+                                        silence=silence,
+                                    )
+                                    files_finalized += 1
 
         except KeyboardInterrupt:
-            print("\n⚠️ Download interrupted by user.")
+            print("\nDownload interrupted by user.")
         finally:
-            print("✅ All files downloaded.")
+            print(
+                f"Downloaded {files_finalized} file(s) "
+                f"({counters['chunks_done']} chunks, "
+                f"{counters['total_bytes'] / (1024 * 1024):.1f} MB compressed)."
+            )
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
@@ -1883,39 +2058,13 @@ class S3LFS:
                 files_to_download.append(file)
 
         if not files_to_download:
-            print("✅ All files are up-to-date. No downloads needed.")
+            print("All files are up-to-date. No downloads needed.")
             return
 
-        print(f"📥 {len(files_to_download)} files need to be downloaded.")
+        print(f"{len(files_to_download)} files need to be downloaded.")
 
-        # Phase 3: Download files that need updates
-        print("🚀 Downloading files...")
-        try:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = [
-                    executor.submit(self.download, file, silence=silence)
-                    for file in files_to_download
-                ]
-
-                for future in tqdm(
-                    as_completed(futures), total=len(futures), desc="Downloading files"
-                ):
-                    if self._shutdown_requested:
-                        print(
-                            "⚠️ Shutdown requested. Cancelling remaining downloads..."
-                        )
-                        break
-
-                    try:
-                        future.result()  # Will re-raise exceptions from the worker thread
-                    except Exception as e:
-                        print(f"An error occurred during download: {e}")
-                        raise
-
-        except KeyboardInterrupt:
-            print("\n⚠️ Download interrupted by user.")
-        finally:
-            print(f"✅ Successfully checked out files for '{path}'.")
+        file_items = [(f, files_to_checkout[f]) for f in files_to_download]
+        self.parallel_download_chunked(file_items, silence=silence)
 
     def merge_files(self, output_path, chunk_paths):
         """
