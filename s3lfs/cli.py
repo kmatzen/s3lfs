@@ -134,7 +134,7 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
             endpoint_url=endpoint_url,
         )
         s3lfs.initialize_repo()
-        print(f"✅ Repository initialized with bucket '{bucket}' and prefix '{prefix}'")
+        print(f"Repository initialized with bucket '{bucket}' and prefix '{prefix}'")
     except Exception as e:
         print(f"Error: {e}")
         return
@@ -493,7 +493,7 @@ def migrate(force):
 
     # Show migration plan
     file_count = len(manifest_data.get("files", {}))
-    click.echo("📋 Migration Plan:")
+    click.echo("Migration Plan:")
     click.echo(f"   Source: .s3_manifest.json ({file_count} tracked files)")
     click.echo("   Target: .s3_manifest.yaml")
     click.echo()
@@ -505,14 +505,14 @@ def migrate(force):
         click.echo()
         confirm = click.confirm("Do you want to proceed?")
         if not confirm:
-            click.echo("❌ Migration cancelled.")
+            click.echo("Migration cancelled.")
             return
 
     # Write YAML manifest
     try:
         with open(yaml_manifest, "w") as f:
             yaml.safe_dump(manifest_data, f, default_flow_style=False, sort_keys=True)
-        click.echo(f"✅ Successfully created {yaml_manifest.name}")
+        click.echo(f"Successfully created {yaml_manifest.name}")
     except Exception as e:
         click.echo(f"Error: Failed to write YAML manifest: {e}")
         raise click.Abort()
@@ -527,13 +527,13 @@ def migrate(force):
                 cache_data = json.load(f)
             with open(yaml_cache, "w") as f:
                 yaml.safe_dump(cache_data, f, default_flow_style=False, sort_keys=True)
-            click.echo(f"✅ Successfully migrated cache file to {yaml_cache.name}")
+            click.echo(f"Successfully migrated cache file to {yaml_cache.name}")
         except Exception as e:
-            click.echo(f"⚠️  Warning: Failed to migrate cache file: {e}")
+            click.echo(f"Warning: Failed to migrate cache file: {e}")
             click.echo("   (Cache will be rebuilt automatically)")
 
     click.echo()
-    click.echo("🎉 Migration complete!")
+    click.echo("Migration complete!")
     click.echo()
     click.echo("Next steps:")
     click.echo("  1. Test the YAML manifest: s3lfs ls")
