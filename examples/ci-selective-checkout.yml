@@ -1,0 +1,28 @@
+# Example: Checkout only specific s3lfs files needed for a build
+#
+# This avoids downloading all tracked files, saving time and bandwidth.
+# Useful when your repo tracks many large files but a given job only needs a subset.
+
+name: Build with selective assets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Only download texture assets needed for the build
+      - uses: kmatzen/s3lfs@main
+        with:
+          checkout: "assets/textures/**"

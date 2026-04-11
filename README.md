@@ -229,6 +229,57 @@ Periodically clean up unreferenced files (use with caution - this feature is unt
 s3lfs cleanup
 ```
 
+## CI/CD Integration
+
+### GitHub Action
+
+Use the built-in GitHub Action to install s3lfs and checkout tracked files in your workflows:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: us-east-1
+
+  - uses: kmatzen/s3lfs@main
+    with:
+      checkout: all
+```
+
+#### Selective Checkout
+
+Only download the files your pipeline needs — no wasted bandwidth:
+
+```yaml
+  - uses: kmatzen/s3lfs@main
+    with:
+      checkout: "assets/textures/**"
+```
+
+#### Action Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `version` | `latest` | s3lfs version to install |
+| `checkout` | `none` | `all`, a glob pattern, or `none` (install only) |
+| `no-sign-request` | `false` | Use unsigned S3 requests (public buckets) |
+| `use-acceleration` | `false` | Enable S3 Transfer Acceleration |
+
+See [`examples/`](examples/) for complete workflow files.
+
+### Other CI Systems
+
+For GitLab CI, Jenkins, or other systems, install s3lfs directly:
+
+```sh
+pip install s3lfs
+s3lfs checkout --all           # or a selective glob
+```
+
 ## Configuration
 
 ### AWS Credentials

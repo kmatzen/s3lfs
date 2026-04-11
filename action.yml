@@ -1,0 +1,54 @@
+name: "s3lfs"
+description: "Install s3lfs and optionally checkout tracked files from S3"
+branding:
+  icon: "upload-cloud"
+  color: "orange"
+
+inputs:
+  version:
+    description: "s3lfs version to install (default: latest)"
+    required: false
+    default: "latest"
+  checkout:
+    description: "Files to checkout after install. Use 'all' for everything, a glob pattern for selective checkout, or 'none' to skip."
+    required: false
+    default: "none"
+  no-sign-request:
+    description: "Use unsigned S3 requests (for public buckets)"
+    required: false
+    default: "false"
+  use-acceleration:
+    description: "Enable S3 Transfer Acceleration"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install s3lfs
+      shell: bash
+      run: |
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          pip install s3lfs
+        else
+          pip install "s3lfs==${{ inputs.version }}"
+        fi
+        echo "s3lfs $(s3lfs --version 2>/dev/null || echo 'installed')"
+
+    - name: Checkout s3lfs files
+      if: inputs.checkout != 'none'
+      shell: bash
+      run: |
+        FLAGS=""
+        if [ "${{ inputs.no-sign-request }}" = "true" ]; then
+          FLAGS="$FLAGS --no-sign-request"
+        fi
+        if [ "${{ inputs.use-acceleration }}" = "true" ]; then
+          FLAGS="$FLAGS --use-acceleration"
+        fi
+
+        if [ "${{ inputs.checkout }}" = "all" ]; then
+          s3lfs checkout --all $FLAGS
+        else
+          s3lfs checkout "${{ inputs.checkout }}" $FLAGS
+        fi
