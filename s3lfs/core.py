@@ -97,6 +97,7 @@ class S3LFS:
         chunk_size=DEFAULT_CHUNK_SIZE,
         s3_factory=None,
         use_acceleration=False,
+        endpoint_url=None,
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -108,25 +109,32 @@ class S3LFS:
         :param chunk_size: Size of chunks for multipart uploads (default: 5 GB)
         :param s3_factory: Custom S3 client factory function (for testing)
         :param use_acceleration: If True, enable S3 Transfer Acceleration
+        :param endpoint_url: Custom S3 endpoint URL for S3-compatible storage (e.g. MinIO, R2, Wasabi)
         """
         self.chunk_size = chunk_size
         self.use_acceleration = use_acceleration
+        self.endpoint_url = endpoint_url
 
         def default_s3_factory(no_sign_request):
             """Default S3 client factory with proper boto3 usage."""
+            kwargs = {}
+            if self.endpoint_url:
+                kwargs["endpoint_url"] = self.endpoint_url
             if no_sign_request:
                 if self.use_acceleration:
                     raise RuntimeError(ERROR_MESSAGES["acceleration_not_supported"])
                 config = Config(signature_version=UNSIGNED)
-                return boto3.client("s3", config=config)
+                return boto3.client("s3", config=config, **kwargs)
             else:
                 if self.use_acceleration:
                     # Use transfer acceleration endpoint
                     return boto3.client(
-                        "s3", config=Config(s3={"use_accelerate_endpoint": True})
+                        "s3",
+                        config=Config(s3={"use_accelerate_endpoint": True}),
+                        **kwargs,
                     )
                 else:
-                    return boto3.client("s3")
+                    return boto3.client("s3", **kwargs)
 
         self.s3_factory = s3_factory if s3_factory is not None else default_s3_factory
 
@@ -180,6 +188,13 @@ class S3LFS:
                 self.manifest["repo_prefix"] = repo_prefix
             else:
                 self.repo_prefix = self.manifest.get("repo_prefix", "s3lfs")
+
+            # Load endpoint_url from manifest if not provided as parameter
+            if self.endpoint_url:
+                self.manifest["endpoint_url"] = self.endpoint_url
+            else:
+                self.endpoint_url = self.manifest.get("endpoint_url")
+
             self.save_manifest()
 
         self.encryption = encryption
@@ -260,6 +275,8 @@ class S3LFS:
                 self.manifest["bucket_name"] = str(self.bucket_name)  # type: ignore
             if self.repo_prefix is not None:
                 self.manifest["repo_prefix"] = str(self.repo_prefix)  # type: ignore
+            if self.endpoint_url is not None:
+                self.manifest["endpoint_url"] = str(self.endpoint_url)  # type: ignore
             self.save_manifest()
 
         # Update .gitignore to exclude cache files
@@ -268,6 +285,8 @@ class S3LFS:
         print("✅ Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
+        if self.endpoint_url:
+            print(f"   Endpoint URL: {self.endpoint_url}")
         print(f"Manifest file saved as {self.manifest_file.name}")
 
     def _update_gitignore(self):
