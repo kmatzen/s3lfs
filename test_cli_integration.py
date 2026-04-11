@@ -174,11 +174,12 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         from pathlib import Path
 
         # Mock the necessary components to test the path resolution logic
-        with patch("s3lfs.cli.find_git_root") as mock_find_git_root, patch(
-            "s3lfs.cli.get_manifest_path"
-        ) as mock_get_manifest_path, patch("pathlib.Path.cwd") as mock_cwd, patch(
-            "pathlib.Path.exists"
-        ) as mock_exists:
+        with (
+            patch("s3lfs.cli.find_git_root") as mock_find_git_root,
+            patch("s3lfs.cli.get_manifest_path") as mock_get_manifest_path,
+            patch("pathlib.Path.cwd") as mock_cwd,
+            patch("pathlib.Path.exists") as mock_exists,
+        ):
             # Setup mocks
             git_root = Path("/test/git/root")
             mock_find_git_root.return_value = git_root
