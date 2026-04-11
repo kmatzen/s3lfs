@@ -35,7 +35,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         self.s3_mock.start()
 
         self.bucket_name = "test-coverage-bucket"
-        self.s3 = boto3.client("s3")
+        self.s3 = boto3.client("s3", region_name="us-east-1")
         self.s3.create_bucket(Bucket=self.bucket_name)
 
         # Create test directory in a temporary location to avoid polluting git root
@@ -116,7 +116,7 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         with patch("json.dump", side_effect=Exception("JSON error")):
             with patch("builtins.print") as mock_print:
                 self.versioner.save_manifest()
-                mock_print.assert_any_call("❌ Failed to save manifest: JSON error")
+                mock_print.assert_any_call("Failed to save manifest: JSON error")
 
     def test_save_cache_error_handling(self):
         """Test save_cache error handling and cleanup."""
@@ -847,9 +847,11 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     def test_hash_file_auto_selection_linux_cli(self):
         """Test automatic selection of CLI method on Linux for non-empty files."""
-        with patch("sys.platform", "linux"), patch(
-            "shutil.which", return_value="/usr/bin/sha256sum"
-        ), patch("subprocess.run") as mock_run:
+        with (
+            patch("sys.platform", "linux"),
+            patch("shutil.which", return_value="/usr/bin/sha256sum"),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value.stdout = "abc123def456 /path/to/file\n"
 
             # Should select CLI method for non-empty files on Linux
@@ -858,9 +860,11 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     def test_md5_file_auto_selection_linux(self):
         """Test MD5 auto selection on Linux."""
-        with patch("sys.platform", "linux"), patch(
-            "shutil.which", return_value="/usr/bin/md5sum"
-        ), patch("subprocess.run") as mock_run:
+        with (
+            patch("sys.platform", "linux"),
+            patch("shutil.which", return_value="/usr/bin/md5sum"),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value.stdout = (
                 "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
             )
@@ -870,9 +874,11 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     def test_md5_file_auto_selection_macos(self):
         """Test MD5 auto selection on macOS."""
-        with patch("sys.platform", "darwin"), patch(
-            "shutil.which", return_value="/usr/bin/md5"
-        ), patch("subprocess.run") as mock_run:
+        with (
+            patch("sys.platform", "darwin"),
+            patch("shutil.which", return_value="/usr/bin/md5"),
+            patch("subprocess.run") as mock_run,
+        ):
             mock_run.return_value.stdout = (
                 "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
             )
@@ -882,9 +888,15 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     def test_compress_file_auto_selection_cli(self):
         """Test automatic selection of CLI compression method."""
-        with patch("sys.platform", "linux"), patch(
-            "shutil.which", return_value="/usr/bin/gzip"
-        ), patch("builtins.open", mock_open()):
+
+        def which_no_pigz(cmd):
+            return "/usr/bin/gzip" if cmd == "gzip" else None
+
+        with (
+            patch("sys.platform", "linux"),
+            patch("shutil.which", side_effect=which_no_pigz),
+            patch("builtins.open", mock_open()),
+        ):
             result = self.versioner.compress_file(self.test_file, method="auto")
             self.assertTrue(str(result).endswith(".gz"))
 
@@ -893,10 +905,16 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         compressed_file = self.test_dir / "test.gz"
         compressed_file.touch()
 
+        def which_no_pigz(cmd):
+            return "/usr/bin/gzip" if cmd == "gzip" else None
+
         try:
-            with patch("sys.platform", "linux"), patch(
-                "shutil.which", return_value="/usr/bin/gzip"
-            ), patch("subprocess.run") as mock_run, patch("builtins.open", mock_open()):
+            with (
+                patch("sys.platform", "linux"),
+                patch("shutil.which", side_effect=which_no_pigz),
+                patch("subprocess.run") as mock_run,
+                patch("builtins.open", mock_open()),
+            ):
                 mock_run.return_value.returncode = 0
 
                 result = self.versioner.decompress_file(compressed_file, method="auto")

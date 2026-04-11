@@ -206,12 +206,13 @@ class TestTrackModifiedReducedLocking(unittest.TestCase):
             with patch.object(s3lfs, "_lock_context", side_effect=counting_lock):
                 s3lfs.track_modified_files_cached(silence=True)
 
-            # Should be a small constant (1 for initial load, maybe
-            # 1 for cache save), not 1-per-file
+            # Should be a small constant, not 1-per-file.
+            # Expected: initial load (1) + cache save (1) +
+            # parallel_upload_chunked locks (2-3 for prep/manifest)
             self.assertLessEqual(
                 lock_count[0],
-                3,
-                f"Lock acquired {lock_count[0]} times, expected at most 3",
+                6,
+                f"Lock acquired {lock_count[0]} times, expected at most 6",
             )
 
 

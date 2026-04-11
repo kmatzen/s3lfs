@@ -43,8 +43,8 @@ class TestPigzCompression(unittest.TestCase):
             s3lfs = S3LFS(bucket_name="test-bucket")
 
             with patch("shutil.which") as mock_which:
-                mock_which.side_effect = (
-                    lambda cmd: "/usr/bin/pigz" if cmd == "pigz" else None
+                mock_which.side_effect = lambda cmd: (
+                    "/usr/bin/pigz" if cmd == "pigz" else None
                 )
 
                 with patch.object(
@@ -60,8 +60,8 @@ class TestPigzCompression(unittest.TestCase):
             s3lfs = S3LFS(bucket_name="test-bucket")
 
             with patch("shutil.which") as mock_which:
-                mock_which.side_effect = (
-                    lambda cmd: "/usr/bin/gzip" if cmd == "gzip" else None
+                mock_which.side_effect = lambda cmd: (
+                    "/usr/bin/gzip" if cmd == "gzip" else None
                 )
 
                 with patch.object(
@@ -168,8 +168,8 @@ class TestPigzDecompression(unittest.TestCase):
             output = Path(self.temp_dir) / "out.bin"
 
             with patch("shutil.which") as mock_which:
-                mock_which.side_effect = (
-                    lambda cmd: "/usr/bin/pigz" if cmd == "pigz" else None
+                mock_which.side_effect = lambda cmd: (
+                    "/usr/bin/pigz" if cmd == "pigz" else None
                 )
 
                 with patch.object(
