@@ -83,7 +83,7 @@ class TestApplyConfig(unittest.TestCase):
         self.assertTrue(merged["use_acceleration"])
 
     def test_defaults_when_no_config_no_cli(self):
-        config = {}
+        config: dict = {}
         cli_kwargs = {"no_sign_request": False, "use_acceleration": False}
         merged = apply_config(config, cli_kwargs)
         self.assertFalse(merged["no_sign_request"])
