@@ -120,10 +120,11 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     def test_save_cache_error_handling(self):
         """Test save_cache error handling and cleanup."""
+        self.versioner._cache_dirty = True
         with patch("json.dump", side_effect=Exception("Cache error")):
             with patch("builtins.print") as mock_print:
                 self.versioner.save_cache()
-                mock_print.assert_any_call("❌ Failed to save cache: Cache error")
+                mock_print.assert_any_call("Failed to save cache: Cache error")
 
     def test_load_cache_json_decode_error(self):
         """Test load_cache with corrupted JSON file."""
