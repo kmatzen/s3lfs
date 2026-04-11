@@ -5,14 +5,17 @@ A Python-based version control system for large assets using Amazon S3 and S3-co
 ## Features
 
 - Upload and track large files in S3 instead of Git
-- Stores asset versions using SHA-256 hashes
-- Encrypts stored assets with AES256 server-side encryption
-- Cleanup of unreferenced files in S3 (experimental)
-- **Parallel uploads/downloads**: Improves speed using multi-threading
-- **Compression before upload**: Uses gzip to reduce storage and bandwidth usage
-- **File deduplication**: Prevents redundant uploads using content hashing
-- **Flexible path resolution**: Supports files, directories, and glob patterns
-- **Multiple hashing algorithms**: SHA-256 (default) and MD5 support
+- Works with any S3-compatible storage (MinIO, Cloudflare R2, Backblaze B2, Wasabi)
+- **Block-level parallel transfers**: Downloads and uploads flatten all chunks across all files into a single worker pool
+- **Automatic parallel compression**: Uses pigz when available, falls back to gzip
+- **Git hook integration**: `s3lfs install` sets up post-checkout, post-merge, and pre-push hooks
+- **Git LFS migration**: One-command migration with `s3lfs migrate-from-lfs`
+- **GitHub Action**: Built-in CI/CD support with selective checkout
+- **Per-repo config**: `.s3lfsconfig` file for team-wide defaults
+- SHA-256 content-based file deduplication
+- AES256 server-side encryption
+- Configurable worker count (auto-detected from CPU count)
+- Exponential backoff retries for transient S3 errors
 
 ## Installation
 
@@ -57,6 +60,8 @@ s3lfs track --modified
 - `--modified`: Track only files that have changed since last upload
 - `--verbose`: Show detailed progress information
 - `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+- `--workers N`: Number of parallel workers (default: auto-detected from CPU count)
+- `--metrics`: Enable parallelism metrics collection
 
 **Examples**:
 ```sh
@@ -77,6 +82,8 @@ s3lfs checkout --all
 - `--all`: Download all files tracked in the manifest
 - `--verbose`: Show detailed progress information
 - `--no-sign-request`: Use unsigned S3 requests (for public buckets)
+- `--workers N`: Number of parallel workers (default: auto-detected from CPU count)
+- `--metrics`: Enable parallelism metrics collection
 
 **Examples**:
 ```sh
@@ -149,6 +156,25 @@ s3lfs cleanup
 s3lfs cleanup --force                    # Clean up without confirmation
 ```
 
+### Install Git Hooks
+```sh
+s3lfs install
+```
+**Description**: Installs git hooks for transparent s3lfs integration. After installation, tracked files are automatically downloaded after `git checkout` and `git merge`, and modified files are automatically uploaded before `git push`.
+
+**Installed hooks**:
+- `post-checkout`: Downloads tracked files after branch checkouts
+- `post-merge`: Downloads tracked files after merges
+- `pre-push`: Uploads modified tracked files before push
+
+The hooks are non-blocking -- if s3lfs fails or is not available, the git operation continues with a warning. Hooks are appended to existing hook files, preserving any other hooks you have.
+
+### Uninstall Git Hooks
+```sh
+s3lfs uninstall
+```
+**Description**: Removes s3lfs git hooks. Other hooks in the same files are preserved.
+
 ### Migrate from Git LFS
 ```sh
 s3lfs migrate-from-lfs <bucket-name> <repo-prefix>
@@ -188,6 +214,13 @@ This creates `.s3_manifest.yaml` which should be committed to Git, and automatic
 git add .s3_manifest.yaml .gitignore
 git commit -m "Initialize S3LFS"
 ```
+
+### 1b. (Optional) Install Hooks
+For a Git LFS-like experience where files sync automatically:
+```sh
+s3lfs install
+```
+With hooks installed, `git pull` and `git checkout` automatically download tracked files, and `git push` automatically uploads modified files.
 
 ### 2. Track Large Files
 Instead of committing large files directly to Git, track them with S3LFS:
@@ -368,19 +401,41 @@ The `.s3_manifest.yaml` file contains:
 
 ## Advanced Features
 
+### Parallel Operations
+Uploads and downloads use block-level parallelism: all chunks across all files are submitted to a single shared worker pool. This means a 20GB file split into 4 chunks downloads all 4 concurrently, alongside chunks from other files.
+
+The worker count is auto-detected from your CPU count but can be overridden:
+```sh
+s3lfs track data/ --workers 32       # Use 32 parallel workers
+s3lfs checkout --all --workers 16    # Limit to 16 workers
+```
+
+The default is `min(32, cpu_count + 4)`. Increase for high-bandwidth connections with many small files; decrease for memory-constrained environments.
+
+### Compression
+Files are automatically compressed with gzip before upload. When `pigz` is installed, s3lfs uses it for parallel compression across all CPU cores. The output format is identical to gzip, so existing tracked files work without changes.
+
+To install pigz: `apt install pigz` (Debian/Ubuntu), `brew install pigz` (macOS).
+
+### Performance Metrics
+Use the `--metrics` flag to collect parallelism metrics during operations:
+```sh
+s3lfs track data/ --metrics
+s3lfs checkout --all --metrics
+```
+
+This reports worker utilization, task durations, and stage-level parallelism for hashing, compression, upload, and download.
+
+### Retry Behavior
+Transient S3 errors (network timeouts, throttling) are retried automatically with exponential backoff (2s, 4s, 8s, capped at 30s). Each operation retries up to 3 times before failing.
+
+### File Deduplication
+Files with identical content (same hash) are stored only once in S3, regardless of path or filename.
+
 ### Multiple Hashing Algorithms
 S3LFS supports both SHA-256 (default) and MD5 hashing:
 - SHA-256: More secure, used for file integrity
 - MD5: Available for compatibility with legacy systems
-
-### Compression
-All files are automatically compressed with gzip before upload, reducing storage costs and transfer time.
-
-### Parallel Operations
-Large file operations use multi-threading for improved performance on multiple files.
-
-### File Deduplication
-Files with identical content (same hash) are stored only once in S3, regardless of path or filename.
 
 ## Troubleshooting
 
