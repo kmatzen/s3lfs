@@ -264,3 +264,17 @@ def disable_metrics() -> None:
 def is_enabled() -> bool:
     """Check if metrics collection is enabled."""
     return _global_tracker is not None
+
+
+@contextmanager
+def track(stage_name, task_id):
+    """Context manager that tracks a task when metrics are enabled.
+
+    When metrics are disabled this is a no-op, so callers never need
+    an if/else branch.
+    """
+    if _global_tracker is not None:
+        with _global_tracker.track_task(stage_name, task_id):
+            yield
+    else:
+        yield
