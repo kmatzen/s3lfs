@@ -1348,30 +1348,159 @@ class S3LFS:
             print("No modified files needing upload.")
 
     def parallel_upload(self, files, silence=True):
-        """Parallel upload of multiple files using ThreadPoolExecutor."""
-        # Test S3 credentials once before starting parallel operations
-        if not silence:
-            print("🔐 Testing S3 credentials...")
-        self.test_s3_credentials(silence=silence)
+        """Upload multiple files with block-level parallelism."""
+        self.parallel_upload_chunked(files, silence=silence)
 
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            # Submit each download task; unpack key from matching_files.items()
-            futures = [
-                executor.submit(
-                    self.upload, f, silence=silence, needs_immediate_update=False
-                )
-                for f in files
+    def _prepare_file_for_upload(self, file_path):
+        """Hash, compress, and split a file into uploadable chunks."""
+        file_path = Path(file_path)
+        file_hash = self.hash_file(file_path)
+        manifest_key = self._get_manifest_key(file_path)
+
+        with self._lock_context():
+            stored_hash = self.manifest["files"].get(manifest_key)
+        if file_hash == stored_hash:
+            return None
+
+        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+        extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
+
+        compressed_path = self.compress_file(file_path)
+
+        if compressed_path.stat().st_size > self.chunk_size:
+            chunk_paths = self.split_file(compressed_path)
+            try:
+                os.remove(compressed_path)
+            except OSError:
+                pass
+            chunks = [
+                {
+                    "path": p,
+                    "s3_key": f"{s3_key}.chunk{i}",
+                    "chunk_index": i,
+                    "extra_args": extra_args,
+                }
+                for i, p in enumerate(chunk_paths)
+            ]
+        else:
+            chunks = [
+                {
+                    "path": compressed_path,
+                    "s3_key": s3_key,
+                    "chunk_index": 0,
+                    "extra_args": extra_args,
+                }
             ]
 
-            for future in tqdm(
-                as_completed(futures), total=len(futures), desc="Uploading files"
-            ):
-                try:
-                    # This will raise the exception if the download failed
-                    future.result()
-                except Exception as e:
-                    # Handle any other exceptions that may occur
-                    print(f"An error occurred: {e}")
+        return (manifest_key, file_hash, chunks)
+
+    def _upload_chunk(self, chunk_info):
+        """Upload a single compressed chunk to S3."""
+        path = chunk_info["path"]
+        s3_key = chunk_info["s3_key"]
+        extra_args = chunk_info["extra_args"]
+
+        try:
+            with open(path, "rb") as f:
+                self._get_s3_client().upload_fileobj(
+                    f,
+                    self.bucket_name,
+                    s3_key,
+                    ExtraArgs=extra_args,
+                    Config=self.config,
+                )
+            bytes_uploaded = path.stat().st_size
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        return (s3_key, bytes_uploaded)
+
+    def parallel_upload_chunked(self, files, silence=True):
+        """Upload files with dynamic block-level parallelism."""
+        if not files:
+            print("Nothing to upload.")
+            return
+
+        self.test_s3_credentials(silence=silence)
+
+        lock = threading.Lock()
+        manifest_updates = {}
+        counters = {"total_bytes": 0, "total_chunks": 0, "chunks_done": 0}
+
+        try:
+            with tqdm(desc="Uploading", unit="chunk") as pbar:
+                with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                    pending = set()
+
+                    def on_prep_done(future):
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            print(f"Error preparing file: {e}")
+                            return
+
+                        if result is None:
+                            return
+
+                        manifest_key, file_hash, chunks = result
+                        with lock:
+                            manifest_updates[manifest_key] = file_hash
+                            counters["total_chunks"] += len(chunks)
+                            pbar.total = counters["total_chunks"]
+                            pbar.refresh()
+
+                        for chunk in chunks:
+                            ul_future = executor.submit(self._upload_chunk, chunk)
+                            pending.add(ul_future)
+
+                    for f in files:
+                        prep_future = executor.submit(self._prepare_file_for_upload, f)
+                        prep_future.add_done_callback(on_prep_done)
+                        pending.add(prep_future)
+
+                    while pending:
+                        if self._shutdown_requested:
+                            print(
+                                "Shutdown requested. " "Cancelling remaining uploads..."
+                            )
+                            break
+
+                        done = {fut for fut in list(pending) if fut.done()}
+                        if not done:
+                            time.sleep(0.01)
+                            continue
+
+                        for future in done:
+                            pending.discard(future)
+                            try:
+                                result = future.result()
+                            except Exception:
+                                continue
+
+                            if isinstance(result, tuple) and len(result) == 2:
+                                _, bytes_uploaded = result
+                                with lock:
+                                    counters["total_bytes"] += bytes_uploaded
+                                    counters["chunks_done"] += 1
+                                    pbar.update(1)
+
+        except KeyboardInterrupt:
+            print("\nUpload interrupted by user.")
+        finally:
+            if manifest_updates:
+                with self._lock_context():
+                    self.load_manifest()
+                    self.manifest["files"].update(manifest_updates)
+                    self.save_manifest()
+
+            print(
+                f"Uploaded {len(manifest_updates)} file(s) "
+                f"({counters['chunks_done']} chunks, "
+                f"{counters['total_bytes'] / (1024 * 1024):.1f} MB compressed)."
+            )
 
     def parallel_download_all(self, silence=True):
         """Download all files using block-level parallelism."""
