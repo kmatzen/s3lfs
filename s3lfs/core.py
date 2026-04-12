@@ -1454,73 +1454,70 @@ class S3LFS:
         return (s3_key, bytes_uploaded)
 
     def parallel_upload_chunked(self, files, silence=True):
-        """Upload files with dynamic block-level parallelism."""
+        """Upload files with block-level parallelism.
+
+        Preparation futures (hash + compress + split) are collected via
+        as_completed; as each resolves, chunk upload futures are
+        submitted into the same pool.
+        """
         if not files:
             print("Nothing to upload.")
             return
 
         self.test_s3_credentials(silence=silence)
 
-        lock = threading.Lock()
         manifest_updates = {}
-        counters = {"total_bytes": 0, "total_chunks": 0, "chunks_done": 0}
+        total_bytes = 0
+        total_chunks = 0
+        chunks_done = 0
 
         try:
             with tqdm(desc="Uploading", unit="chunk") as pbar:
                 with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                    pending = set()
+                    # Phase 1: submit all prep tasks
+                    prep_futures = {
+                        executor.submit(self._prepare_file_for_upload, f): f
+                        for f in files
+                    }
 
-                    def on_prep_done(future):
+                    # Phase 2: as preps complete, submit uploads
+                    ul_futures = {}
+                    for prep_future in as_completed(prep_futures):
+                        if self._shutdown_requested:
+                            break
                         try:
-                            result = future.result()
+                            result = prep_future.result()
                         except Exception as e:
                             print(f"Error preparing file: {e}")
-                            return
-
-                        if result is None:
-                            return
-
-                        manifest_key, file_hash, chunks = result
-                        with lock:
-                            manifest_updates[manifest_key] = file_hash
-                            counters["total_chunks"] += len(chunks)
-                            pbar.total = counters["total_chunks"]
-                            pbar.refresh()
-
-                        for chunk in chunks:
-                            ul_future = executor.submit(self._upload_chunk, chunk)
-                            pending.add(ul_future)
-
-                    for f in files:
-                        prep_future = executor.submit(self._prepare_file_for_upload, f)
-                        prep_future.add_done_callback(on_prep_done)
-                        pending.add(prep_future)
-
-                    while pending:
-                        if self._shutdown_requested:
-                            print(
-                                "Shutdown requested. " "Cancelling remaining uploads..."
-                            )
-                            break
-
-                        done = {fut for fut in list(pending) if fut.done()}
-                        if not done:
-                            time.sleep(0.01)
                             continue
 
-                        for future in done:
-                            pending.discard(future)
-                            try:
-                                result = future.result()
-                            except Exception:
-                                continue
+                        if result is None:
+                            continue
 
-                            if isinstance(result, tuple) and len(result) == 2:
-                                _, bytes_uploaded = result
-                                with lock:
-                                    counters["total_bytes"] += bytes_uploaded
-                                    counters["chunks_done"] += 1
-                                    pbar.update(1)
+                        manifest_key, file_hash, chunks = result
+                        manifest_updates[manifest_key] = file_hash
+                        total_chunks += len(chunks)
+                        pbar.total = total_chunks
+                        pbar.refresh()
+
+                        for chunk in chunks:
+                            f = executor.submit(self._upload_chunk, chunk)
+                            ul_futures[f] = chunk
+
+                    # Phase 3: collect upload results
+                    for ul_future in as_completed(ul_futures):
+                        if self._shutdown_requested:
+                            break
+                        try:
+                            _, bytes_uploaded = ul_future.result()
+                        except Exception as e:
+                            chunk = ul_futures[ul_future]
+                            print(f"Error uploading " f"{chunk['s3_key']}: {e}")
+                            continue
+
+                        total_bytes += bytes_uploaded
+                        chunks_done += 1
+                        pbar.update(1)
 
         except KeyboardInterrupt:
             print("\nUpload interrupted by user.")
@@ -1533,8 +1530,8 @@ class S3LFS:
 
             print(
                 f"Uploaded {len(manifest_updates)} file(s) "
-                f"({counters['chunks_done']} chunks, "
-                f"{counters['total_bytes'] / (1024 * 1024):.1f} MB compressed)."
+                f"({chunks_done} chunks, "
+                f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
 
     def parallel_download_all(self, silence=True):
@@ -1640,11 +1637,13 @@ class S3LFS:
                 pass
 
     def parallel_download_chunked(self, file_items, silence=True):
-        """Download files with dynamic block-level parallelism.
+        """Download files with block-level parallelism.
 
-        Uses a single shared thread pool for both chunk discovery and
-        chunk download. As each file's chunks are discovered, download
-        tasks are submitted immediately.
+        Discovery and download share a single thread pool.  Discovery
+        futures are collected via as_completed; as each resolves, its
+        chunk download futures are submitted into the same pool.  A
+        second as_completed pass collects download results and triggers
+        per-file finalization when all chunks land.
         """
         if not file_items:
             print("Nothing to download.")
@@ -1652,73 +1651,52 @@ class S3LFS:
 
         self.test_s3_credentials(silence=silence)
 
-        lock = threading.Lock()
         file_tracker = {}
         files_finalized = 0
-        counters = {"total_bytes": 0, "total_chunks": 0, "chunks_done": 0}
+        total_bytes = 0
+        total_chunks = 0
+        chunks_done = 0
 
         try:
             with tqdm(desc="Downloading", unit="chunk") as pbar:
                 with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                    pending = set()
+                    # Phase 1: submit all discovery tasks
+                    disc_futures = {
+                        executor.submit(self._discover_chunks_for_file, mk, fh): mk
+                        for mk, fh in file_items
+                    }
 
-                    def on_discovery_done(future):
+                    # Phase 2: as discoveries complete, submit downloads
+                    dl_futures = {}
+                    for disc_future in as_completed(disc_futures):
+                        if self._shutdown_requested:
+                            break
                         try:
-                            chunks = future.result()
+                            chunks = disc_future.result()
                         except Exception as e:
                             print(f"Error discovering chunks: {e}")
-                            return
+                            continue
 
                         mk = chunks[0]["manifest_key"]
-                        with lock:
-                            file_tracker[mk] = {
-                                "expected": len(chunks),
-                                "received": [],
-                                "is_chunked": chunks[0]["is_chunked"],
-                            }
-                            counters["total_chunks"] += len(chunks)
-                            pbar.total = counters["total_chunks"]
-                            pbar.refresh()
+                        file_tracker[mk] = {
+                            "expected": len(chunks),
+                            "received": [],
+                            "is_chunked": chunks[0]["is_chunked"],
+                        }
+                        total_chunks += len(chunks)
+                        pbar.total = total_chunks
+                        pbar.refresh()
 
                         for chunk in chunks:
                             target = self.temp_dir / f"{uuid4()}.gz"
-                            dl_future = executor.submit(
-                                self._download_chunk, chunk, target
-                            )
-                            pending.add(dl_future)
+                            f = executor.submit(self._download_chunk, chunk, target)
+                            dl_futures[f] = chunk
 
-                    for manifest_key, file_hash in file_items:
-                        disc_future = executor.submit(
-                            self._discover_chunks_for_file,
-                            manifest_key,
-                            file_hash,
-                        )
-                        disc_future.add_done_callback(on_discovery_done)
-                        pending.add(disc_future)
-
-                    while pending:
+                    # Phase 3: collect download results, finalize files
+                    for dl_future in as_completed(dl_futures):
                         if self._shutdown_requested:
-                            print(
-                                "Shutdown requested. "
-                                "Cancelling remaining downloads..."
-                            )
                             break
-
-                        done = {f for f in list(pending) if f.done()}
-                        if not done:
-                            time.sleep(0.01)
-                            continue
-
-                        for future in done:
-                            pending.discard(future)
-                            try:
-                                result = future.result()
-                            except Exception:
-                                continue
-
-                            if isinstance(result, list):
-                                continue
-
+                        try:
                             (
                                 manifest_key,
                                 chunk_index,
@@ -1726,36 +1704,39 @@ class S3LFS:
                                 bytes_downloaded,
                                 is_chunked,
                                 num_chunks,
-                            ) = result
+                            ) = dl_future.result()
+                        except Exception as e:
+                            chunk = dl_futures[dl_future]
+                            print(f"Error downloading " f"{chunk['s3_key']}: {e}")
+                            continue
 
-                            with lock:
-                                counters["total_bytes"] += bytes_downloaded
-                                counters["chunks_done"] += 1
-                                pbar.update(1)
+                        total_bytes += bytes_downloaded
+                        chunks_done += 1
+                        pbar.update(1)
 
-                                entry = file_tracker.get(manifest_key)
-                                if entry is None:
-                                    continue
-                                entry["received"].append((chunk_index, target_path))
+                        entry = file_tracker.get(manifest_key)
+                        if entry is None:
+                            continue
+                        entry["received"].append((chunk_index, target_path))
 
-                                if len(entry["received"]) == entry["expected"]:
-                                    entry["received"].sort(key=lambda x: x[0])
-                                    chunk_paths = [p for _, p in entry["received"]]
-                                    self._finalize_file(
-                                        manifest_key,
-                                        chunk_paths,
-                                        entry["is_chunked"],
-                                        silence=silence,
-                                    )
-                                    files_finalized += 1
+                        if len(entry["received"]) == entry["expected"]:
+                            entry["received"].sort(key=lambda x: x[0])
+                            chunk_paths = [p for _, p in entry["received"]]
+                            self._finalize_file(
+                                manifest_key,
+                                chunk_paths,
+                                entry["is_chunked"],
+                                silence=silence,
+                            )
+                            files_finalized += 1
 
         except KeyboardInterrupt:
             print("\nDownload interrupted by user.")
         finally:
             print(
                 f"Downloaded {files_finalized} file(s) "
-                f"({counters['chunks_done']} chunks, "
-                f"{counters['total_bytes'] / (1024 * 1024):.1f} MB compressed)."
+                f"({chunks_done} chunks, "
+                f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
 
     def remove_subtree(self, directory, keep_in_s3=True):
