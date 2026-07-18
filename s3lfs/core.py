@@ -832,10 +832,11 @@ class S3LFS:
             print(
                 f"Uploading {len(files_to_upload)} modified file(s) " f"in parallel..."
             )
+            # parallel_upload_chunked commits the manifest itself, reloading
+            # under the lock and merging only the keys it uploaded. Saving
+            # again here would write this process's older in-memory copy back
+            # over anything another process committed in between.
             self.parallel_upload(files_to_upload, silence=silence)
-
-            with self._lock_context():
-                self.save_manifest()
         else:
             print("No modified files needing upload.")
 
@@ -1284,6 +1285,10 @@ class S3LFS:
         file_path_str = str(file_path.as_posix())
 
         with self._lock_context():
+            # Re-read under the lock: this process's copy may predate another
+            # process's commit, and saving without reloading would erase it.
+            self.load_manifest()
+
             if file_path_str not in self.manifest["files"]:
                 print(f"File '{file_path}' is not currently tracked.")
                 return
@@ -1382,11 +1387,9 @@ class S3LFS:
         # Upload files in parallel if needed
         if files_to_upload:
             print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
+            # parallel_upload_chunked commits the manifest itself; see the
+            # note in track_modified_files_cached.
             self.parallel_upload(files_to_upload, silence=silence)
-
-            # Save updated manifest
-            with self._lock_context():
-                self.save_manifest()
         else:
             print("No modified files needing upload.")
 
@@ -1760,6 +1763,12 @@ class S3LFS:
         pattern = str(directory.as_posix())
 
         with self._lock_context():
+            # Match, mutate, and save in a single critical section against a
+            # fresh read. Matching under one lock and saving under a later one
+            # lets another process commit in between, and the save would then
+            # write this process's older copy back over it.
+            self.load_manifest()
+
             # Try matching with the pattern as-is (handles files and glob patterns)
             files_to_remove = [
                 path
@@ -1777,19 +1786,24 @@ class S3LFS:
                     if fnmatch.fnmatch(path, dir_pattern)
                 ]
 
-        if not files_to_remove:
-            print(f"No tracked files found matching '{directory}'.")
-            return
+            if not files_to_remove:
+                print(f"No tracked files found matching '{directory}'.")
+                return
 
-        for file_path in files_to_remove:
-            file_hash = self.manifest["files"].pop(file_path, None)
-            if not keep_in_s3 and file_hash:
+            removed_hashes = {
+                file_path: self.manifest["files"].pop(file_path, None)
+                for file_path in files_to_remove
+            }
+            self.save_manifest()
+
+        # S3 deletion is network I/O and must not hold the manifest lock.
+        if not keep_in_s3:
+            for file_path, file_hash in removed_hashes.items():
+                if not file_hash:
+                    continue
                 s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path}.gz"
                 self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
                 print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
-
-        with self._lock_context():
-            self.save_manifest()
 
         count = len(files_to_remove)
         print(
