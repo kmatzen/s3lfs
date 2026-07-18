@@ -1,0 +1,220 @@
+# TLA+ specifications
+
+Formal models of s3lfs's concurrency-sensitive protocols, checked with TLC.
+
+## Setup
+
+```sh
+curl -sSL -o tla2tools.jar \
+  https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+```
+
+`tla2tools.jar` is not committed — add it to `.gitignore` if you keep it here.
+
+## S3lfsGC — garbage collection vs. concurrent upload
+
+Models `cleanup_s3` (`s3lfs/core.py:1298-1346`) racing `parallel_upload_chunked`
+(`s3lfs/core.py:1456-1535`).
+
+The invariant `NoDanglingReference` states that every hash referenced by the
+manifest has a corresponding S3 object. Violating it means a `checkout` 404s on
+a file the manifest claims is tracked.
+
+Three configurations, selected by the `REVALIDATE` and `INFLIGHT` constants:
+
+```sh
+java -jar tla2tools.jar -config S3lfsGC.cfg         S3lfsGC.tla  # current code
+java -jar tla2tools.jar -config S3lfsGCFixed.cfg    S3lfsGC.tla  # revalidate under lock
+java -jar tla2tools.jar -config S3lfsGCInflight.cfg S3lfsGC.tla  # in-flight registry
+```
+
+Results as of the last run (TLC 2.19):
+
+| Config | Outcome |
+| --- | --- |
+| `S3lfsGC.cfg` (baseline) | Violated at depth 7 |
+| `S3lfsGCFixed.cfg` (revalidate) | Violated at depth 7 |
+| `S3lfsGCInflight.cfg` (registry) | No error, 87 distinct states, exhaustive |
+
+### Why revalidation is not enough
+
+Re-reading the manifest under the lock immediately before deleting looks like
+the natural fix, but TLC rejects it. The counterexample is:
+
+```
+WStart   uploader picks hash h1
+WUpload  h1 lands in S3, still unreferenced
+GMark    GC snapshots the manifest -- h1 absent, correctly so
+GList    GC marks h1 unreferenced
+GSweep   GC revalidates: h1 still absent from the manifest -> deletes it
+WCommit  uploader publishes manifest -> h1, now dangling
+```
+
+The whole GC cycle fits inside the uploader's upload-then-commit window. During
+that window the manifest genuinely does not reference the object, so no amount
+of re-reading it helps. Revalidation only closes the narrower case where the
+uploader commits partway through a sweep.
+
+### What does work
+
+The uploader claims the hash under the lock *before* any bytes reach S3, and
+releases the claim in the same critical section that publishes the manifest
+reference. The GC treats `manifest ∪ inflight` as the live set. This is the
+`INFLIGHT` configuration and it checks clean over the full state space.
+
+An object-age grace period (skip objects younger than the longest plausible
+upload) is a weaker alternative — simpler to implement, no shared registry, but
+it trades correctness for a timeout guess and is not modeled here.
+
+## S3lfsManifest — concurrent read-modify-write of the manifest
+
+Models N processes loading, mutating, and saving `.s3_manifest.yaml`. Two
+independent knobs:
+
+- `RELOAD` — whether the process re-reads the manifest under the lock before
+  saving. TRUE models `parallel_upload_chunked:1525`, `upload:1258`,
+  `track_interleaved:2480`; FALSE models `remove_file:1284`,
+  `remove_subtree:1776`, `track_modified_files_cached:830`,
+  `track_modified_files:1381`.
+- `SHARED_LOCK` — whether all processes agree on one lock file. FALSE models the
+  CWD-relative `temp_dir` defect at `core.py:158`.
+
+`NoLostUpdate` compares the manifest against a ghost variable holding the result
+of an equivalent serial execution. A violation is one process erasing another's
+committed work, orphaning its S3 objects.
+
+```sh
+for c in NoReload_NoLock NoReload_Lock Reload_NoLock Reload_Lock; do
+  java -jar tla2tools.jar -config S3lfsManifest_$c.cfg S3lfsManifest.tla
+done
+```
+
+|  | `SHARED_LOCK = FALSE` | `SHARED_LOCK = TRUE` |
+| --- | --- | --- |
+| `RELOAD = FALSE` | Violated, depth 9 | Violated, depth 9 |
+| `RELOAD = TRUE` | Violated, depth 9 | **No error**, 269 states, exhaustive |
+
+Both fixes are individually necessary and only jointly sufficient. Neither one
+alone moves the needle.
+
+With a working lock but no reload (`NoReload_Lock`), the processes serialize
+correctly and it still loses the update, because the second process writes back
+a snapshot it took before the first one committed:
+
+```
+PLoad(q1) PAcquire(q1) PReload(q1) PLoad(q2) PSave(q1) PAcquire(q2) PReload(q2) PSave(q2)
+```
+
+With correct reload discipline but no shared lock (`Reload_NoLock`), both
+processes hold their own lock, both reload, and both then save — the reload is
+correct but no longer excludes anything:
+
+```
+PLoad(q1) PAcquire(q1) PReload(q1) PLoad(q2) PAcquire(q2) PReload(q2) PSave(q1) PSave(q2)
+```
+
+`PReload` is deliberately a separate step from `PSave` rather than folded into
+it. Folding them would make each save atomic and would hide the `Reload_NoLock`
+counterexample entirely — the spec would report a clean result for a broken
+system.
+
+## S3lfsChunks — partial chunked upload and silent truncation
+
+Models `parallel_upload_chunked` (`s3lfs/core.py:1456-1535`) followed by the
+checkout that reassembles the file (`_discover_chunks_for_file:1565-1584`,
+`_finalize_file:1615-1637`).
+
+Three defects interact:
+
+1. The manifest entry is recorded at *prep* time (`core.py:1498`), before any
+   chunk is PUT.
+2. Per-chunk upload failures are caught, printed, and skipped
+   (`core.py:1513-1516`); the `finally` at `core.py:1524` writes the manifest
+   anyway.
+3. Checkout infers the chunk count from `len(chunk_keys)` and reads indices
+   `0..n-1` (`core.py:1584`), assuming the surviving chunks form a contiguous
+   prefix.
+
+`NoSilentCorruption` states that a checkout reporting success produced the whole
+file. `ManifestImpliesChunks` is the stronger upload-side property: a manifest
+entry implies all of its chunks exist.
+
+```sh
+for c in Baseline StoreCount VerifyHash CommitAfter CommitAndVerify; do
+  java -jar tla2tools.jar -config S3lfsChunks_$c.cfg S3lfsChunks.tla
+done
+```
+
+| Config | `NoSilentCorruption` | `ManifestImpliesChunks` |
+| --- | --- | --- |
+| `Baseline` (current code) | Violated | Violated |
+| `StoreCount` | No error | Violated |
+| `VerifyHash` | No error | Violated |
+| `CommitAfter` | No error | **No error** |
+
+### Trailing gaps are the dangerous ones
+
+With `NumChunks = 3`, chunk 0 uploads and chunks 1 and 2 fail:
+
+```
+UStart  UUpload   uploaded = {0}
+UCommit           manifest entry written anyway
+DCheckout         len(chunk_keys) = 1 -> read indices 0..0 -> all present
+                  outcome = "ok", content = {0}
+```
+
+The user gets a file truncated to one third of its length and **no error is
+raised anywhere**. Nothing downstream detects it: there is no hash check in
+`_finalize_file`.
+
+An *interior* gap is much less dangerous. With `uploaded = {0,1,2,4}` of 5 the
+inferred count is 4, index 3 is missing, and the download fails loudly on a 404.
+The bug's severity depends entirely on which chunks fail, which is why testing
+is unlikely to surface it — a test that kills one chunk mid-file gets a clean
+error and looks like it passed.
+
+### Choosing a fix
+
+All three candidates independently eliminate silent corruption, but they are not
+equivalent:
+
+- `STORE_COUNT` and `VERIFY_HASH` only convert corruption into a *loud* failure
+  at checkout time. The manifest still references an incomplete object, so the
+  repository stays broken and every later checkout keeps failing.
+- `COMMIT_AFTER_UPLOAD` is the only one that satisfies `ManifestImpliesChunks`.
+  It prevents the bad state from being recorded at all.
+
+Recommended: `COMMIT_AFTER_UPLOAD` as the actual fix, with `VERIFY_HASH` as
+defence in depth against chunks lost after a correct commit (lifecycle
+expiration, out-of-band deletion, the GC race modeled in `S3lfsGC`). Those
+combined are the `CommitAndVerify` configuration.
+
+## Scope and limitations
+
+The model abstracts the manifest to a set of content hashes, dropping the path
+dimension. It therefore cannot see the mismatch between GC's reachability unit
+(hash) and storage's unit (hash + path), which is a separate defect.
+
+It also assumes manifest reads and writes are mutually exclusive — that the
+`portalocker` lock actually works. `S3lfsManifest` discharges exactly that
+assumption, and shows it does not currently hold: the lock is only real when
+`SHARED_LOCK` is TRUE, which the CWD-relative `temp_dir` at `s3lfs/core.py:158`
+does not guarantee. **The `INFLIGHT` result therefore depends on fixing the lock
+path first.** Resolve the lock file relative to the git root, as the manifest
+path already is.
+
+Both specs use two processes and two paths. That is enough to exhibit every
+counterexample here, but it does not establish correctness for larger
+configurations — TLC checks the model it is given, not the code.
+
+`S3lfsManifest` also models each process as performing a single mutation. Real
+`track` runs mutate many entries across a long upload, which widens every window
+modeled here without changing their shape.
+
+`S3lfsChunks` models a single file with `NumChunks = 3` and treats an upload as
+one atomic choice of which chunks survive, rather than as concurrent per-chunk
+tasks. That is sound for the properties checked — every surviving-subset is
+reachable either way — but it means the spec says nothing about the worker-pool
+behaviour itself, including the shared-pool submission pattern at
+`core.py:1497-1516` or the download-side tracker that never finalizes a file
+when a chunk fails (`core.py:1722`).
