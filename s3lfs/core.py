@@ -158,9 +158,6 @@ class S3LFS:
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
-        # Use a file-based lock for cross-process synchronization
-        self._lock_file = self.temp_dir / ".s3lfs.lock"
-
         max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
@@ -180,6 +177,17 @@ class S3LFS:
         )
         cache_file_name = self.manifest_file.stem + "_cache" + cache_suffix
         self.cache_file = self.manifest_file.parent / cache_file_name
+
+        # Use a file-based lock for cross-process synchronization. The lock is
+        # anchored to the manifest it guards, not to the current working
+        # directory: a CWD-relative path gives processes started from different
+        # directories different lock files for the same manifest, silently
+        # removing mutual exclusion between them. It is kept inside
+        # .s3lfs_temp/ rather than beside the manifest so that file enumeration
+        # (rglob) does not pick it up as a trackable file.
+        lock_dir = self.manifest_file.parent.resolve() / ".s3lfs_temp"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file = lock_dir / ".s3lfs.lock"
 
         self.no_sign_request = no_sign_request
         self._cache_mtime: Optional[float] = None
