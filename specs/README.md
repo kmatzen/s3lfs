@@ -189,6 +189,74 @@ defence in depth against chunks lost after a correct commit (lifecycle
 expiration, out-of-band deletion, the GC race modeled in `S3lfsGC`). Those
 combined are the `CommitAndVerify` configuration.
 
+## S3lfsNamespace — derived lock identity and the file namespace
+
+This supersedes the `SHARED_LOCK` knob in `S3lfsManifest`, and exists because
+that knob was a modeling error worth recording.
+
+`S3lfsManifest` takes mutual exclusion as an input (`SHARED_LOCK \in BOOLEAN`).
+A model told whether the lock works can only score fixes someone already thought
+of; it cannot evaluate a placement, because placement is exactly the thing it
+abstracts away. Here the lock is a `(base, name)` pair resolved the way the code
+resolves it, and mutual exclusion is *derived* from whether two processes land on
+the same file.
+
+The model also carries the directory tree, because s3lfs's own metadata lives in
+the tree s3lfs enumerates. `_resolve_filesystem_paths` uses `rglob("*")` with no
+exclusion list (`core.py:1878`).
+
+```
+R                 repository root, holds .s3_manifest.yaml
+|-- R_temp        R/.s3lfs_temp
++-- S             a subdirectory a process may be started from
+    +-- S_temp    S/.s3lfs_temp
+```
+
+`LOCK_POLICY` selects among the three placements actually considered:
+
+| Policy | Resolves to | Status |
+| --- | --- | --- |
+| `cwd_temp` | `<cwd>/.s3lfs_temp/.s3lfs.lock` | the original defect |
+| `manifest_root` | `<manifest dir>/.s3lfs.lock` | first attempt |
+| `manifest_temp` | `<manifest dir>/.s3lfs_temp/.s3lfs.lock` | shipped |
+
+### Results
+
+`NoLostUpdate`, with `RELOAD = TRUE` throughout:
+
+| Policy | Result |
+| --- | --- |
+| `cwd_temp` | Violated |
+| `manifest_root` | No error |
+| `manifest_temp` | No error |
+
+The derived model reproduces `S3lfsManifest`'s `SHARED_LOCK` result without being
+handed it, and adds the finding that `manifest_root` and `manifest_temp` are
+**equivalent** for correctness. The choice between them is organizational.
+
+`NoInternalFileTracked` — no internal file inside the enumerated subtree:
+
+| Policy | `TRACK_TARGET = R` | `TRACK_TARGET = S` |
+| --- | --- | --- |
+| `cwd_temp` | Violated | Violated |
+| `manifest_root` | Violated | No error |
+| `manifest_temp` | Violated | No error |
+
+Tracking the repository root violates the invariant under **every** policy,
+because the manifest itself sits in the enumerated subtree. That is not a
+consequence of the lock fix; it is a standing defect. Confirmed against the real
+code: enumerating from the repository root returns `.s3_manifest.yaml`, the lock
+file, and all of `.git/**`.
+
+### Why this spec exists
+
+The lock fix was first written with the lock beside the manifest
+(`manifest_root`) and justified on the grounds that `.s3lfs_temp/` would keep it
+out of file enumeration. That justification is false — both placements are
+equally enumerated — and no spec at the time could contradict it, because none of
+them modeled the namespace. A boolean knob cannot reject a bad reason for a
+correct change.
+
 ## Scope and limitations
 
 The model abstracts the manifest to a set of content hashes, dropping the path
