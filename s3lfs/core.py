@@ -1837,6 +1837,35 @@ class S3LFS:
         # Use PathResolver for consistent path handling
         return self.path_resolver.to_manifest_key(file_path)
 
+    def _is_internal_path(self, path: Union[str, Path]) -> bool:
+        """
+        Is this a file s3lfs must never track?
+
+        Covers git's own metadata and s3lfs's own bookkeeping. Filesystem
+        enumeration uses rglob("*"), which matches dotfiles, so without this
+        `track .` walks into .git/ and also picks up the manifest, the hash
+        cache, and the lock file.
+
+        :param path: Absolute or relative file path
+        :return: True if the path is internal and must be skipped
+        """
+        resolved = Path(path).resolve()
+        try:
+            parts = resolved.relative_to(self.path_resolver.git_root).parts
+        except ValueError:
+            # Outside the repository; fall back to the whole path.
+            parts = resolved.parts
+
+        if ".git" in parts:
+            return True
+        if ".s3lfs_temp" in parts or self.temp_dir.name in parts:
+            return True
+        if resolved.name in {self.manifest_file.name, self.cache_file.name}:
+            return True
+        if resolved.name.endswith(".s3lfs.lock"):
+            return True
+        return False
+
     def _resolve_filesystem_paths(self, path):
         """
         FILESYSTEM GLOB: Find files on disk matching a pattern.
@@ -1892,8 +1921,8 @@ class S3LFS:
                         [f for f in path_obj.rglob("*") if f.is_file()]
                     )
 
-        # Return absolute paths
-        return [p.resolve() for p in resolved_files]
+        # Return absolute paths, less anything internal to git or s3lfs
+        return [p.resolve() for p in resolved_files if not self._is_internal_path(p)]
 
     def _resolve_manifest_paths(self, path):
         """
