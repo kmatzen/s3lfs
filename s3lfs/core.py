@@ -461,9 +461,12 @@ class S3LFS:
 
     def save_manifest(self):
         """Save the manifest back to disk atomically (YAML or JSON format)."""
-        temp_file = self.manifest_file.with_suffix(
-            ".tmp"
-        )  # Temporary file in the same directory
+        # Unique temp name. A shared one lets two writers interleave into the
+        # same file before either renames: the rename is atomic, the content
+        # is not.
+        temp_file = self.manifest_file.with_name(
+            f"{self.manifest_file.name}.{uuid4().hex}.tmp"
+        )
         try:
             # Write the manifest to a temporary file
             with open(temp_file, "w") as f:
@@ -533,7 +536,10 @@ class S3LFS:
         if hasattr(self, "_cache_dirty") and not self._cache_dirty:
             return
 
-        temp_file = self.cache_file.with_suffix(".tmp")
+        # Unique temp name; see save_manifest.
+        temp_file = self.cache_file.with_name(
+            f"{self.cache_file.name}.{uuid4().hex}.tmp"
+        )
         try:
             with open(temp_file, "w") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
@@ -595,6 +601,42 @@ class S3LFS:
         else:
             raise ValueError(f"Unsupported hashing method: {method}")
 
+    # Filesystem mtime is frequently stored at 1-second resolution. A file
+    # modified within this window of being hashed cannot be distinguished from
+    # one that was not, so such entries are not cached at all.
+    MTIME_GRANULARITY_SECONDS = 1.0
+
+    def _changed_during_hashing(self, file_path, metadata):
+        """Did the file change between the pre-hash stat and now?"""
+        try:
+            stat = Path(file_path).stat()
+        except OSError:
+            return True
+
+        return (
+            stat.st_size != metadata["size"]
+            or stat.st_mtime != metadata["mtime"]
+            or getattr(stat, "st_ino", None) != metadata["inode"]
+        )
+
+    def _entry_is_racy(self, cached_data):
+        """Was this entry written too soon after the file was modified?
+
+        If the gap between the file's mtime and the moment we recorded the
+        hash is below mtime granularity, a further modification in that same
+        tick would leave (size, mtime, inode) unchanged and go unnoticed. Such
+        an entry cannot be trusted on the strength of its metadata alone.
+
+        The entry is still kept: recomputing once refreshes it with a
+        timestamp comfortably after the mtime, and it is trusted from then on.
+        This mirrors git's "racily clean" handling.
+        """
+        written_at = cached_data.get("timestamp")
+        mtime = cached_data.get("metadata", {}).get("mtime")
+        if written_at is None or mtime is None:
+            return True
+        return (written_at - mtime) < self.MTIME_GRANULARITY_SECONDS
+
     def hash_file_cached(
         self, file_path: Union[str, Path], method: str = "auto"
     ) -> str:
@@ -639,6 +681,7 @@ class S3LFS:
                     cached_metadata.get("size") == current_metadata["size"]
                     and cached_metadata.get("mtime") == current_metadata["mtime"]
                     and cached_metadata.get("inode") == current_metadata["inode"]
+                    and not self._entry_is_racy(cached_data)
                 ):
                     # File hasn't changed, return cached hash
                     return cached_data["hash"]
@@ -649,6 +692,13 @@ class S3LFS:
 
         # Compute hash outside of lock to avoid blocking other processes
         new_hash = self.hash_file(file_path, method)
+
+        # The metadata above was read before hashing. If the file changed while
+        # we were reading it, that hash belongs to no single version of the
+        # file, and storing it against the pre-hash metadata would leave an
+        # entry that is wrong whenever those metadata recur.
+        if self._changed_during_hashing(file_path, current_metadata):
+            return new_hash
 
         # Acquire lock again to update cache
         with self._lock_context():
@@ -663,6 +713,7 @@ class S3LFS:
                     cached_metadata.get("size") == current_metadata["size"]
                     and cached_metadata.get("mtime") == current_metadata["mtime"]
                     and cached_metadata.get("inode") == current_metadata["inode"]
+                    and not self._entry_is_racy(cached_data)
                 ):
                     # Another process computed it while we were working
                     return cached_data["hash"]
