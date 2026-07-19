@@ -261,15 +261,34 @@ class TestInstallCommand(unittest.TestCase):
         content = hook_path.read_text()
         self.assertIn('"$3" = "1"', content)
 
-    def test_hooks_warn_on_failure(self):
-        """Hook scripts use || echo to warn rather than fail the git operation."""
+    def test_post_hooks_warn_rather_than_fail(self):
+        """post-* hooks run after git has already committed its state.
+
+        Failing them helps nobody, so they report loudly and exit zero.
+        """
         runner = CliRunner()
         runner.invoke(cli, ["install"])
 
-        for hook_name in ["post-merge", "post-checkout", "pre-push"]:
+        for hook_name in ["post-merge", "post-checkout"]:
             hook_path = Path(self.temp_dir) / ".git" / "hooks" / hook_name
             content = hook_path.read_text()
-            self.assertIn("|| echo", content, f"{hook_name} should warn on failure")
+            self.assertIn("ERROR", content, f"{hook_name} should report failure")
+            self.assertNotIn(
+                "exit 1", content, f"{hook_name} should not fail the git operation"
+            )
+
+    def test_pre_push_aborts_on_failure(self):
+        """pre-push is the last point at which a bad push can be stopped.
+
+        It uploads the content the manifest being pushed refers to; letting
+        the push proceed after a failed upload publishes a manifest whose
+        hashes have no objects behind them.
+        """
+        runner = CliRunner()
+        runner.invoke(cli, ["install"])
+
+        content = (Path(self.temp_dir) / ".git" / "hooks" / "pre-push").read_text()
+        self.assertIn("exit 1", content)
 
     def test_hooks_check_s3lfs_exists(self):
         """Hook scripts check that s3lfs command exists before running."""
