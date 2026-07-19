@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 import shutil
 import tempfile
@@ -265,7 +266,11 @@ class TestParallelDownloadChunked(unittest.TestCase):
             mock_client.list_objects_v2.return_value = {}
             mock_client.head_object.return_value = {"ContentLength": 100}
 
-            compressed = gzip.compress(b"test content")
+            content = b"test content"
+            compressed = gzip.compress(content)
+            # Finalization verifies the reassembled file against the manifest
+            # hash, so the fixture must carry the real digest.
+            digest = hashlib.sha256(content).hexdigest()
 
             def fake_download(Bucket, Key, Fileobj):
                 Fileobj.write(compressed)
@@ -274,7 +279,7 @@ class TestParallelDownloadChunked(unittest.TestCase):
 
             s3lfs = S3LFS(bucket_name="test-bucket")
             s3lfs.parallel_download_chunked(
-                [("file1.txt", "h1"), ("file2.txt", "h2")],
+                [("file1.txt", digest), ("file2.txt", digest)],
                 silence=True,
             )
 
@@ -297,7 +302,10 @@ class TestParallelDownloadChunked(unittest.TestCase):
             part0 = compressed[:mid]
             part1 = compressed[mid:]
 
-            s3_key = "test-prefix/assets/hash1/big.bin.gz"
+            # Finalization verifies the reassembled file against the manifest
+            # hash, so the fixture must carry the real digest.
+            digest = hashlib.sha256(full_content).hexdigest()
+            s3_key = f"test-prefix/assets/{digest}/big.bin.gz"
             mock_client.list_objects_v2.return_value = {
                 "Contents": [
                     {"Key": f"{s3_key}.chunk0"},
@@ -317,7 +325,7 @@ class TestParallelDownloadChunked(unittest.TestCase):
             mock_client.download_fileobj.side_effect = fake_download
 
             s3lfs = S3LFS(bucket_name="test-bucket")
-            s3lfs.parallel_download_chunked([("big.bin", "hash1")], silence=True)
+            s3lfs.parallel_download_chunked([("big.bin", digest)], silence=True)
 
             output = s3lfs.path_resolver.to_filesystem_path("big.bin")
             self.assertTrue(output.exists())

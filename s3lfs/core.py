@@ -1478,6 +1478,9 @@ class S3LFS:
         self.test_s3_credentials(silence=silence)
 
         manifest_updates = {}
+        # manifest_key -> {hash, expected, done}. A file earns its manifest
+        # entry only once every one of its chunks has landed in S3.
+        pending = {}
         total_bytes = 0
         total_chunks = 0
         chunks_done = 0
@@ -1506,25 +1509,34 @@ class S3LFS:
                             continue
 
                         manifest_key, file_hash, chunks = result
-                        manifest_updates[manifest_key] = file_hash
+                        pending[manifest_key] = {
+                            "hash": file_hash,
+                            "expected": len(chunks),
+                            "done": 0,
+                        }
                         total_chunks += len(chunks)
                         pbar.total = total_chunks
                         pbar.refresh()
 
                         for chunk in chunks:
                             f = executor.submit(self._upload_chunk, chunk)
-                            ul_futures[f] = chunk
+                            ul_futures[f] = (manifest_key, chunk)
 
                     # Phase 3: collect upload results
                     for ul_future in as_completed(ul_futures):
                         if self._shutdown_requested:
                             break
+                        manifest_key, chunk = ul_futures[ul_future]
                         try:
                             _, bytes_uploaded = ul_future.result()
                         except Exception as e:
-                            chunk = ul_futures[ul_future]
                             print(f"Error uploading " f"{chunk['s3_key']}: {e}")
                             continue
+
+                        entry = pending[manifest_key]
+                        entry["done"] += 1
+                        if entry["done"] == entry["expected"]:
+                            manifest_updates[manifest_key] = entry["hash"]
 
                         total_bytes += bytes_uploaded
                         chunks_done += 1
@@ -1538,6 +1550,25 @@ class S3LFS:
                     self.load_manifest()
                     self.manifest["files"].update(manifest_updates)
                     self.save_manifest()
+
+            # Files whose chunks did not all land are deliberately absent from
+            # the manifest. Recording them would leave an entry pointing at an
+            # incomplete object, and checkout infers the chunk count from the
+            # objects that exist -- so a missing tail reassembles into a
+            # truncated file with no error raised anywhere.
+            incomplete = sorted(
+                key for key, v in pending.items() if v["done"] != v["expected"]
+            )
+            if incomplete:
+                print(
+                    f"WARNING: {len(incomplete)} file(s) did not upload "
+                    f"completely and were NOT added to the manifest:"
+                )
+                for key in incomplete[:10]:
+                    v = pending[key]
+                    print(f"  {key} ({v['done']}/{v['expected']} chunks)")
+                if len(incomplete) > 10:
+                    print(f"  ... and {len(incomplete) - 10} more")
 
             print(
                 f"Uploaded {len(manifest_updates)} file(s) "
@@ -1623,8 +1654,17 @@ class S3LFS:
             chunk_info["num_chunks"],
         )
 
-    def _finalize_file(self, manifest_key, chunk_paths, is_chunked, silence=True):
-        """Merge chunks (if needed) and decompress to final location."""
+    def _finalize_file(
+        self, manifest_key, chunk_paths, is_chunked, expected_hash=None, silence=True
+    ):
+        """Merge chunks (if needed) and decompress to final location.
+
+        If expected_hash is given, the reassembled file is hashed and compared
+        against it. Chunk discovery infers the chunk count from the objects
+        that happen to exist, so a partial upload whose tail is missing
+        reassembles into a shorter file that is otherwise well-formed; without
+        this check nothing downstream would notice.
+        """
         filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
 
         if is_chunked and len(chunk_paths) > 1:
@@ -1647,6 +1687,20 @@ class S3LFS:
             except OSError:
                 pass
 
+        if expected_hash is not None:
+            actual_hash = self.hash_file(filesystem_path)
+            if actual_hash != expected_hash:
+                # Remove the bad output rather than leave it looking valid.
+                try:
+                    os.remove(filesystem_path)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Checksum mismatch for {manifest_key}: "
+                    f"expected {expected_hash}, got {actual_hash}. "
+                    f"The stored object is incomplete or corrupt."
+                )
+
     def parallel_download_chunked(self, file_items, silence=True):
         """Download files with block-level parallelism.
 
@@ -1664,6 +1718,7 @@ class S3LFS:
 
         file_tracker = {}
         files_finalized = 0
+        files_failed = 0
         total_bytes = 0
         total_chunks = 0
         chunks_done = 0
@@ -1693,6 +1748,7 @@ class S3LFS:
                             "expected": len(chunks),
                             "received": [],
                             "is_chunked": chunks[0]["is_chunked"],
+                            "file_hash": chunks[0]["file_hash"],
                         }
                         total_chunks += len(chunks)
                         pbar.total = total_chunks
@@ -1733,13 +1789,19 @@ class S3LFS:
                         if len(entry["received"]) == entry["expected"]:
                             entry["received"].sort(key=lambda x: x[0])
                             chunk_paths = [p for _, p in entry["received"]]
-                            self._finalize_file(
-                                manifest_key,
-                                chunk_paths,
-                                entry["is_chunked"],
-                                silence=silence,
-                            )
-                            files_finalized += 1
+                            try:
+                                self._finalize_file(
+                                    manifest_key,
+                                    chunk_paths,
+                                    entry["is_chunked"],
+                                    expected_hash=entry["file_hash"],
+                                    silence=silence,
+                                )
+                                files_finalized += 1
+                            except Exception as e:
+                                # One corrupt file must not abandon the rest.
+                                print(f"ERROR: {manifest_key}: {e}")
+                                files_failed += 1
 
         except KeyboardInterrupt:
             print("\nDownload interrupted by user.")
@@ -1749,6 +1811,35 @@ class S3LFS:
                 f"({chunks_done} chunks, "
                 f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
+
+            # A file whose chunks did not all arrive is never finalized. Say so
+            # and drop its partial chunks, rather than leaving the caller to
+            # infer it from the count and the temp files behind.
+            incomplete = sorted(
+                mk
+                for mk, e in file_tracker.items()
+                if len(e["received"]) != e["expected"]
+            )
+            for mk in incomplete:
+                for _, path in file_tracker[mk]["received"]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+            if incomplete or files_failed:
+                print(
+                    f"WARNING: {len(incomplete) + files_failed} file(s) were "
+                    f"not written:"
+                )
+                for mk in incomplete[:10]:
+                    e = file_tracker[mk]
+                    print(
+                        f"  {mk} (received {len(e['received'])}/{e['expected']} "
+                        f"chunks)"
+                    )
+                if len(incomplete) > 10:
+                    print(f"  ... and {len(incomplete) - 10} more")
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
