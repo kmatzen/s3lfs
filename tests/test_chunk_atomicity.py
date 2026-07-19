@@ -47,7 +47,7 @@ class TestChunkAtomicity(unittest.TestCase):
 
     def _s3lfs(self, fail_chunks_after=None):
         """Build an S3LFS whose chunk uploads fail after N successes."""
-        store = {}
+        store: dict = {}
 
         def factory(no_sign_request):
             client = Mock()
