@@ -314,40 +314,87 @@ class S3LFS:
             yaml.safe_dump({"claims": claims}, f)
         temp_file.replace(self._inflight_file)
 
-    def _live_inflight_hashes(self):
+    def _live_inflight_keys(self):
         """Claims that have not aged out. Caller must hold the lock."""
         cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
-        return {h for h, ts in self._load_inflight().items() if ts >= cutoff}
+        return {k for k, ts in self._load_inflight().items() if ts >= cutoff}
 
-    def _claim_inflight(self, file_hash):
-        """Register a hash as in-flight, before any of its bytes reach S3."""
+    def _claim_inflight(self, base_key):
+        """Register an asset key as in-flight, before any bytes reach S3."""
         with self._lock_context():
             claims = self._load_inflight()
-            claims[file_hash] = time.time()
+            claims[base_key] = time.time()
             self._save_inflight(claims)
 
-    def _release_inflight(self, hashes):
+    def _release_inflight(self, base_keys):
         """Drop claims. Must run only after the manifest entry is published."""
-        if not hashes:
+        if not base_keys:
             return
         with self._lock_context():
             claims = self._load_inflight()
             cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
             claims = {
-                h: ts
-                for h, ts in claims.items()
-                if h not in hashes and ts >= cutoff  # also prune aged-out claims
+                k: ts
+                for k, ts in claims.items()
+                if k not in base_keys and ts >= cutoff  # also prune aged-out claims
             }
             self._save_inflight(claims)
 
-    def _hash_from_asset_key(self, key):
-        """Extract the content hash from an assets/ S3 key, or None."""
+    def _asset_base_key(self, manifest_key, file_hash):
+        """The S3 key a file's content is stored under."""
+        return f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+
+    def _delete_asset(self, base_key):
+        """Delete an asset and every chunk belonging to it.
+
+        A large file is stored as base_key.chunk0..N rather than at base_key
+        itself, so deleting only the base key leaves the whole file behind.
+        """
+        client = self._get_s3_client()
+        resp = client.list_objects_v2(Bucket=self.bucket_name, Prefix=base_key)
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        # Guard against a prefix match on an unrelated, longer key.
+        keys = [k for k in keys if self._key_covered_by(k, {base_key})]
+        if not keys:
+            keys = [base_key]
+
+        for key in keys:
+            client.delete_object(Bucket=self.bucket_name, Key=key)
+            print(f"File removed from S3: s3://{self.bucket_name}/{key}")
+
+    def _live_asset_keys(self):
+        """Base keys reachable from the manifest. Caller must hold the lock."""
+        return {
+            self._asset_base_key(manifest_key, file_hash)
+            for manifest_key, file_hash in self.manifest.get("files", {}).items()
+        }
+
+    def _is_asset_key(self, key):
+        """Does this key have the shape of a stored asset?
+
+        Anything else under the prefix is left alone: s3lfs did not put it
+        there in a form it recognises, so it is not ours to delete.
+        """
         prefix = f"{self.repo_prefix}/assets/"
         if not key.startswith(prefix):
-            return None
+            return False
         rest = key[len(prefix) :]
-        head, _, tail = rest.partition("/")
-        return head if tail else None
+        head, sep, tail = rest.partition("/")
+        return bool(head and sep and tail)
+
+    @staticmethod
+    def _key_covered_by(key, base_keys):
+        """Is this key one of these assets, or a chunk belonging to one?
+
+        Reachability has to be judged on hash *and* path, because that is what
+        the storage layout keys on. Judging on the hash alone means an object
+        stays reachable as long as any path shares its content, so a removed
+        or renamed path leaks its object permanently.
+        """
+        if key in base_keys:
+            return True
+        head, sep, tail = key.rpartition(".chunk")
+        return bool(sep) and tail.isdigit() and head in base_keys
 
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
@@ -1438,9 +1485,7 @@ class S3LFS:
         if not keep_in_s3:
             # Objects are stored under the manifest key, so deletion must use
             # it too; the raw argument would miss the object entirely.
-            s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path_str}.gz"
-            self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-            print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
+            self._delete_asset(self._asset_base_key(file_path_str, file_hash))
         else:
             print(
                 f"File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path_str}"
@@ -1454,8 +1499,7 @@ class S3LFS:
         """
         with self._lock_context():
             self.load_manifest()
-            live_hashes = set(self.manifest["files"].values())
-            live_hashes |= self._live_inflight_hashes()
+            live_keys = self._live_asset_keys() | self._live_inflight_keys()
 
         paginator = self._get_s3_client().get_paginator("list_objects_v2")
         pages = paginator.paginate(
@@ -1468,12 +1512,11 @@ class S3LFS:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    file_hash = self._hash_from_asset_key(key)
-                    if file_hash is None:
+                    if not self._is_asset_key(key):
                         continue
 
                     # Collect unreferenced files
-                    if file_hash not in live_hashes:
+                    if not self._key_covered_by(key, live_keys):
                         unreferenced_files.append(key)
 
         if not unreferenced_files:
@@ -1491,15 +1534,14 @@ class S3LFS:
 
         # Re-check under the lock immediately before deleting. Listing S3 and
         # waiting for confirmation both take unbounded time, during which an
-        # upload may have claimed or published any of these hashes.
+        # upload may have claimed or published any of these keys.
         with self._lock_context():
             self.load_manifest()
-            live_now = set(self.manifest["files"].values())
-            live_now |= self._live_inflight_hashes()
+            live_now = self._live_asset_keys() | self._live_inflight_keys()
 
         to_delete = []
         for key in unreferenced_files:
-            if self._hash_from_asset_key(key) in live_now:
+            if self._key_covered_by(key, live_now):
                 print(f"Skipping {key} (became referenced during cleanup)")
                 continue
             to_delete.append(key)
@@ -1666,12 +1708,13 @@ class S3LFS:
 
                         manifest_key, file_hash, chunks = result
 
-                        # Claim the hash before submitting any chunk upload.
+                        # Claim the asset before submitting any chunk upload.
                         # Between a chunk landing in S3 and the manifest entry
                         # being published, the object is unreferenced and a
                         # concurrent cleanup_s3 would otherwise delete it.
-                        self._claim_inflight(file_hash)
-                        claimed.add(file_hash)
+                        base_key = self._asset_base_key(manifest_key, file_hash)
+                        self._claim_inflight(base_key)
+                        claimed.add(base_key)
 
                         pending[manifest_key] = {
                             "hash": file_hash,
@@ -2062,9 +2105,7 @@ class S3LFS:
             for file_path, file_hash in removed_hashes.items():
                 if not file_hash:
                     continue
-                s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path}.gz"
-                self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-                print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
+                self._delete_asset(self._asset_base_key(file_path, file_hash))
 
         count = len(files_to_remove)
         print(
