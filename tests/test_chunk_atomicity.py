@@ -53,12 +53,14 @@ class TestChunkAtomicity(unittest.TestCase):
             client = Mock()
 
             def upload_fileobj(fileobj, bucket, key, **kwargs):
-                if (
-                    fail_chunks_after is not None
-                    and ".chunk" in key
-                    and len([k for k in store if ".chunk" in k]) >= fail_chunks_after
-                ):
-                    raise RuntimeError("simulated S3 failure")
+                # Decide from the chunk index, not from how many chunks have
+                # landed so far: uploads run concurrently, so a count-based
+                # rule lets every chunk pass the check before any is recorded
+                # and the failure never fires.
+                if fail_chunks_after is not None and ".chunk" in key:
+                    index = int(key.rsplit(".chunk", 1)[1])
+                    if index >= fail_chunks_after:
+                        raise RuntimeError("simulated S3 failure")
                 store[key] = fileobj.read()
 
             client.upload_fileobj.side_effect = upload_fileobj
