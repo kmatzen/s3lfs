@@ -252,7 +252,14 @@ class S3LFS:
             self.path_resolver = PathResolver(manifest_dir)
 
         self._shutdown_requested = False
-        signal.signal(signal.SIGINT, self._handle_sigint)
+        # signal.signal only works on the main thread of the main interpreter,
+        # and raises ValueError elsewhere. Constructing an S3LFS from a worker
+        # thread is legitimate for library callers, so treat the handler as
+        # best-effort rather than a hard requirement.
+        try:
+            signal.signal(signal.SIGINT, self._handle_sigint)
+        except ValueError:
+            pass
 
     def _handle_sigint(self, signum, frame):
         """
@@ -564,8 +571,11 @@ class S3LFS:
 
     def hash_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
         """
-        Compute a unique SHA-256 hash of the file using its content and relative path.
-        Supports multiple hashing methods for performance optimization.
+        Compute a SHA-256 hash of the file's contents.
+
+        The hash covers content only: the same bytes at two different paths
+        produce the same digest. Supports multiple hashing methods for
+        performance optimization.
 
         :param file_path: Path to the file to hash.
         :param method: Hashing method to use. Options are:
@@ -1405,7 +1415,10 @@ class S3LFS:
         :param keep_in_s3: If False, schedule the file for deletion in future GC.
         """
         file_path = Path(file_path)
-        file_path_str = str(file_path.as_posix())
+        # Normalise the same way every other call site does. Using the raw
+        # argument meant "./data/x.bin" or an absolute path reported the file
+        # as untracked when it was tracked under "data/x.bin".
+        file_path_str = self._get_manifest_key(file_path)
 
         with self._lock_context():
             # Re-read under the lock: this process's copy may predate another
@@ -1423,12 +1436,14 @@ class S3LFS:
         print(f"Removed tracking for '{file_path}'.")
 
         if not keep_in_s3:
-            s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path.as_posix()}.gz"
+            # Objects are stored under the manifest key, so deletion must use
+            # it too; the raw argument would miss the object entirely.
+            s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path_str}.gz"
             self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
             print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
         else:
             print(
-                f"File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path.as_posix()}"
+                f"File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path_str}"
             )
 
     def cleanup_s3(self, force=False):
