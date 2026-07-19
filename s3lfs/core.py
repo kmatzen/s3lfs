@@ -140,6 +140,15 @@ def retry(times, exceptions, max_delay=30):
     return decorator
 
 
+class ShutdownRequested(Exception):
+    """Raised by a worker that declined to start because of an interrupt.
+
+    Distinguishes cancelled work from work that genuinely failed, so the
+    drain loops can stay quiet about it rather than printing an error per
+    queued task.
+    """
+
+
 class S3LFS:
     def __init__(
         self,
@@ -200,6 +209,11 @@ class S3LFS:
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
+        # Note: boto3 spawns max_concurrency threads per transfer and s3lfs
+        # runs self.workers transfers at once, so in the worst case these
+        # multiply. That is deliberate: a single large asset is one transfer,
+        # and dividing the budget across the pool would leave it with no
+        # multipart parallelism at all, which is the case s3lfs exists for.
         max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
@@ -1701,6 +1715,16 @@ class S3LFS:
         s3_key = chunk_info["s3_key"]
         extra_args = chunk_info["extra_args"]
 
+        # Queued work should not start after an interrupt. Only the drain
+        # loops checked this, so every task already submitted to the pool ran
+        # to completion and Ctrl-C appeared to hang on large transfers.
+        if self._shutdown_requested:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise ShutdownRequested(f"Upload cancelled: {s3_key}")
+
         try:
             bytes_uploaded = self._put_chunk(path, s3_key, extra_args)
         finally:
@@ -1789,7 +1813,8 @@ class S3LFS:
                         try:
                             _, bytes_uploaded = ul_future.result()
                         except Exception as e:
-                            print(f"Error uploading " f"{chunk['s3_key']}: {e}")
+                            if not isinstance(e, ShutdownRequested):
+                                print(f"Error uploading " f"{chunk['s3_key']}: {e}")
                             continue
 
                         entry = pending[manifest_key]
@@ -1906,6 +1931,10 @@ class S3LFS:
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def _download_chunk(self, chunk_info, target_path):
         """Download a single S3 chunk to a target path."""
+        # See _upload_chunk: queued work must not start after an interrupt.
+        if self._shutdown_requested:
+            raise ShutdownRequested(f"Download cancelled: {chunk_info['s3_key']}")
+
         with open(target_path, "wb") as f:
             self._get_s3_client().download_fileobj(
                 Bucket=self.bucket_name,
@@ -2041,7 +2070,8 @@ class S3LFS:
                             ) = dl_future.result()
                         except Exception as e:
                             chunk = dl_futures[dl_future]
-                            print(f"Error downloading " f"{chunk['s3_key']}: {e}")
+                            if not isinstance(e, ShutdownRequested):
+                                print(f"Error downloading " f"{chunk['s3_key']}: {e}")
                             continue
 
                         total_bytes += bytes_downloaded
