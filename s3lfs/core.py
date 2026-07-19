@@ -1,11 +1,13 @@
 import contextlib
 import fnmatch
+import functools
 import glob
 import gzip
 import hashlib
 import json
 import mmap
 import os
+import random
 import re
 import shutil
 import signal
@@ -69,8 +71,43 @@ ERROR_MESSAGES = {
 }
 
 
+# Errors that will not succeed on a second attempt. Retrying them wastes the
+# caller's time and buries the real cause behind a delay.
+NON_RETRYABLE_S3_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AllAccessDisabled",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "NoSuchBucket",
+        "InvalidBucketName",
+        "AccountProblem",
+        "InvalidObjectState",
+        "EntityTooLarge",
+    }
+)
+
+
+def _is_retryable(exc):
+    """Is this exception worth another attempt?"""
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in NON_RETRYABLE_S3_CODES:
+            return False
+        # 4xx other than throttling and request timeout are client errors.
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if isinstance(status, int) and 400 <= status < 500:
+            return code in {
+                "RequestTimeout",
+                "SlowDown",
+                "Throttling",
+                "ThrottlingException",
+            }
+    return True
+
+
 def retry(times, exceptions, max_delay=30):
-    """Retry decorator with exponential backoff.
+    """Retry decorator with exponential backoff and full jitter.
 
     :param times: Maximum number of retry attempts.
     :param exceptions: Tuple of exception types that trigger a retry.
@@ -78,20 +115,25 @@ def retry(times, exceptions, max_delay=30):
     """
 
     def decorator(func):
+        @functools.wraps(func)
         def newfn(*args, **kwargs):
             for attempt in range(times):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as exc:
-                    if attempt < times - 1:
-                        delay = min(2 ** (attempt + 1), max_delay)
-                        print(
-                            f"Retry {attempt + 1}/{times} for {func.__name__} "
-                            f"in {delay}s: {exc}"
-                        )
-                        time.sleep(delay)
-                    else:
+                    if attempt >= times - 1 or not _is_retryable(exc):
                         raise
+                    # Full jitter. Without it, every worker that failed at the
+                    # same moment retries at the same moment, so a transient
+                    # blip becomes a synchronised stampede against the
+                    # endpoint that just failed.
+                    ceiling = min(2 ** (attempt + 1), max_delay)
+                    delay = random.uniform(0, ceiling)
+                    print(
+                        f"Retry {attempt + 1}/{times} for {func.__name__} "
+                        f"in {delay:.1f}s: {exc}"
+                    )
+                    time.sleep(delay)
 
         return newfn
 
@@ -1635,22 +1677,32 @@ class S3LFS:
 
         return (manifest_key, file_hash, chunks)
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
+    def _put_chunk(self, path, s3_key, extra_args):
+        """PUT one chunk. Retried, so it must not consume its input."""
+        with open(path, "rb") as f:
+            self._get_s3_client().upload_fileobj(
+                f,
+                self.bucket_name,
+                s3_key,
+                ExtraArgs=extra_args,
+                Config=self.config,
+            )
+        return path.stat().st_size
+
     def _upload_chunk(self, chunk_info):
-        """Upload a single compressed chunk to S3."""
+        """Upload a single compressed chunk to S3.
+
+        The chunk file is removed once, after all retry attempts. Deleting it
+        inside the retried call would leave nothing for the next attempt to
+        read, so the retry could only ever fail.
+        """
         path = chunk_info["path"]
         s3_key = chunk_info["s3_key"]
         extra_args = chunk_info["extra_args"]
 
         try:
-            with open(path, "rb") as f:
-                self._get_s3_client().upload_fileobj(
-                    f,
-                    self.bucket_name,
-                    s3_key,
-                    ExtraArgs=extra_args,
-                    Config=self.config,
-                )
-            bytes_uploaded = path.stat().st_size
+            bytes_uploaded = self._put_chunk(path, s3_key, extra_args)
         finally:
             try:
                 os.remove(path)
@@ -1817,6 +1869,7 @@ class S3LFS:
 
         self.parallel_download_chunked(files_to_download, silence=silence)
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def _discover_chunks_for_file(self, manifest_key, file_hash):
         """Discover S3 chunks for a single file."""
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
@@ -1850,6 +1903,7 @@ class S3LFS:
                 }
             ]
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def _download_chunk(self, chunk_info, target_path):
         """Download a single S3 chunk to a target path."""
         with open(target_path, "wb") as f:
