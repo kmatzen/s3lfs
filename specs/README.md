@@ -58,9 +58,26 @@ uploader commits partway through a sweep.
 ### What does work
 
 The uploader claims the hash under the lock *before* any bytes reach S3, and
-releases the claim in the same critical section that publishes the manifest
-reference. The GC treats `manifest ∪ inflight` as the live set. This is the
-`INFLIGHT` configuration and it checks clean over the full state space.
+releases the claim only after the manifest reference is published. The GC treats
+`manifest ∪ inflight` as the live set. This is the `INFLIGHT` configuration and
+it checks clean over the full state space.
+
+**This is now implemented.** `parallel_upload_chunked` claims each hash as its
+prep completes and releases the set in its `finally`, strictly after the manifest
+write; `cleanup_s3` unions the registry into its live set at mark time and
+re-checks under the lock immediately before deleting. The registry lives at
+`.s3lfs_temp/.s3lfs_inflight.yaml`.
+
+The release ordering is the load-bearing part. Releasing before the manifest
+write would reopen exactly the window the registry exists to close — the hash
+would be in neither the manifest nor the registry, and a sweep landing in
+between would delete the objects.
+
+One residual: a crashed uploader leaves its claims behind, so claims age out
+after `INFLIGHT_TTL_SECONDS` (24h). That timeout bounds the leak from a crash;
+it plays no part in closing the race, which the registry closes outright. This
+is deliberately narrower than the alternative of an object-age grace period,
+where the timeout *is* the correctness argument.
 
 An object-age grace period (skip objects younger than the longest plausible
 upload) is a weaker alternative — simpler to implement, no shared registry, but
