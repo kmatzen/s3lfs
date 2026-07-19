@@ -257,6 +257,60 @@ equally enumerated — and no spec at the time could contradict it, because none
 them modeled the namespace. A boolean knob cannot reject a bad reason for a
 correct change.
 
+## Verification notes
+
+### Lock reentrancy — checked by instrumentation, not by TLC
+
+`_lock_context` is not reentrant. `portalocker` takes `LOCK_EX` on a freshly
+opened descriptor, so a second acquisition on the same thread blocks against the
+first and the process hangs. Widening a critical section therefore risks a
+self-deadlock.
+
+This is a property of the actual call graph, and a spec would only re-encode
+whatever assumptions were made when writing it. It was instead checked directly:
+`_lock_context` was instrumented with a per-instance, per-thread depth counter
+that reports any nested acquisition, and the full test suite was run against it.
+
+Result: **0 reentrant acquisitions**, with the instrumented run reproducing the
+uninstrumented pass/fail counts exactly. The suite also completed without
+hanging, which separately rules out cross-instance nesting (two S3LFS objects
+sharing one lock file on one thread), since that blocks on flock rather than
+tripping the counter.
+
+This covers exercised paths only. 61 tests in this environment fail early for an
+unrelated reason (they shell out to `python`, absent here), so their paths are
+unverified.
+
+### A measurement error worth recording
+
+Earlier commit messages in this branch claimed the lock-path fix resolved 28
+`test_cli_integration.py::TestS3LFSCLIInProcess` failures. **That claim is
+false.** The baseline had been extracted with `git archive`, which does not
+include `.git`, and those 28 tests require a git repository. They were failing
+for that reason alone.
+
+Measured correctly, with `.git` present in both trees:
+
+| Tree | Result |
+| --- | --- |
+| `385fe1b` (before all three code fixes) | 61 failed / 531 passed |
+| `1c355de` (after all three) | 61 failed / 538 passed |
+
+The delta is exactly the seven tests added alongside the fixes. **All three code
+fixes have zero test-suite delta.** Each is verified by a targeted probe or a
+purpose-written regression test instead:
+
+- lock path — two processes at different working directories, critical sections
+  interleave before and serialize after;
+- enumeration — `track .` on a fresh repo, 22 manifest entries before and 2
+  after;
+- read-modify-write — a concurrent commit erased before and preserved after,
+  with two of the three new tests failing on the parent commit.
+
+The general lesson: a baseline built by copying a tree is not the same tree. Diff
+the failure sets, and confirm any claimed movement against a control that differs
+only in the change under test.
+
 ## Scope and limitations
 
 The model abstracts the manifest to a set of content hashes, dropping the path
