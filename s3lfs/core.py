@@ -189,6 +189,11 @@ class S3LFS:
         lock_dir.mkdir(parents=True, exist_ok=True)
         self._lock_file = lock_dir / ".s3lfs.lock"
 
+        # Registry of hashes an uploader has claimed but not yet published in
+        # the manifest. Garbage collection treats these as live; see
+        # _inflight_claim.
+        self._inflight_file = lock_dir / ".s3lfs_inflight.yaml"
+
         self.no_sign_request = no_sign_request
         self._cache_mtime: Optional[float] = None
         self._cache_dirty = False
@@ -269,6 +274,73 @@ class S3LFS:
         finally:
             portalocker.unlock(lock)  # Release the lock
             lock.close()  # Close the file handle
+
+    # A claim older than this is treated as abandoned by a crashed process.
+    # This bounds the leak from a crash; it plays no part in closing the race
+    # itself, which the registry handles outright.
+    INFLIGHT_TTL_SECONDS = 24 * 60 * 60
+
+    def _load_inflight(self):
+        """Read the in-flight claim registry. Caller must hold the lock."""
+        if not self._inflight_file.exists():
+            return {}
+        try:
+            with open(self._inflight_file, "r") as f:
+                data = yaml.safe_load(f) or {}
+            claims = data.get("claims", {})
+            return claims if isinstance(claims, dict) else {}
+        except Exception:
+            # A corrupt registry must not block uploads. Treating it as empty
+            # is the conservative direction: GC may delete an object an
+            # in-flight upload is about to reference, which is the behaviour
+            # without a registry at all, rather than leaking forever.
+            return {}
+
+    def _save_inflight(self, claims):
+        """Write the in-flight claim registry. Caller must hold the lock."""
+        # Unique temp name: a shared one lets concurrent writers interleave
+        # into a single file before the rename.
+        temp_file = self._inflight_file.with_name(
+            f"{self._inflight_file.name}.{uuid4().hex}.tmp"
+        )
+        with open(temp_file, "w") as f:
+            yaml.safe_dump({"claims": claims}, f)
+        temp_file.replace(self._inflight_file)
+
+    def _live_inflight_hashes(self):
+        """Claims that have not aged out. Caller must hold the lock."""
+        cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
+        return {h for h, ts in self._load_inflight().items() if ts >= cutoff}
+
+    def _claim_inflight(self, file_hash):
+        """Register a hash as in-flight, before any of its bytes reach S3."""
+        with self._lock_context():
+            claims = self._load_inflight()
+            claims[file_hash] = time.time()
+            self._save_inflight(claims)
+
+    def _release_inflight(self, hashes):
+        """Drop claims. Must run only after the manifest entry is published."""
+        if not hashes:
+            return
+        with self._lock_context():
+            claims = self._load_inflight()
+            cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
+            claims = {
+                h: ts
+                for h, ts in claims.items()
+                if h not in hashes and ts >= cutoff  # also prune aged-out claims
+            }
+            self._save_inflight(claims)
+
+    def _hash_from_asset_key(self, key):
+        """Extract the content hash from an assets/ S3 key, or None."""
+        prefix = f"{self.repo_prefix}/assets/"
+        if not key.startswith(prefix):
+            return None
+        rest = key[len(prefix) :]
+        head, _, tail = rest.partition("/")
+        return head if tail else None
 
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
@@ -1315,7 +1387,9 @@ class S3LFS:
         :param force: If True, bypass confirmation (for automated tests).
         """
         with self._lock_context():
-            current_hashes = set(self.manifest["files"].values())
+            self.load_manifest()
+            live_hashes = set(self.manifest["files"].values())
+            live_hashes |= self._live_inflight_hashes()
 
         paginator = self._get_s3_client().get_paginator("list_objects_v2")
         pages = paginator.paginate(
@@ -1328,14 +1402,12 @@ class S3LFS:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    parts = key.replace(f"{self.repo_prefix}/", "").split("/")
-                    if len(parts) < 3:
+                    file_hash = self._hash_from_asset_key(key)
+                    if file_hash is None:
                         continue
 
-                    file_hash = parts[1]  # Extract the hash from the S3 key
-
                     # Collect unreferenced files
-                    if file_hash not in current_hashes:
+                    if file_hash not in live_hashes:
                         unreferenced_files.append(key)
 
         if not unreferenced_files:
@@ -1351,8 +1423,23 @@ class S3LFS:
                 print("Cleanup aborted. No files were deleted.")
                 return
 
-        # Proceed with deletion
+        # Re-check under the lock immediately before deleting. Listing S3 and
+        # waiting for confirmation both take unbounded time, during which an
+        # upload may have claimed or published any of these hashes.
+        with self._lock_context():
+            self.load_manifest()
+            live_now = set(self.manifest["files"].values())
+            live_now |= self._live_inflight_hashes()
+
+        to_delete = []
         for key in unreferenced_files:
+            if self._hash_from_asset_key(key) in live_now:
+                print(f"Skipping {key} (became referenced during cleanup)")
+                continue
+            to_delete.append(key)
+
+        # Proceed with deletion
+        for key in to_delete:
             self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
             print(f"Deleted {key}")
 
@@ -1481,6 +1568,9 @@ class S3LFS:
         # manifest_key -> {hash, expected, done}. A file earns its manifest
         # entry only once every one of its chunks has landed in S3.
         pending = {}
+        # Hashes claimed in the in-flight registry, released once the manifest
+        # has been written.
+        claimed = set()
         total_bytes = 0
         total_chunks = 0
         chunks_done = 0
@@ -1509,6 +1599,14 @@ class S3LFS:
                             continue
 
                         manifest_key, file_hash, chunks = result
+
+                        # Claim the hash before submitting any chunk upload.
+                        # Between a chunk landing in S3 and the manifest entry
+                        # being published, the object is unreferenced and a
+                        # concurrent cleanup_s3 would otherwise delete it.
+                        self._claim_inflight(file_hash)
+                        claimed.add(file_hash)
+
                         pending[manifest_key] = {
                             "hash": file_hash,
                             "expected": len(chunks),
@@ -1550,6 +1648,12 @@ class S3LFS:
                     self.load_manifest()
                     self.manifest["files"].update(manifest_updates)
                     self.save_manifest()
+
+            # Strictly after the manifest is published. Releasing first would
+            # reopen the window the registry exists to close: the hash would be
+            # in neither the manifest nor the registry, and a sweep running in
+            # between would delete the objects.
+            self._release_inflight(claimed)
 
             # Files whose chunks did not all land are deliberately absent from
             # the manifest. Recording them would leave an entry pointing at an
