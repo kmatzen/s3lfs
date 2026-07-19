@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Any base branch, so stacked PRs are checked before their base merges.
+    branches: ["**"]
 
 jobs:
   lint:

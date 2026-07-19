@@ -1833,10 +1833,10 @@ class S3LFS:
                     f"not written:"
                 )
                 for mk in incomplete[:10]:
-                    e = file_tracker[mk]
+                    tracked = file_tracker[mk]
                     print(
-                        f"  {mk} (received {len(e['received'])}/{e['expected']} "
-                        f"chunks)"
+                        f"  {mk} (received {len(tracked['received'])}/"
+                        f"{tracked['expected']} chunks)"
                     )
                 if len(incomplete) > 10:
                     print(f"  ... and {len(incomplete) - 10} more")
