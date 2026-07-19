@@ -1,0 +1,4 @@
+# TLC toolchain and scratch output
+tla2tools.jar
+states/
+*.old
