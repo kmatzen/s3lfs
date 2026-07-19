@@ -118,7 +118,16 @@ PSave(p) ==
     /\ pstate' = [pstate EXCEPT ![p] = "done"]
     /\ UNCHANGED <<snapshot, op, cwd>>
 
-Next == \E p \in Procs : PLoad(p) \/ PAcquire(p) \/ PReload(p) \/ PSave(p)
+(***************************************************************************)
+(* Explicit terminal stutter, so TLC's deadlock check can stay ON.          *)
+(***************************************************************************)
+Terminating ==
+    /\ \A p \in Procs : pstate[p] = "done"
+    /\ UNCHANGED vars
+
+Next ==
+    \/ \E p \in Procs : PLoad(p) \/ PAcquire(p) \/ PReload(p) \/ PSave(p)
+    \/ Terminating
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 

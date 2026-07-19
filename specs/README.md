@@ -274,6 +274,71 @@ equally enumerated — and no spec at the time could contradict it, because none
 them modeled the namespace. A boolean knob cannot reject a bad reason for a
 correct change.
 
+## S3lfsCombined — the manifest and GC protocols together
+
+The other specs are per-protocol silos, and each assumed the others' properties
+held. `S3lfsGC` assumed mutual exclusion, which was false until the lock path was
+fixed. `S3lfsManifest` assumed paths did not matter, which hid the namespace
+defect. Cross-cutting defects live in exactly those seams.
+
+This model puts an uploader, a remover and a collector against one manifest, so
+both safety properties are checked against the **same** behaviours rather than
+against two separate idealisations. Reachability is keyed on hash *and* path,
+matching the storage layout and the path-aware GC the code now implements.
+
+```sh
+for c in Broken ReloadOnly RevalOnly Fixed; do
+  java -jar tla2tools.jar -config S3lfsCombined_$c.cfg S3lfsCombined.tla
+done
+```
+
+| Config | `RELOAD` | `INFLIGHT` | `GC_REVALIDATE` | Result |
+| --- | --- | --- | --- | --- |
+| `Broken` | ✗ | ✗ | ✗ | `NoLostUpdate` violated |
+| `ReloadOnly` | ✓ | ✗ | ✗ | `NoDanglingReference` violated |
+| `RevalOnly` | ✓ | ✗ | ✓ | `NoDanglingReference` **still** violated |
+| `Fixed` | ✓ | ✓ | ✓ | No error |
+
+`RevalOnly` is the interesting row: it confirms in the composed model what
+`S3lfsGC` found in isolation — re-validating the manifest before deleting does
+not close the race, because the whole mark/sweep cycle fits inside the
+uploader's store-then-publish window.
+
+`NoOrphanedObjectSurvivesGC` is the property neither single-protocol spec could
+state, because it needs the remover and the collector in one behaviour: a lost
+update orphans an object, and the collector then deletes it. A manifest bug
+becomes data loss only when GC is also in play.
+
+## Termination, and why the deadlock check is back on
+
+Every configuration previously set `CHECK_DEADLOCK FALSE`. That was expedient
+and wrong: processes finishing looks like a deadlock to TLC, so the check was
+switched off — which also switched off detection of *real* deadlocks. That
+mattered, because `_lock_context` is not reentrant and widening a critical
+section risks a self-deadlock; the question ended up being answered by
+instrumentation instead (see below).
+
+Each spec now has an explicit `Terminating` stuttering step, so a finished
+behaviour is a legitimate self-loop rather than a stuck state, and
+**`CHECK_DEADLOCK TRUE` is set everywhere**. All clean configurations pass with
+it enabled.
+
+## Larger configurations
+
+The counterexamples all appear at 2 processes / 2 paths / 3 chunks, but a clean
+result at that size establishes very little. The verified-good configurations
+were re-run larger:
+
+| Config | Size | Result |
+| --- | --- | --- |
+| `S3lfsCombined_FixedLarge` | 3 paths, 3 hashes | No error |
+| `S3lfsManifest_Reload_Lock_Large` | 3 processes, 3 paths | No error |
+| `S3lfsChunks_CommitAndVerifyLarge` | 6 chunks | No error |
+
+Nothing new appears at greater scale. This still is not a proof — TLC checks the
+model it is given — but it removes the "only ever checked at the smallest
+interesting size" caveat.
+
 ## Verification notes
 
 ### Lock reentrancy — checked by instrumentation, not by TLC
@@ -350,10 +415,15 @@ configurations — TLC checks the model it is given, not the code.
 `track` runs mutate many entries across a long upload, which widens every window
 modeled here without changing their shape.
 
-`S3lfsChunks` models a single file with `NumChunks = 3` and treats an upload as
-one atomic choice of which chunks survive, rather than as concurrent per-chunk
-tasks. That is sound for the properties checked — every surviving-subset is
-reachable either way — but it means the spec says nothing about the worker-pool
-behaviour itself, including the shared-pool submission pattern at
-`core.py:1497-1516` or the download-side tracker that never finalizes a file
-when a chunk fails (`core.py:1722`).
+`S3lfsChunks` models a single file and treats an upload as one atomic choice of
+which chunks survive, rather than as concurrent per-chunk tasks. That is sound
+for the properties checked — every surviving-subset is reachable either way —
+but it means the spec says nothing about the worker-pool behaviour itself,
+including the shared-pool submission pattern or the download-side tracker.
+
+`S3lfsCombined` models one uploader, one remover and one collector. Multiple
+concurrent uploaders are not modelled, so it cannot speak to two uploads racing
+on the same path.
+
+The hash cache is not modelled at all. Its lost-write mechanism has the same
+shape as the manifest read-modify-write bug and would be straightforward to add.

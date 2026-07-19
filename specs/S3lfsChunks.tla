@@ -116,7 +116,15 @@ DCheckout ==
     /\ dPhase' = "done"
     /\ UNCHANGED <<uploaded, uPhase, committed, mCount>>
 
-Next == UStart \/ UUpload \/ UCommit \/ DCheckout
+(***************************************************************************)
+(* Explicit terminal stutter, so TLC's deadlock check can stay ON.          *)
+(***************************************************************************)
+Terminating ==
+    /\ uPhase = "done"
+    /\ (dPhase = "done" \/ ~committed)
+    /\ UNCHANGED vars
+
+Next == UStart \/ UUpload \/ UCommit \/ DCheckout \/ Terminating
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 

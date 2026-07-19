@@ -68,9 +68,13 @@ class TestRetryDecorator(unittest.TestCase):
 
         # 3 sleeps for 4 attempts (no sleep after final failure)
         self.assertEqual(len(sleep_calls), 3)
-        self.assertEqual(sleep_calls[0], 2)  # 2^1
-        self.assertEqual(sleep_calls[1], 4)  # 2^2
-        self.assertEqual(sleep_calls[2], 8)  # 2^3
+        # Full jitter: each delay is drawn from [0, 2**(attempt+1)] rather
+        # than being exactly that ceiling. A fixed schedule makes every
+        # worker that failed together retry together.
+        self.assertGreaterEqual(sleep_calls[0], 0)
+        self.assertLessEqual(sleep_calls[0], 2)  # 2^1
+        self.assertLessEqual(sleep_calls[1], 4)  # 2^2
+        self.assertLessEqual(sleep_calls[2], 8)  # 2^3
 
     def test_max_delay_cap(self):
         sleep_calls = []

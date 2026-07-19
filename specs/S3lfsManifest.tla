@@ -114,8 +114,19 @@ PSave(p) ==
     /\ pstate' = [pstate EXCEPT ![p] = "done"]
     /\ UNCHANGED <<snapshot, op>>
 
+(***************************************************************************)
+(* Every process has finished. Modelled as an explicit stuttering step so   *)
+(* that TLC's deadlock check stays ON: without it, normal termination is    *)
+(* indistinguishable from a genuine deadlock, and switching the check off   *)
+(* would also hide one.                                                     *)
+(***************************************************************************)
+Terminating ==
+    /\ \A p \in Procs : pstate[p] = "done"
+    /\ UNCHANGED vars
+
 Next ==
-    \E p \in Procs : PLoad(p) \/ PAcquire(p) \/ PReload(p) \/ PSave(p)
+    \/ \E p \in Procs : PLoad(p) \/ PAcquire(p) \/ PReload(p) \/ PSave(p)
+    \/ Terminating
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 

@@ -1,11 +1,13 @@
 import contextlib
 import fnmatch
+import functools
 import glob
 import gzip
 import hashlib
 import json
 import mmap
 import os
+import random
 import re
 import shutil
 import signal
@@ -69,8 +71,43 @@ ERROR_MESSAGES = {
 }
 
 
+# Errors that will not succeed on a second attempt. Retrying them wastes the
+# caller's time and buries the real cause behind a delay.
+NON_RETRYABLE_S3_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AllAccessDisabled",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "NoSuchBucket",
+        "InvalidBucketName",
+        "AccountProblem",
+        "InvalidObjectState",
+        "EntityTooLarge",
+    }
+)
+
+
+def _is_retryable(exc):
+    """Is this exception worth another attempt?"""
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in NON_RETRYABLE_S3_CODES:
+            return False
+        # 4xx other than throttling and request timeout are client errors.
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if isinstance(status, int) and 400 <= status < 500:
+            return code in {
+                "RequestTimeout",
+                "SlowDown",
+                "Throttling",
+                "ThrottlingException",
+            }
+    return True
+
+
 def retry(times, exceptions, max_delay=30):
-    """Retry decorator with exponential backoff.
+    """Retry decorator with exponential backoff and full jitter.
 
     :param times: Maximum number of retry attempts.
     :param exceptions: Tuple of exception types that trigger a retry.
@@ -78,24 +115,38 @@ def retry(times, exceptions, max_delay=30):
     """
 
     def decorator(func):
+        @functools.wraps(func)
         def newfn(*args, **kwargs):
             for attempt in range(times):
                 try:
                     return func(*args, **kwargs)
                 except exceptions as exc:
-                    if attempt < times - 1:
-                        delay = min(2 ** (attempt + 1), max_delay)
-                        print(
-                            f"Retry {attempt + 1}/{times} for {func.__name__} "
-                            f"in {delay}s: {exc}"
-                        )
-                        time.sleep(delay)
-                    else:
+                    if attempt >= times - 1 or not _is_retryable(exc):
                         raise
+                    # Full jitter. Without it, every worker that failed at the
+                    # same moment retries at the same moment, so a transient
+                    # blip becomes a synchronised stampede against the
+                    # endpoint that just failed.
+                    ceiling = min(2 ** (attempt + 1), max_delay)
+                    delay = random.uniform(0, ceiling)
+                    print(
+                        f"Retry {attempt + 1}/{times} for {func.__name__} "
+                        f"in {delay:.1f}s: {exc}"
+                    )
+                    time.sleep(delay)
 
         return newfn
 
     return decorator
+
+
+class ShutdownRequested(Exception):
+    """Raised by a worker that declined to start because of an interrupt.
+
+    Distinguishes cancelled work from work that genuinely failed, so the
+    drain loops can stay quiet about it rather than printing an error per
+    queued task.
+    """
 
 
 class S3LFS:
@@ -158,6 +209,11 @@ class S3LFS:
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
+        # Note: boto3 spawns max_concurrency threads per transfer and s3lfs
+        # runs self.workers transfers at once, so in the worst case these
+        # multiply. That is deliberate: a single large asset is one transfer,
+        # and dividing the budget across the pool would leave it with no
+        # multipart parallelism at all, which is the case s3lfs exists for.
         max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
@@ -314,40 +370,87 @@ class S3LFS:
             yaml.safe_dump({"claims": claims}, f)
         temp_file.replace(self._inflight_file)
 
-    def _live_inflight_hashes(self):
+    def _live_inflight_keys(self):
         """Claims that have not aged out. Caller must hold the lock."""
         cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
-        return {h for h, ts in self._load_inflight().items() if ts >= cutoff}
+        return {k for k, ts in self._load_inflight().items() if ts >= cutoff}
 
-    def _claim_inflight(self, file_hash):
-        """Register a hash as in-flight, before any of its bytes reach S3."""
+    def _claim_inflight(self, base_key):
+        """Register an asset key as in-flight, before any bytes reach S3."""
         with self._lock_context():
             claims = self._load_inflight()
-            claims[file_hash] = time.time()
+            claims[base_key] = time.time()
             self._save_inflight(claims)
 
-    def _release_inflight(self, hashes):
+    def _release_inflight(self, base_keys):
         """Drop claims. Must run only after the manifest entry is published."""
-        if not hashes:
+        if not base_keys:
             return
         with self._lock_context():
             claims = self._load_inflight()
             cutoff = time.time() - self.INFLIGHT_TTL_SECONDS
             claims = {
-                h: ts
-                for h, ts in claims.items()
-                if h not in hashes and ts >= cutoff  # also prune aged-out claims
+                k: ts
+                for k, ts in claims.items()
+                if k not in base_keys and ts >= cutoff  # also prune aged-out claims
             }
             self._save_inflight(claims)
 
-    def _hash_from_asset_key(self, key):
-        """Extract the content hash from an assets/ S3 key, or None."""
+    def _asset_base_key(self, manifest_key, file_hash):
+        """The S3 key a file's content is stored under."""
+        return f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+
+    def _delete_asset(self, base_key):
+        """Delete an asset and every chunk belonging to it.
+
+        A large file is stored as base_key.chunk0..N rather than at base_key
+        itself, so deleting only the base key leaves the whole file behind.
+        """
+        client = self._get_s3_client()
+        resp = client.list_objects_v2(Bucket=self.bucket_name, Prefix=base_key)
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        # Guard against a prefix match on an unrelated, longer key.
+        keys = [k for k in keys if self._key_covered_by(k, {base_key})]
+        if not keys:
+            keys = [base_key]
+
+        for key in keys:
+            client.delete_object(Bucket=self.bucket_name, Key=key)
+            print(f"File removed from S3: s3://{self.bucket_name}/{key}")
+
+    def _live_asset_keys(self):
+        """Base keys reachable from the manifest. Caller must hold the lock."""
+        return {
+            self._asset_base_key(manifest_key, file_hash)
+            for manifest_key, file_hash in self.manifest.get("files", {}).items()
+        }
+
+    def _is_asset_key(self, key):
+        """Does this key have the shape of a stored asset?
+
+        Anything else under the prefix is left alone: s3lfs did not put it
+        there in a form it recognises, so it is not ours to delete.
+        """
         prefix = f"{self.repo_prefix}/assets/"
         if not key.startswith(prefix):
-            return None
+            return False
         rest = key[len(prefix) :]
-        head, _, tail = rest.partition("/")
-        return head if tail else None
+        head, sep, tail = rest.partition("/")
+        return bool(head and sep and tail)
+
+    @staticmethod
+    def _key_covered_by(key, base_keys):
+        """Is this key one of these assets, or a chunk belonging to one?
+
+        Reachability has to be judged on hash *and* path, because that is what
+        the storage layout keys on. Judging on the hash alone means an object
+        stays reachable as long as any path shares its content, so a removed
+        or renamed path leaks its object permanently.
+        """
+        if key in base_keys:
+            return True
+        head, sep, tail = key.rpartition(".chunk")
+        return bool(sep) and tail.isdigit() and head in base_keys
 
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
@@ -1438,9 +1541,7 @@ class S3LFS:
         if not keep_in_s3:
             # Objects are stored under the manifest key, so deletion must use
             # it too; the raw argument would miss the object entirely.
-            s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path_str}.gz"
-            self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-            print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
+            self._delete_asset(self._asset_base_key(file_path_str, file_hash))
         else:
             print(
                 f"File remains in S3: s3://{self.bucket_name}/{file_hash}/{file_path_str}"
@@ -1454,8 +1555,7 @@ class S3LFS:
         """
         with self._lock_context():
             self.load_manifest()
-            live_hashes = set(self.manifest["files"].values())
-            live_hashes |= self._live_inflight_hashes()
+            live_keys = self._live_asset_keys() | self._live_inflight_keys()
 
         paginator = self._get_s3_client().get_paginator("list_objects_v2")
         pages = paginator.paginate(
@@ -1468,12 +1568,11 @@ class S3LFS:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    file_hash = self._hash_from_asset_key(key)
-                    if file_hash is None:
+                    if not self._is_asset_key(key):
                         continue
 
                     # Collect unreferenced files
-                    if file_hash not in live_hashes:
+                    if not self._key_covered_by(key, live_keys):
                         unreferenced_files.append(key)
 
         if not unreferenced_files:
@@ -1491,15 +1590,14 @@ class S3LFS:
 
         # Re-check under the lock immediately before deleting. Listing S3 and
         # waiting for confirmation both take unbounded time, during which an
-        # upload may have claimed or published any of these hashes.
+        # upload may have claimed or published any of these keys.
         with self._lock_context():
             self.load_manifest()
-            live_now = set(self.manifest["files"].values())
-            live_now |= self._live_inflight_hashes()
+            live_now = self._live_asset_keys() | self._live_inflight_keys()
 
         to_delete = []
         for key in unreferenced_files:
-            if self._hash_from_asset_key(key) in live_now:
+            if self._key_covered_by(key, live_now):
                 print(f"Skipping {key} (became referenced during cleanup)")
                 continue
             to_delete.append(key)
@@ -1593,22 +1691,42 @@ class S3LFS:
 
         return (manifest_key, file_hash, chunks)
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
+    def _put_chunk(self, path, s3_key, extra_args):
+        """PUT one chunk. Retried, so it must not consume its input."""
+        with open(path, "rb") as f:
+            self._get_s3_client().upload_fileobj(
+                f,
+                self.bucket_name,
+                s3_key,
+                ExtraArgs=extra_args,
+                Config=self.config,
+            )
+        return path.stat().st_size
+
     def _upload_chunk(self, chunk_info):
-        """Upload a single compressed chunk to S3."""
+        """Upload a single compressed chunk to S3.
+
+        The chunk file is removed once, after all retry attempts. Deleting it
+        inside the retried call would leave nothing for the next attempt to
+        read, so the retry could only ever fail.
+        """
         path = chunk_info["path"]
         s3_key = chunk_info["s3_key"]
         extra_args = chunk_info["extra_args"]
 
+        # Queued work should not start after an interrupt. Only the drain
+        # loops checked this, so every task already submitted to the pool ran
+        # to completion and Ctrl-C appeared to hang on large transfers.
+        if self._shutdown_requested:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise ShutdownRequested(f"Upload cancelled: {s3_key}")
+
         try:
-            with open(path, "rb") as f:
-                self._get_s3_client().upload_fileobj(
-                    f,
-                    self.bucket_name,
-                    s3_key,
-                    ExtraArgs=extra_args,
-                    Config=self.config,
-                )
-            bytes_uploaded = path.stat().st_size
+            bytes_uploaded = self._put_chunk(path, s3_key, extra_args)
         finally:
             try:
                 os.remove(path)
@@ -1666,12 +1784,13 @@ class S3LFS:
 
                         manifest_key, file_hash, chunks = result
 
-                        # Claim the hash before submitting any chunk upload.
+                        # Claim the asset before submitting any chunk upload.
                         # Between a chunk landing in S3 and the manifest entry
                         # being published, the object is unreferenced and a
                         # concurrent cleanup_s3 would otherwise delete it.
-                        self._claim_inflight(file_hash)
-                        claimed.add(file_hash)
+                        base_key = self._asset_base_key(manifest_key, file_hash)
+                        self._claim_inflight(base_key)
+                        claimed.add(base_key)
 
                         pending[manifest_key] = {
                             "hash": file_hash,
@@ -1694,7 +1813,8 @@ class S3LFS:
                         try:
                             _, bytes_uploaded = ul_future.result()
                         except Exception as e:
-                            print(f"Error uploading " f"{chunk['s3_key']}: {e}")
+                            if not isinstance(e, ShutdownRequested):
+                                print(f"Error uploading " f"{chunk['s3_key']}: {e}")
                             continue
 
                         entry = pending[manifest_key]
@@ -1774,6 +1894,7 @@ class S3LFS:
 
         self.parallel_download_chunked(files_to_download, silence=silence)
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def _discover_chunks_for_file(self, manifest_key, file_hash):
         """Discover S3 chunks for a single file."""
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
@@ -1807,8 +1928,13 @@ class S3LFS:
                 }
             ]
 
+    @retry(3, (BotoCoreError, ClientError, SSLError))
     def _download_chunk(self, chunk_info, target_path):
         """Download a single S3 chunk to a target path."""
+        # See _upload_chunk: queued work must not start after an interrupt.
+        if self._shutdown_requested:
+            raise ShutdownRequested(f"Download cancelled: {chunk_info['s3_key']}")
+
         with open(target_path, "wb") as f:
             self._get_s3_client().download_fileobj(
                 Bucket=self.bucket_name,
@@ -1944,7 +2070,8 @@ class S3LFS:
                             ) = dl_future.result()
                         except Exception as e:
                             chunk = dl_futures[dl_future]
-                            print(f"Error downloading " f"{chunk['s3_key']}: {e}")
+                            if not isinstance(e, ShutdownRequested):
+                                print(f"Error downloading " f"{chunk['s3_key']}: {e}")
                             continue
 
                         total_bytes += bytes_downloaded
@@ -2062,9 +2189,7 @@ class S3LFS:
             for file_path, file_hash in removed_hashes.items():
                 if not file_hash:
                     continue
-                s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path}.gz"
-                self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
-                print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
+                self._delete_asset(self._asset_base_key(file_path, file_hash))
 
         count = len(files_to_remove)
         print(
