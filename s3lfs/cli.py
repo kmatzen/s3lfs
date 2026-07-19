@@ -777,20 +777,36 @@ S3LFS_HOOK_END = "# <<< s3lfs hook <<<"
 _POST_MERGE_BODY = """\
 # Auto-checkout s3lfs files after merge
 if command -v s3lfs >/dev/null 2>&1; then
-    s3lfs checkout --all 2>&1 || echo "s3lfs: warning: post-merge checkout failed"
+    if ! s3lfs checkout --all 2>&1; then
+        echo "s3lfs: ERROR: post-merge checkout failed" >&2
+        echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
+    fi
 fi"""
 
 _POST_CHECKOUT_BODY = """\
 # Auto-checkout s3lfs files after checkout
 # Only run on branch checkouts ($3 == 1), not file checkouts
 if [ "$3" = "1" ] && command -v s3lfs >/dev/null 2>&1; then
-    s3lfs checkout --all 2>&1 || echo "s3lfs: warning: post-checkout checkout failed"
+    if ! s3lfs checkout --all 2>&1; then
+        echo "s3lfs: ERROR: post-checkout checkout failed" >&2
+        echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
+    fi
 fi"""
 
 _PRE_PUSH_BODY = """\
-# Auto-track modified s3lfs files before push
+# Auto-track modified s3lfs files before push.
+#
+# This hook aborts the push on failure, and that is deliberate. It uploads
+# the content the manifest being pushed refers to; if the upload fails and
+# the push proceeds, collaborators fetch a manifest whose hashes have no
+# objects behind them and every checkout 404s. Failing here is recoverable,
+# pushing a broken manifest is not.
 if command -v s3lfs >/dev/null 2>&1; then
-    s3lfs track --modified 2>&1 || echo "s3lfs: warning: pre-push track failed"
+    if ! s3lfs track --modified 2>&1; then
+        echo "s3lfs: pre-push track failed; aborting push" >&2
+        echo "s3lfs: push anyway with --no-verify if you are sure" >&2
+        exit 1
+    fi
 fi"""
 
 HOOK_SCRIPTS = {
@@ -840,9 +856,28 @@ def _install_hook(hooks_dir, hook_name, hook_block):
     else:
         content = shebang + "\n" + hook_block + "\n"
 
-    hook_path.write_text(content)
-    hook_path.chmod(0o755)
+    _write_hook_atomically(hook_path, content)
     return hook_path
+
+
+def _write_hook_atomically(hook_path, content):
+    """Replace a hook file in one step.
+
+    write_text truncates before writing, so an interrupt part-way through
+    leaves a user's pre-existing hook truncated and executable. Write to a
+    sibling temp file and rename, which is atomic within a directory.
+    """
+    from uuid import uuid4
+
+    temp_path = hook_path.with_name(f"{hook_path.name}.{uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(content)
+        temp_path.chmod(0o755)
+        temp_path.replace(hook_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
 
 
 def _uninstall_hook(hooks_dir, hook_name):
@@ -870,7 +905,7 @@ def _uninstall_hook(hooks_dir, hook_name):
     if stripped == "" or stripped == "#!/bin/sh":
         hook_path.unlink()
     else:
-        hook_path.write_text(new_content)
+        _write_hook_atomically(hook_path, new_content)
 
     return True
 
