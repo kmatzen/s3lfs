@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -30,7 +31,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command when not in git repo
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=non_git_dir,
@@ -51,7 +52,7 @@ class TestLSCommandCoverage(unittest.TestCase):
         # Don't create manifest file - it shouldn't exist
         # Test ls command when manifest doesn't exist
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -87,7 +88,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command from outside git repo
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=outside_dir,
@@ -117,7 +118,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with --all flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--all"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--all"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -146,7 +147,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with specific path
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -175,7 +176,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with --verbose flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--verbose"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--verbose"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -204,7 +205,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with --no-sign-request flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--no-sign-request"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--no-sign-request"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -234,7 +235,7 @@ class TestLSCommandCoverage(unittest.TestCase):
         # Test ls command with multiple flags
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "s3lfs.cli",
                 "ls",
@@ -270,7 +271,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with both path and --all flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "test_file.txt", "--all"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "test_file.txt", "--all"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -304,7 +305,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command from subdirectory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=subdir,
@@ -338,7 +339,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with specific path from subdirectory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=subdir,
@@ -367,7 +368,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with empty manifest
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -396,7 +397,7 @@ class TestLSCommandCoverage(unittest.TestCase):
 
         # Test ls command with nonexistent path
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "nonexistent_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "nonexistent_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
