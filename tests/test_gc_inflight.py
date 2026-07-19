@@ -17,8 +17,8 @@ class TestGCInflightRegistry(unittest.TestCase):
     An uploader PUTs chunks before publishing its manifest entry, so there is
     a window in which an object exists in S3 and nothing references it. A
     sweep running in that window would delete it and leave the manifest
-    pointing at a missing object. Uploaders therefore claim the hash before
-    any bytes are sent, and GC treats claimed hashes as live.
+    pointing at a missing object. Uploaders therefore claim the asset key
+    before any bytes are sent, and GC treats claimed keys as live.
     """
 
     def setUp(self):
@@ -74,12 +74,12 @@ class TestGCInflightRegistry(unittest.TestCase):
                 s3_factory=factory,
             )
 
-    def test_claimed_hash_survives_cleanup(self):
+    def test_claimed_asset_survives_cleanup(self):
         s3lfs = self._s3lfs()
         key = "test-prefix/assets/claimed_hash/file.bin.gz"
         self.store[key] = b"data"
 
-        s3lfs._claim_inflight("claimed_hash")
+        s3lfs._claim_inflight(key)
         s3lfs.cleanup_s3(force=True)
 
         self.assertIn(key, self.store, "GC deleted an in-flight object")
@@ -98,8 +98,8 @@ class TestGCInflightRegistry(unittest.TestCase):
         key = "test-prefix/assets/tmp_hash/file.bin.gz"
         self.store[key] = b"data"
 
-        s3lfs._claim_inflight("tmp_hash")
-        s3lfs._release_inflight({"tmp_hash"})
+        s3lfs._claim_inflight(key)
+        s3lfs._release_inflight({key})
         s3lfs.cleanup_s3(force=True)
 
         self.assertNotIn(key, self.store)
@@ -112,25 +112,28 @@ class TestGCInflightRegistry(unittest.TestCase):
 
         with s3lfs._lock_context():
             expired = time.time() - S3LFS.INFLIGHT_TTL_SECONDS - 60
-            s3lfs._save_inflight({"stale_hash": expired})
+            s3lfs._save_inflight({key: expired})
 
         s3lfs.cleanup_s3(force=True)
 
         self.assertNotIn(key, self.store, "an aged-out claim still pinned an object")
 
-    def test_hash_extracted_from_key_with_prefix_in_path(self):
-        """Key parsing must not be confused by the prefix appearing again."""
+    def test_asset_key_shape_is_validated(self):
+        """Keys that are not recognisably assets are left alone."""
         s3lfs = self._s3lfs()
-        key = "test-prefix/assets/abc123/test-prefix/nested.bin.gz"
 
-        self.assertEqual(s3lfs._hash_from_asset_key(key), "abc123")
-        self.assertIsNone(s3lfs._hash_from_asset_key("other/assets/abc123/f.gz"))
+        self.assertTrue(
+            s3lfs._is_asset_key("test-prefix/assets/abc123/test-prefix/nested.bin.gz")
+        )
+        self.assertFalse(s3lfs._is_asset_key("other/assets/abc123/f.gz"))
+        self.assertFalse(s3lfs._is_asset_key("test-prefix/short"))
+        self.assertFalse(s3lfs._is_asset_key("test-prefix/assets/onlyhash"))
 
     def test_corrupt_registry_does_not_block(self):
         s3lfs = self._s3lfs()
         s3lfs._inflight_file.write_text("{{{ not yaml")
 
-        self.assertEqual(s3lfs._live_inflight_hashes(), set())
+        self.assertEqual(s3lfs._live_inflight_keys(), set())
 
     def test_registry_is_not_enumerated_as_a_user_file(self):
         s3lfs = self._s3lfs()
