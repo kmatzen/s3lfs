@@ -158,9 +158,6 @@ class S3LFS:
         self.temp_dir = Path(temp_dir or ".s3lfs_temp")
         self.temp_dir.mkdir(parents=True, exist_ok=True)  # Ensure the directory exists
 
-        # Use a file-based lock for cross-process synchronization
-        self._lock_file = self.temp_dir / ".s3lfs.lock"
-
         max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
@@ -180,6 +177,17 @@ class S3LFS:
         )
         cache_file_name = self.manifest_file.stem + "_cache" + cache_suffix
         self.cache_file = self.manifest_file.parent / cache_file_name
+
+        # Use a file-based lock for cross-process synchronization. The lock is
+        # anchored to the manifest it guards, not to the current working
+        # directory: a CWD-relative path gives processes started from different
+        # directories different lock files for the same manifest, silently
+        # removing mutual exclusion between them. It is kept inside
+        # .s3lfs_temp/ rather than beside the manifest so that file enumeration
+        # (rglob) does not pick it up as a trackable file.
+        lock_dir = self.manifest_file.parent.resolve() / ".s3lfs_temp"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_file = lock_dir / ".s3lfs.lock"
 
         self.no_sign_request = no_sign_request
         self._cache_mtime: Optional[float] = None
@@ -824,10 +832,11 @@ class S3LFS:
             print(
                 f"Uploading {len(files_to_upload)} modified file(s) " f"in parallel..."
             )
+            # parallel_upload_chunked commits the manifest itself, reloading
+            # under the lock and merging only the keys it uploaded. Saving
+            # again here would write this process's older in-memory copy back
+            # over anything another process committed in between.
             self.parallel_upload(files_to_upload, silence=silence)
-
-            with self._lock_context():
-                self.save_manifest()
         else:
             print("No modified files needing upload.")
 
@@ -1276,6 +1285,10 @@ class S3LFS:
         file_path_str = str(file_path.as_posix())
 
         with self._lock_context():
+            # Re-read under the lock: this process's copy may predate another
+            # process's commit, and saving without reloading would erase it.
+            self.load_manifest()
+
             if file_path_str not in self.manifest["files"]:
                 print(f"File '{file_path}' is not currently tracked.")
                 return
@@ -1374,11 +1387,9 @@ class S3LFS:
         # Upload files in parallel if needed
         if files_to_upload:
             print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
+            # parallel_upload_chunked commits the manifest itself; see the
+            # note in track_modified_files_cached.
             self.parallel_upload(files_to_upload, silence=silence)
-
-            # Save updated manifest
-            with self._lock_context():
-                self.save_manifest()
         else:
             print("No modified files needing upload.")
 
@@ -1467,6 +1478,9 @@ class S3LFS:
         self.test_s3_credentials(silence=silence)
 
         manifest_updates = {}
+        # manifest_key -> {hash, expected, done}. A file earns its manifest
+        # entry only once every one of its chunks has landed in S3.
+        pending = {}
         total_bytes = 0
         total_chunks = 0
         chunks_done = 0
@@ -1495,25 +1509,34 @@ class S3LFS:
                             continue
 
                         manifest_key, file_hash, chunks = result
-                        manifest_updates[manifest_key] = file_hash
+                        pending[manifest_key] = {
+                            "hash": file_hash,
+                            "expected": len(chunks),
+                            "done": 0,
+                        }
                         total_chunks += len(chunks)
                         pbar.total = total_chunks
                         pbar.refresh()
 
                         for chunk in chunks:
                             f = executor.submit(self._upload_chunk, chunk)
-                            ul_futures[f] = chunk
+                            ul_futures[f] = (manifest_key, chunk)
 
                     # Phase 3: collect upload results
                     for ul_future in as_completed(ul_futures):
                         if self._shutdown_requested:
                             break
+                        manifest_key, chunk = ul_futures[ul_future]
                         try:
                             _, bytes_uploaded = ul_future.result()
                         except Exception as e:
-                            chunk = ul_futures[ul_future]
                             print(f"Error uploading " f"{chunk['s3_key']}: {e}")
                             continue
+
+                        entry = pending[manifest_key]
+                        entry["done"] += 1
+                        if entry["done"] == entry["expected"]:
+                            manifest_updates[manifest_key] = entry["hash"]
 
                         total_bytes += bytes_uploaded
                         chunks_done += 1
@@ -1527,6 +1550,25 @@ class S3LFS:
                     self.load_manifest()
                     self.manifest["files"].update(manifest_updates)
                     self.save_manifest()
+
+            # Files whose chunks did not all land are deliberately absent from
+            # the manifest. Recording them would leave an entry pointing at an
+            # incomplete object, and checkout infers the chunk count from the
+            # objects that exist -- so a missing tail reassembles into a
+            # truncated file with no error raised anywhere.
+            incomplete = sorted(
+                key for key, v in pending.items() if v["done"] != v["expected"]
+            )
+            if incomplete:
+                print(
+                    f"WARNING: {len(incomplete)} file(s) did not upload "
+                    f"completely and were NOT added to the manifest:"
+                )
+                for key in incomplete[:10]:
+                    v = pending[key]
+                    print(f"  {key} ({v['done']}/{v['expected']} chunks)")
+                if len(incomplete) > 10:
+                    print(f"  ... and {len(incomplete) - 10} more")
 
             print(
                 f"Uploaded {len(manifest_updates)} file(s) "
@@ -1612,8 +1654,17 @@ class S3LFS:
             chunk_info["num_chunks"],
         )
 
-    def _finalize_file(self, manifest_key, chunk_paths, is_chunked, silence=True):
-        """Merge chunks (if needed) and decompress to final location."""
+    def _finalize_file(
+        self, manifest_key, chunk_paths, is_chunked, expected_hash=None, silence=True
+    ):
+        """Merge chunks (if needed) and decompress to final location.
+
+        If expected_hash is given, the reassembled file is hashed and compared
+        against it. Chunk discovery infers the chunk count from the objects
+        that happen to exist, so a partial upload whose tail is missing
+        reassembles into a shorter file that is otherwise well-formed; without
+        this check nothing downstream would notice.
+        """
         filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
 
         if is_chunked and len(chunk_paths) > 1:
@@ -1636,6 +1687,20 @@ class S3LFS:
             except OSError:
                 pass
 
+        if expected_hash is not None:
+            actual_hash = self.hash_file(filesystem_path)
+            if actual_hash != expected_hash:
+                # Remove the bad output rather than leave it looking valid.
+                try:
+                    os.remove(filesystem_path)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Checksum mismatch for {manifest_key}: "
+                    f"expected {expected_hash}, got {actual_hash}. "
+                    f"The stored object is incomplete or corrupt."
+                )
+
     def parallel_download_chunked(self, file_items, silence=True):
         """Download files with block-level parallelism.
 
@@ -1653,6 +1718,7 @@ class S3LFS:
 
         file_tracker = {}
         files_finalized = 0
+        files_failed = 0
         total_bytes = 0
         total_chunks = 0
         chunks_done = 0
@@ -1682,6 +1748,7 @@ class S3LFS:
                             "expected": len(chunks),
                             "received": [],
                             "is_chunked": chunks[0]["is_chunked"],
+                            "file_hash": chunks[0]["file_hash"],
                         }
                         total_chunks += len(chunks)
                         pbar.total = total_chunks
@@ -1722,13 +1789,19 @@ class S3LFS:
                         if len(entry["received"]) == entry["expected"]:
                             entry["received"].sort(key=lambda x: x[0])
                             chunk_paths = [p for _, p in entry["received"]]
-                            self._finalize_file(
-                                manifest_key,
-                                chunk_paths,
-                                entry["is_chunked"],
-                                silence=silence,
-                            )
-                            files_finalized += 1
+                            try:
+                                self._finalize_file(
+                                    manifest_key,
+                                    chunk_paths,
+                                    entry["is_chunked"],
+                                    expected_hash=entry["file_hash"],
+                                    silence=silence,
+                                )
+                                files_finalized += 1
+                            except Exception as e:
+                                # One corrupt file must not abandon the rest.
+                                print(f"ERROR: {manifest_key}: {e}")
+                                files_failed += 1
 
         except KeyboardInterrupt:
             print("\nDownload interrupted by user.")
@@ -1738,6 +1811,35 @@ class S3LFS:
                 f"({chunks_done} chunks, "
                 f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
+
+            # A file whose chunks did not all arrive is never finalized. Say so
+            # and drop its partial chunks, rather than leaving the caller to
+            # infer it from the count and the temp files behind.
+            incomplete = sorted(
+                mk
+                for mk, e in file_tracker.items()
+                if len(e["received"]) != e["expected"]
+            )
+            for mk in incomplete:
+                for _, path in file_tracker[mk]["received"]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+            if incomplete or files_failed:
+                print(
+                    f"WARNING: {len(incomplete) + files_failed} file(s) were "
+                    f"not written:"
+                )
+                for mk in incomplete[:10]:
+                    tracked = file_tracker[mk]
+                    print(
+                        f"  {mk} (received {len(tracked['received'])}/"
+                        f"{tracked['expected']} chunks)"
+                    )
+                if len(incomplete) > 10:
+                    print(f"  ... and {len(incomplete) - 10} more")
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
@@ -1752,6 +1854,12 @@ class S3LFS:
         pattern = str(directory.as_posix())
 
         with self._lock_context():
+            # Match, mutate, and save in a single critical section against a
+            # fresh read. Matching under one lock and saving under a later one
+            # lets another process commit in between, and the save would then
+            # write this process's older copy back over it.
+            self.load_manifest()
+
             # Try matching with the pattern as-is (handles files and glob patterns)
             files_to_remove = [
                 path
@@ -1769,19 +1877,24 @@ class S3LFS:
                     if fnmatch.fnmatch(path, dir_pattern)
                 ]
 
-        if not files_to_remove:
-            print(f"No tracked files found matching '{directory}'.")
-            return
+            if not files_to_remove:
+                print(f"No tracked files found matching '{directory}'.")
+                return
 
-        for file_path in files_to_remove:
-            file_hash = self.manifest["files"].pop(file_path, None)
-            if not keep_in_s3 and file_hash:
+            removed_hashes = {
+                file_path: self.manifest["files"].pop(file_path, None)
+                for file_path in files_to_remove
+            }
+            self.save_manifest()
+
+        # S3 deletion is network I/O and must not hold the manifest lock.
+        if not keep_in_s3:
+            for file_path, file_hash in removed_hashes.items():
+                if not file_hash:
+                    continue
                 s3_key = f"{self.repo_prefix}/assets/{file_hash}/{file_path}.gz"
                 self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=s3_key)
                 print(f"File removed from S3: s3://{self.bucket_name}/{s3_key}")
-
-        with self._lock_context():
-            self.save_manifest()
 
         count = len(files_to_remove)
         print(
@@ -1828,6 +1941,35 @@ class S3LFS:
         """
         # Use PathResolver for consistent path handling
         return self.path_resolver.to_manifest_key(file_path)
+
+    def _is_internal_path(self, path: Union[str, Path]) -> bool:
+        """
+        Is this a file s3lfs must never track?
+
+        Covers git's own metadata and s3lfs's own bookkeeping. Filesystem
+        enumeration uses rglob("*"), which matches dotfiles, so without this
+        `track .` walks into .git/ and also picks up the manifest, the hash
+        cache, and the lock file.
+
+        :param path: Absolute or relative file path
+        :return: True if the path is internal and must be skipped
+        """
+        resolved = Path(path).resolve()
+        try:
+            parts = resolved.relative_to(self.path_resolver.git_root).parts
+        except ValueError:
+            # Outside the repository; fall back to the whole path.
+            parts = resolved.parts
+
+        if ".git" in parts:
+            return True
+        if ".s3lfs_temp" in parts or self.temp_dir.name in parts:
+            return True
+        if resolved.name in {self.manifest_file.name, self.cache_file.name}:
+            return True
+        if resolved.name.endswith(".s3lfs.lock"):
+            return True
+        return False
 
     def _resolve_filesystem_paths(self, path):
         """
@@ -1884,8 +2026,8 @@ class S3LFS:
                         [f for f in path_obj.rglob("*") if f.is_file()]
                     )
 
-        # Return absolute paths
-        return [p.resolve() for p in resolved_files]
+        # Return absolute paths, less anything internal to git or s3lfs
+        return [p.resolve() for p in resolved_files if not self._is_internal_path(p)]
 
     def _resolve_manifest_paths(self, path):
         """
