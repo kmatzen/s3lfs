@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -46,7 +47,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from outside git repo
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=outside_dir,
@@ -81,7 +82,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from different level directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=different_level_dir,
@@ -114,7 +115,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from parent directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=parent_dir,
@@ -148,7 +149,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from sibling directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=sibling_dir,
@@ -182,7 +183,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from nested directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=nested_dir,
@@ -219,7 +220,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from symlink directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=symlink_dir,
@@ -253,7 +254,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from absolute path directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=outside_dir,
@@ -293,7 +294,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
                 # Test ls command from different drive directory
                 result = subprocess.run(
-                    ["python", "-m", "s3lfs.cli", "ls"],
+                    [sys.executable, "-m", "s3lfs.cli", "ls"],
                     capture_output=True,
                     text=True,
                     cwd=different_drive_dir,
@@ -310,7 +311,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
             # Test ls command from different drive directory
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "ls"],
+                [sys.executable, "-m", "s3lfs.cli", "ls"],
                 capture_output=True,
                 text=True,
                 cwd=different_drive_dir,
@@ -346,7 +347,7 @@ class TestGitRootCoverage(unittest.TestCase):
 
         # Test ls command from outside directory
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=outside_dir,
