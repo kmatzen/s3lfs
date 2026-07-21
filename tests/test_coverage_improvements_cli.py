@@ -23,8 +23,14 @@ import yaml
 from click.testing import CliRunner
 
 from s3lfs import metrics
-from s3lfs.cli import (_find_lfs_files, _get_hooks_dir, _human_size,
-                       _write_hook_atomically, cli, ls)
+from s3lfs.cli import (
+    _find_lfs_files,
+    _get_hooks_dir,
+    _human_size,
+    _write_hook_atomically,
+    cli,
+    ls,
+)
 
 
 class TestMetricsFlag(unittest.TestCase):

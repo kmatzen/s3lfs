@@ -328,7 +328,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
         test_file.write_text("upload error content")
 
         error_response = {"Error": {"Code": "500", "Message": "Internal error"}}
-        client_error = ClientError(error_response, "HeadObject")
+        client_error = ClientError(error_response, "HeadObject")  # type: ignore[arg-type]
 
         with patch.object(s3lfs, "_get_s3_client") as mock_get_client:
             mock_client = Mock()
@@ -804,7 +804,9 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                 chunk_info["num_chunks"],
             )
 
-        with patch.object(s3lfs, "_discover_chunks_for_file", side_effect=fake_discover):
+        with patch.object(
+            s3lfs, "_discover_chunks_for_file", side_effect=fake_discover
+        ):
             with patch.object(s3lfs, "_download_chunk", side_effect=fake_download):
                 s3lfs.parallel_download_chunked(file_items, silence=True)
 
@@ -838,7 +840,9 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                 chunk_info["num_chunks"],
             )
 
-        with patch.object(s3lfs, "_discover_chunks_for_file", side_effect=fake_discover):
+        with patch.object(
+            s3lfs, "_discover_chunks_for_file", side_effect=fake_discover
+        ):
             with patch.object(s3lfs, "_download_chunk", side_effect=fake_download):
                 s3lfs.parallel_download_chunked([("k1", "h1")], silence=True)
 
@@ -923,7 +927,9 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                 chunk_info["num_chunks"],
             )
 
-        with patch.object(s3lfs, "_discover_chunks_for_file", side_effect=fake_discover):
+        with patch.object(
+            s3lfs, "_discover_chunks_for_file", side_effect=fake_discover
+        ):
             with patch.object(s3lfs, "_download_chunk", side_effect=fake_download):
                 with patch(
                     "s3lfs.core.os.remove", side_effect=OSError("cannot remove")
@@ -974,7 +980,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
     def test_s3_credentials_generic_client_error(self):
         s3lfs = self._make_s3lfs()
         error_response = {"Error": {"Code": "SomeOtherError", "Message": "oops"}}
-        client_error = ClientError(error_response, "ListObjectsV2")
+        client_error = ClientError(error_response, "ListObjectsV2")  # type: ignore[arg-type]
         with patch.object(s3lfs, "_get_s3_client") as mock_get_client:
             mock_client = Mock()
             mock_get_client.return_value = mock_client
@@ -1132,7 +1138,9 @@ class TestCoreCoverageImprovements(unittest.TestCase):
         s3lfs.save_manifest()
 
         with patch.object(s3lfs, "parallel_download_chunked") as mock_dl:
-            s3lfs.checkout(manifest_key, silence=True, interleaved=False, use_cache=True)
+            s3lfs.checkout(
+                manifest_key, silence=True, interleaved=False, use_cache=True
+            )
             mock_dl.assert_called_once()
 
     # ------------------------------------------------------------------
