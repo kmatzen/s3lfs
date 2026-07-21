@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -31,7 +32,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test track command without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "track", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "track", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -53,7 +54,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test track command with --modified flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "track", "--modified"],
+            [sys.executable, "-m", "s3lfs.cli", "track", "--modified"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -75,7 +76,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test track command with --verbose flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "track", "--verbose", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "track", "--verbose", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -98,7 +99,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         # Test track command with --no-sign-request flag without manifest file
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "s3lfs.cli",
                 "track",
@@ -126,7 +127,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test checkout command without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "checkout", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "checkout", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -148,7 +149,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test checkout command with --all flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "checkout", "--all"],
+            [sys.executable, "-m", "s3lfs.cli", "checkout", "--all"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -170,7 +171,14 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test checkout command with --verbose flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "checkout", "--verbose", "test_file.txt"],
+            [
+                sys.executable,
+                "-m",
+                "s3lfs.cli",
+                "checkout",
+                "--verbose",
+                "test_file.txt",
+            ],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -193,7 +201,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         # Test checkout command with --no-sign-request flag without manifest file
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "s3lfs.cli",
                 "checkout",
@@ -221,7 +229,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls"],
+            [sys.executable, "-m", "s3lfs.cli", "ls"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -243,7 +251,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --all flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--all"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--all"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -265,7 +273,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --verbose flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--verbose"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--verbose"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -287,7 +295,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --no-sign-request flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--no-sign-request"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--no-sign-request"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -309,7 +317,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test remove command without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "remove", "test_file.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "remove", "test_file.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -331,7 +339,14 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test remove command with --purge-from-s3 flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "remove", "--purge-from-s3", "test_file.txt"],
+            [
+                sys.executable,
+                "-m",
+                "s3lfs.cli",
+                "remove",
+                "--purge-from-s3",
+                "test_file.txt",
+            ],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -353,7 +368,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test cleanup command without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "cleanup"],
+            [sys.executable, "-m", "s3lfs.cli", "cleanup"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -375,7 +390,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test cleanup command with --force flag without manifest file
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "cleanup", "--force"],
+            [sys.executable, "-m", "s3lfs.cli", "cleanup", "--force"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -397,7 +412,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test init command
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "init", "testbucket", "testprefix"],
+            [sys.executable, "-m", "s3lfs.cli", "init", "testbucket", "testprefix"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -417,7 +432,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         # Test init command with --no-sign-request flag
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "s3lfs.cli",
                 "init",
@@ -447,7 +462,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test init command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "init", "testbucket", "testprefix"],
+                [sys.executable, "-m", "s3lfs.cli", "init", "testbucket", "testprefix"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -472,7 +487,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
             # Test init command with --no-sign-request flag when not in git repo
             result = subprocess.run(
                 [
-                    "python",
+                    sys.executable,
                     "-m",
                     "s3lfs.cli",
                     "init",
@@ -509,7 +524,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test track command with no path and no --modified flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "track"],
+            [sys.executable, "-m", "s3lfs.cli", "track"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -541,7 +556,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test checkout command with no path and no --all flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "checkout"],
+            [sys.executable, "-m", "s3lfs.cli", "checkout"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -573,7 +588,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --all flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--all"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--all"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -602,7 +617,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --all flag and --verbose
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--all", "--verbose"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--all", "--verbose"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -631,7 +646,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test ls command with --all flag and --no-sign-request
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "ls", "--all", "--no-sign-request"],
+            [sys.executable, "-m", "s3lfs.cli", "ls", "--all", "--no-sign-request"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -660,7 +675,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test remove command with directory pattern
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "remove", "test_dir/"],
+            [sys.executable, "-m", "s3lfs.cli", "remove", "test_dir/"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -689,7 +704,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test remove command with glob pattern
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "remove", "*.txt"],
+            [sys.executable, "-m", "s3lfs.cli", "remove", "*.txt"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -718,7 +733,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test cleanup command with --force flag
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "cleanup", "--force"],
+            [sys.executable, "-m", "s3lfs.cli", "cleanup", "--force"],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -749,7 +764,14 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
 
         # Test cleanup command with --force flag and --no-sign-request
         result = subprocess.run(
-            ["python", "-m", "s3lfs.cli", "cleanup", "--force", "--no-sign-request"],
+            [
+                sys.executable,
+                "-m",
+                "s3lfs.cli",
+                "cleanup",
+                "--force",
+                "--no-sign-request",
+            ],
             capture_output=True,
             text=True,
             cwd=git_repo,
@@ -774,7 +796,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test track command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "track", "test_file.txt"],
+                [sys.executable, "-m", "s3lfs.cli", "track", "test_file.txt"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -798,7 +820,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test track command with --modified flag when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "track", "--modified"],
+                [sys.executable, "-m", "s3lfs.cli", "track", "--modified"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -822,7 +844,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test checkout command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "checkout", "test_file.txt"],
+                [sys.executable, "-m", "s3lfs.cli", "checkout", "test_file.txt"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -846,7 +868,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test checkout command with --all flag when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "checkout", "--all"],
+                [sys.executable, "-m", "s3lfs.cli", "checkout", "--all"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -870,7 +892,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test ls command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "ls"],
+                [sys.executable, "-m", "s3lfs.cli", "ls"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -894,7 +916,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test ls command with --all flag when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "ls", "--all"],
+                [sys.executable, "-m", "s3lfs.cli", "ls", "--all"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -918,7 +940,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test remove command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "remove", "test_file.txt"],
+                [sys.executable, "-m", "s3lfs.cli", "remove", "test_file.txt"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -943,7 +965,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
             # Test remove command with --purge-from-s3 flag when not in git repo
             result = subprocess.run(
                 [
-                    "python",
+                    sys.executable,
                     "-m",
                     "s3lfs.cli",
                     "remove",
@@ -973,7 +995,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test cleanup command when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "cleanup"],
+                [sys.executable, "-m", "s3lfs.cli", "cleanup"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
@@ -997,7 +1019,7 @@ class TestManifestNotExistsCoverage(unittest.TestCase):
         with patch("s3lfs.cli.find_git_root", return_value=None):
             # Test cleanup command with --force flag when not in git repo
             result = subprocess.run(
-                ["python", "-m", "s3lfs.cli", "cleanup", "--force"],
+                [sys.executable, "-m", "s3lfs.cli", "cleanup", "--force"],
                 capture_output=True,
                 text=True,
                 cwd=non_git_dir,
