@@ -1,5 +1,7 @@
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import click
@@ -292,6 +294,136 @@ def checkout(
         raise click.Abort()
 
 
+def _prune_empty_parents(git_root, path):
+    """Remove directories left empty by a deleted file, up to the git root."""
+    parent = path.parent
+    while parent != git_root and git_root in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
+@cli.command()
+@click.option(
+    "--from",
+    "from_revision",
+    default=None,
+    help="Git revision whose manifest to diff against (default: full checkout)",
+)
+@click.option(
+    "--prune/--no-prune",
+    default=True,
+    help="Delete tracked files that the current manifest no longer lists",
+)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option("--verbose", is_flag=True, help="Show detailed progress information")
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
+def sync(
+    from_revision,
+    prune,
+    no_sign_request,
+    use_acceleration,
+    endpoint_url,
+    verbose,
+    workers,
+):
+    """Bring tracked files in line with the current manifest.
+
+    With --from, only the entries that differ from that revision's manifest
+    are considered, which is what makes branch switches cheap: `checkout
+    --all` re-hashes every tracked file, while a diff touches only what
+    actually changed. Used by the post-checkout, post-merge, and
+    post-rewrite hooks.
+    """
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
+        no_sign_request=no_sign_request,
+        use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
+        workers=workers,
+    )
+
+    current = dict(s3lfs.manifest.get("files", {}))
+    previous = (
+        _manifest_files_at_revision(git_root, from_revision) if from_revision else None
+    )
+
+    if previous is None:
+        # No baseline to diff against (no --from, an unavailable revision, or
+        # a revision predating s3lfs). Fall back to checking everything.
+        if from_revision:
+            click.echo(
+                f"No manifest available at {from_revision}; "
+                "falling back to a full checkout."
+            )
+        s3lfs.parallel_download_all(silence=not verbose)
+        return
+
+    changed = {k: h for k, h in current.items() if previous.get(k) != h}
+    dropped = {k: h for k, h in previous.items() if k not in current}
+
+    if not changed and not dropped:
+        click.echo("Tracked files are already in sync.")
+        return
+
+    if changed:
+        # The diff says which entries could differ on disk; the disk says
+        # which actually do (a file may already hold the target content).
+        states = s3lfs.compare_to_hashes(changed, progress=verbose)
+        to_download = [
+            (key, changed[key])
+            for key, state in states.items()
+            if state != "up_to_date"
+        ]
+        if to_download:
+            click.echo(f"Downloading {len(to_download)} changed file(s)...")
+            s3lfs.parallel_download_chunked(to_download, silence=not verbose)
+        else:
+            click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
+
+    if dropped and prune:
+        # Only remove content that still matches what the old manifest
+        # recorded. Anything else is local work the user has not tracked,
+        # and deleting it would destroy the only copy.
+        states = s3lfs.compare_to_hashes(dropped, progress=verbose)
+        removed = 0
+        for key, state in sorted(states.items()):
+            if state == "missing":
+                continue
+            if state == "modified":
+                click.echo(
+                    f"Keeping {key}: it is no longer tracked but has local "
+                    "modifications."
+                )
+                continue
+            filesystem_path = path_resolver.to_filesystem_path(key)
+            filesystem_path.unlink()
+            _prune_empty_parents(git_root, filesystem_path)
+            removed += 1
+            if verbose:
+                click.echo(f"  Removed {key}")
+        if removed:
+            click.echo(f"Removed {removed} file(s) no longer tracked.")
+
+
 @cli.command()
 @click.argument("path", required=False)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
@@ -375,6 +507,114 @@ def ls(
             verbose=verbose,
             strip_prefix=str(relative_cwd) if relative_cwd != Path(".") else None,
         )
+
+
+@cli.command()
+@click.argument("path", required=False)
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="Include up-to-date files in the listing",
+)
+@click.option(
+    "--porcelain",
+    is_flag=True,
+    help="Machine-readable output: one '<code> <path>' line per file",
+)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoint_url):
+    """Show which tracked files are modified or missing.
+
+    Tracked files are gitignored, so `git status` cannot see them. This is
+    the equivalent view for s3lfs-tracked content.
+    """
+    if path:
+        git_root, manifest_path, path_resolver, manifest_key = _setup_s3lfs_command(
+            cli_path=path
+        )
+    else:
+        git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+        manifest_key = None
+
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
+        no_sign_request=no_sign_request,
+        use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
+    )
+
+    if manifest_key:
+        expected = s3lfs._resolve_manifest_paths(manifest_key)
+    else:
+        expected = dict(s3lfs.manifest.get("files", {}))
+
+    if not expected:
+        if not porcelain:
+            click.echo("No files are tracked by s3lfs.")
+        return
+
+    states = s3lfs.compare_to_hashes(expected)
+
+    # Show paths relative to where the user is standing, as ls does.
+    try:
+        relative_cwd = Path.cwd().relative_to(git_root)
+    except ValueError:
+        relative_cwd = Path(".")
+
+    def display(key):
+        if relative_cwd == Path("."):
+            return key
+        try:
+            return str(Path(key).relative_to(relative_cwd).as_posix())
+        except ValueError:
+            return key
+
+    modified = sorted(k for k, v in states.items() if v == "modified")
+    missing = sorted(k for k, v in states.items() if v == "missing")
+    up_to_date = sorted(k for k, v in states.items() if v == "up_to_date")
+
+    if porcelain:
+        for key in modified:
+            click.echo(f"M {display(key)}")
+        for key in missing:
+            click.echo(f"D {display(key)}")
+        if show_all:
+            for key in up_to_date:
+                click.echo(f"  {display(key)}")
+        return
+
+    click.echo(
+        f"{len(states)} tracked file(s): {len(up_to_date)} up-to-date, "
+        f"{len(modified)} modified, {len(missing)} missing"
+    )
+
+    if modified:
+        click.echo()
+        click.echo("Modified (upload with 's3lfs track --modified'):")
+        for key in modified:
+            click.echo(f"  {display(key)}")
+
+    if missing:
+        click.echo()
+        click.echo("Missing from disk (download with 's3lfs checkout --all'):")
+        for key in missing:
+            click.echo(f"  {display(key)}")
+
+    if show_all and up_to_date:
+        click.echo()
+        click.echo("Up-to-date:")
+        for key in up_to_date:
+            click.echo(f"  {display(key)}")
 
 
 @click.command()
@@ -780,21 +1020,17 @@ S3LFS_GITIGNORE_START = "# >>> s3lfs tracked files >>>"
 S3LFS_GITIGNORE_END = "# <<< s3lfs tracked files <<<"
 
 
-def _load_gitignore_block(git_root):
-    """Split .gitignore into (lines_before, block_entries, lines_after).
+S3LFS_GITATTRIBUTES_START = "# >>> s3lfs manifest merge >>>"
+S3LFS_GITATTRIBUTES_END = "# <<< s3lfs manifest merge <<<"
 
-    The s3lfs block is delimited by marker comments so entries can be
-    added and removed without disturbing the rest of the file.
-    """
-    gitignore = git_root / ".gitignore"
-    if not gitignore.exists():
-        return [], [], []
-    lines = gitignore.read_text().splitlines()
-    if S3LFS_GITIGNORE_START not in lines:
+
+def _split_marked_lines(lines, start_marker, end_marker):
+    """Split lines into (before, block_entries, after)."""
+    if start_marker not in lines:
         return lines, [], []
-    start = lines.index(S3LFS_GITIGNORE_START)
+    start = lines.index(start_marker)
     try:
-        end = lines.index(S3LFS_GITIGNORE_END, start)
+        end = lines.index(end_marker, start)
     except ValueError:
         # Malformed block (no end marker): drop only the start marker and
         # keep everything else out of the block rather than swallowing
@@ -804,40 +1040,74 @@ def _load_gitignore_block(git_root):
     return lines[:start], entries, lines[end + 1 :]
 
 
-def _save_gitignore_block(git_root, before, entries, after):
-    """Write .gitignore back with the s3lfs block holding these entries."""
-    gitignore = git_root / ".gitignore"
+def _load_marked_block(path, start_marker, end_marker):
+    """Split a line-oriented file into (before, block_entries, after).
+
+    The s3lfs block is delimited by marker comments so entries can be
+    added and removed without disturbing the rest of the file.
+    """
+    if not path.exists():
+        return [], [], []
+    return _split_marked_lines(path.read_text().splitlines(), start_marker, end_marker)
+
+
+def _save_marked_block(path, start_marker, end_marker, before, entries, after):
+    """Write the file back with the s3lfs block holding these entries."""
     lines = list(before)
     if entries:
         if lines and lines[-1].strip():
             lines.append("")
-        lines.append(S3LFS_GITIGNORE_START)
+        lines.append(start_marker)
         lines.extend(entries)
-        lines.append(S3LFS_GITIGNORE_END)
+        lines.append(end_marker)
     lines.extend(after)
-    if not lines and not gitignore.exists():
+    if not lines and not path.exists():
         return
-    gitignore.write_text("\n".join(lines) + ("\n" if lines else ""))
+    path.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def _add_marked_entry(path, start_marker, end_marker, entry):
+    """Add an entry to a marked block. Returns True if it was added."""
+    before, entries, after = _load_marked_block(path, start_marker, end_marker)
+    if entry in entries:
+        return False
+    entries.append(entry)
+    _save_marked_block(path, start_marker, end_marker, before, entries, after)
+    return True
+
+
+def _remove_marked_entries(path, start_marker, end_marker, entry_variants):
+    """Remove any of these entries from a marked block. True if any went."""
+    before, entries, after = _load_marked_block(path, start_marker, end_marker)
+    kept = [e for e in entries if e not in entry_variants]
+    if kept == entries:
+        return False
+    _save_marked_block(path, start_marker, end_marker, before, kept, after)
+    return True
+
+
+def _load_gitignore_block(git_root):
+    """Split .gitignore into (lines_before, s3lfs entries, lines_after)."""
+    return _load_marked_block(
+        git_root / ".gitignore", S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END
+    )
 
 
 def _add_gitignore_entry(git_root, entry):
     """Add an entry to the s3lfs block in .gitignore. Returns True if added."""
-    before, entries, after = _load_gitignore_block(git_root)
-    if entry in entries:
-        return False
-    entries.append(entry)
-    _save_gitignore_block(git_root, before, entries, after)
-    return True
+    return _add_marked_entry(
+        git_root / ".gitignore", S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END, entry
+    )
 
 
 def _remove_gitignore_entry(git_root, entry_variants):
-    """Remove any of these entries from the s3lfs block. Returns True if removed."""
-    before, entries, after = _load_gitignore_block(git_root)
-    kept = [e for e in entries if e not in entry_variants]
-    if kept == entries:
-        return False
-    _save_gitignore_block(git_root, before, kept, after)
-    return True
+    """Remove any of these entries from the s3lfs block. True if removed."""
+    return _remove_marked_entries(
+        git_root / ".gitignore",
+        S3LFS_GITIGNORE_START,
+        S3LFS_GITIGNORE_END,
+        entry_variants,
+    )
 
 
 def _gitignore_entry_for(git_root, manifest_key):
@@ -955,20 +1225,42 @@ S3LFS_HOOK_START = "# >>> s3lfs hook >>>"
 S3LFS_HOOK_END = "# <<< s3lfs hook <<<"
 
 _POST_MERGE_BODY = """\
-# Auto-checkout s3lfs files after merge
+# Sync s3lfs files after merge.
+#
+# ORIG_HEAD is the pre-merge commit, so the manifest diff against it covers
+# exactly what the merge brought in. s3lfs sync falls back to a full
+# checkout if that revision is unavailable.
 if command -v s3lfs >/dev/null 2>&1; then
-    if ! s3lfs checkout --all 2>&1; then
-        echo "s3lfs: ERROR: post-merge checkout failed" >&2
+    if ! s3lfs sync --from ORIG_HEAD 2>&1; then
+        echo "s3lfs: ERROR: post-merge sync failed" >&2
         echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
     fi
 fi"""
 
 _POST_CHECKOUT_BODY = """\
-# Auto-checkout s3lfs files after checkout
-# Only run on branch checkouts ($3 == 1), not file checkouts
+# Sync s3lfs files after checkout.
+#
+# Only run on branch checkouts ($3 == 1), not file checkouts. $1 is the
+# previous HEAD, so diffing its manifest against the new one downloads only
+# what this branch switch actually changed instead of re-hashing every
+# tracked file.
 if [ "$3" = "1" ] && command -v s3lfs >/dev/null 2>&1; then
-    if ! s3lfs checkout --all 2>&1; then
-        echo "s3lfs: ERROR: post-checkout checkout failed" >&2
+    if ! s3lfs sync --from "$1" 2>&1; then
+        echo "s3lfs: ERROR: post-checkout sync failed" >&2
+        echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
+    fi
+fi"""
+
+_POST_REWRITE_BODY = """\
+# Sync s3lfs files after a rebase.
+#
+# `git pull --rebase` fires neither post-merge nor a branch post-checkout,
+# so without this hook the most common pull configuration leaves tracked
+# files stale. Amends ($1 = amend) rarely touch the manifest and leave
+# ORIG_HEAD stale, so they are skipped.
+if [ "$1" = "rebase" ] && command -v s3lfs >/dev/null 2>&1; then
+    if ! s3lfs sync --from ORIG_HEAD 2>&1; then
+        echo "s3lfs: ERROR: post-rewrite sync failed" >&2
         echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
     fi
 fi"""
@@ -1018,6 +1310,9 @@ HOOK_SCRIPTS = {
     "post-merge": S3LFS_HOOK_START + "\n" + _POST_MERGE_BODY + "\n" + S3LFS_HOOK_END,
     "post-checkout": (
         S3LFS_HOOK_START + "\n" + _POST_CHECKOUT_BODY + "\n" + S3LFS_HOOK_END
+    ),
+    "post-rewrite": (
+        S3LFS_HOOK_START + "\n" + _POST_REWRITE_BODY + "\n" + S3LFS_HOOK_END
     ),
     "pre-commit": S3LFS_HOOK_START + "\n" + _PRE_COMMIT_BODY + "\n" + S3LFS_HOOK_END,
     "pre-push": S3LFS_HOOK_START + "\n" + _PRE_PUSH_BODY + "\n" + S3LFS_HOOK_END,
@@ -1136,6 +1431,9 @@ def install():
         hook_path = _install_hook(hooks_dir, hook_name, hook_block)
         click.echo(f"  Installed {hook_name} hook -> {hook_path}")
 
+    _install_merge_driver(git_root)
+    click.echo("  Registered manifest merge driver (.gitattributes, git config)")
+
     click.echo()
     click.echo("s3lfs hooks installed. Your git workflow now automatically:")
     click.echo(
@@ -1143,11 +1441,97 @@ def install():
     )
     click.echo("  - Blocks committing s3lfs-tracked files into git (pre-commit)")
     click.echo(
-        "  - Downloads tracked files after checkout/merge (post-checkout, post-merge)"
+        "  - Syncs tracked files after checkout/merge/rebase "
+        "(post-checkout, post-merge, post-rewrite)"
     )
     click.echo("  - Verifies pushed manifests reference uploaded content (pre-push)")
+    click.echo("  - Merges concurrent manifest changes without conflicts")
     click.echo()
+    click.echo("Commit the updated .gitattributes so teammates inherit the merge rule.")
     click.echo("Run 's3lfs uninstall' to remove hooks.")
+
+
+@click.command()
+@click.argument("url", required=True)
+@click.argument("directory", required=False)
+@click.option(
+    "--no-checkout",
+    is_flag=True,
+    help="Install hooks but don't download tracked files",
+)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
+@click.pass_context
+def clone(
+    ctx,
+    url,
+    directory,
+    no_checkout,
+    no_sign_request,
+    use_acceleration,
+    endpoint_url,
+    workers,
+):
+    """Clone a repository, install s3lfs hooks, and download tracked files.
+
+    Hooks live in .git and are never cloned, so a fresh clone has no s3lfs
+    integration until someone runs 's3lfs install'. This does the whole
+    day-one setup in one command.
+    """
+    target = directory or Path(url.rstrip("/")).name
+    if target.endswith(".git"):
+        target = target[: -len(".git")]
+
+    result = subprocess.run(["git", "clone", url] + ([directory] if directory else []))
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+    target_path = Path(target).resolve()
+    if not target_path.is_dir():
+        click.echo(f"Error: expected clone at {target_path}, but it is not there")
+        raise SystemExit(1)
+
+    original_cwd = Path.cwd()
+    os.chdir(target_path)
+    try:
+        if not get_manifest_path(target_path).exists():
+            click.echo()
+            click.echo(
+                "Cloned, but this repository is not s3lfs-initialized "
+                "(no manifest). Nothing else to do."
+            )
+            return
+
+        click.echo()
+        ctx.invoke(install)
+
+        if no_checkout:
+            return
+
+        click.echo()
+        ctx.invoke(
+            checkout,
+            all=True,
+            no_sign_request=no_sign_request,
+            use_acceleration=use_acceleration,
+            endpoint_url=endpoint_url,
+            workers=workers,
+        )
+    finally:
+        os.chdir(original_cwd)
 
 
 @click.command()
@@ -1165,11 +1549,239 @@ def uninstall():
             click.echo(f"  Removed {hook_name} hook")
             removed = True
 
+    if _uninstall_merge_driver(git_root):
+        click.echo("  Removed manifest merge driver registration")
+        removed = True
+
     if removed:
         click.echo()
         click.echo("s3lfs hooks removed.")
     else:
         click.echo("No s3lfs hooks found.")
+
+
+MERGE_DRIVER_COMMAND = "s3lfs merge-driver %O %A %B %P"
+MANIFEST_NAMES = (".s3_manifest.yaml", ".s3_manifest.json")
+# Both files are rewritten by every `s3lfs track`, so both conflict when
+# two branches track different files.
+MERGE_DRIVER_PATHS = MANIFEST_NAMES + (".gitignore",)
+
+
+def _merge_maps(base, ours, theirs):
+    """Three-way merge of two flat maps. Returns (merged, conflicting_keys).
+
+    A key only conflicts when both sides changed it away from the base to
+    different values; a change on one side alone (including a deletion)
+    is taken as-is.
+    """
+    merged = {}
+    conflicts = []
+    for key in set(base) | set(ours) | set(theirs):
+        o, a, b = base.get(key), ours.get(key), theirs.get(key)
+        if a == b:
+            value = a
+        elif a == o:
+            value = b
+        elif b == o:
+            value = a
+        else:
+            conflicts.append(key)
+            value = a
+        if value is not None:
+            merged[key] = value
+    return merged, sorted(conflicts)
+
+
+def _read_manifest_for_merge(path):
+    """Load one side of a manifest merge. Missing or empty reads as empty."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    # safe_load parses both the YAML and JSON manifest formats
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a manifest mapping")
+    return data
+
+
+def _merge_ordered_entries(base, ours, theirs):
+    """Three-way merge of an ordered list of unique lines.
+
+    An entry present in the base survives unless a side deleted it;
+    entries either side added are appended. Order is stable so the block
+    does not churn between merges.
+    """
+    merged = [e for e in base if e in ours and e in theirs]
+    for side in (ours, theirs):
+        for entry in side:
+            if entry not in base and entry not in merged:
+                merged.append(entry)
+    return merged
+
+
+def _merge_gitignore(base, ours, theirs):
+    """Merge .gitignore, unioning the s3lfs block. Returns (text, conflict).
+
+    Two branches that track different files both append to the s3lfs
+    block, which git's line-based merge calls a conflict. The block
+    merges as a set union; the rest of the file is handed to git's own
+    text merge so the user's entries behave exactly as they normally do.
+    """
+    sides = {}
+    for name, path in (("base", base), ("ours", ours), ("theirs", theirs)):
+        path = Path(path)
+        text = path.read_text() if path.exists() else ""
+        before, entries, after = _split_marked_lines(
+            text.splitlines(), S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END
+        )
+        # The block is always written at the end, so the user's content is
+        # just everything outside it.
+        sides[name] = (before + after, entries)
+
+    entries = _merge_ordered_entries(
+        sides["base"][1], sides["ours"][1], sides["theirs"][1]
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = {}
+        for name, (rest, _) in sides.items():
+            side_path = Path(tmp) / name
+            side_path.write_text("\n".join(rest) + ("\n" if rest else ""))
+            paths[name] = str(side_path)
+        result = subprocess.run(
+            ["git", "merge-file", "-p", paths["ours"], paths["base"], paths["theirs"]],
+            capture_output=True,
+            text=True,
+        )
+        # git merge-file returns the number of conflicts, or <0 on error.
+        conflict = result.returncode != 0
+        merged_rest = result.stdout.splitlines()
+
+    lines = list(merged_rest)
+    if entries:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(S3LFS_GITIGNORE_START)
+        lines.extend(entries)
+        lines.append(S3LFS_GITIGNORE_END)
+    return "\n".join(lines) + ("\n" if lines else ""), conflict
+
+
+@click.command("merge-driver")
+@click.argument("base", type=click.Path())
+@click.argument("ours", type=click.Path())
+@click.argument("theirs", type=click.Path())
+@click.argument("target", type=click.Path(), required=False)
+def merge_driver(base, ours, theirs, target):
+    """Three-way merge s3lfs-managed files (git merge driver).
+
+    Registered by 's3lfs install' for the manifest and .gitignore. Two
+    branches that each track different files rewrite both, which git's
+    line-based merge reports as a conflict even though the change is a
+    clean union. This merges the manifest key-wise and the .gitignore
+    block as a set union, so a conflict is only reported when both sides
+    really disagree about the same path.
+
+    Writes the result over OURS, as git requires, and exits non-zero when
+    a real conflict remains.
+    """
+    if target and Path(target).name == ".gitignore":
+        merged_text, conflict = _merge_gitignore(base, ours, theirs)
+        Path(ours).write_text(merged_text)
+        if conflict:
+            click.echo(
+                "s3lfs: .gitignore has conflicting non-s3lfs edits; "
+                "resolve them and 'git add' the file.",
+                err=True,
+            )
+            raise SystemExit(1)
+        return
+
+    try:
+        base_data = _read_manifest_for_merge(base)
+        our_data = _read_manifest_for_merge(ours)
+        their_data = _read_manifest_for_merge(theirs)
+    except Exception as e:
+        click.echo(f"s3lfs: cannot merge manifest ({e}); falling back to git", err=True)
+        raise SystemExit(1)
+
+    files, file_conflicts = _merge_maps(
+        base_data.get("files") or {},
+        our_data.get("files") or {},
+        their_data.get("files") or {},
+    )
+    meta, meta_conflicts = _merge_maps(
+        {k: v for k, v in base_data.items() if k != "files"},
+        {k: v for k, v in our_data.items() if k != "files"},
+        {k: v for k, v in their_data.items() if k != "files"},
+    )
+    merged = dict(meta)
+    merged["files"] = files
+
+    # %A is a temp file, so the real path (%P) is what says which format to
+    # write back; without it, fall back to what our side looks like.
+    name = target or ours
+    as_json = str(name).endswith(".json") or Path(ours).read_text().lstrip().startswith(
+        "{"
+    )
+    with open(ours, "w") as f:
+        if as_json:
+            json.dump(merged, f, indent=4, sort_keys=True)
+        else:
+            yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=True)
+
+    conflicts = file_conflicts + meta_conflicts
+    if conflicts:
+        click.echo(
+            "s3lfs: manifest conflict -- both sides changed these entries:", err=True
+        )
+        for key in conflicts:
+            click.echo(f"  {key}", err=True)
+        click.echo(
+            "s3lfs: our version was kept for each; edit the manifest and "
+            "'git add' it to resolve.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+
+def _install_merge_driver(git_root):
+    """Register the manifest merge driver for this repository."""
+    subprocess.run(
+        ["git", "config", "merge.s3lfs.name", "s3lfs manifest merge"],
+        cwd=str(git_root),
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "merge.s3lfs.driver", MERGE_DRIVER_COMMAND],
+        cwd=str(git_root),
+        capture_output=True,
+    )
+    # The .gitattributes entry is committed so teammates inherit it; the
+    # driver itself is local config, and git falls back to its normal merge
+    # for anyone who has not run 's3lfs install'.
+    for name in MERGE_DRIVER_PATHS:
+        _add_marked_entry(
+            git_root / ".gitattributes",
+            S3LFS_GITATTRIBUTES_START,
+            S3LFS_GITATTRIBUTES_END,
+            f"{name} merge=s3lfs",
+        )
+
+
+def _uninstall_merge_driver(git_root):
+    """Remove the manifest merge driver registration. True if anything went."""
+    subprocess.run(
+        ["git", "config", "--remove-section", "merge.s3lfs"],
+        cwd=str(git_root),
+        capture_output=True,
+    )
+    return _remove_marked_entries(
+        git_root / ".gitattributes",
+        S3LFS_GITATTRIBUTES_START,
+        S3LFS_GITATTRIBUTES_END,
+        {f"{name} merge=s3lfs" for name in MERGE_DRIVER_PATHS},
+    )
 
 
 @click.command()
@@ -1314,6 +1926,8 @@ cli.add_command(install)
 cli.add_command(uninstall)
 cli.add_command(verify)
 cli.add_command(pre_commit)
+cli.add_command(merge_driver)
+cli.add_command(clone)
 
 
 def main():

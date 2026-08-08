@@ -1001,6 +1001,68 @@ class S3LFS:
             return cached_data["hash"]
         return None
 
+    def compare_to_hashes(self, expected, progress=False):
+        """Compare files on disk against the hashes they are expected to have.
+
+        :param expected: dict of manifest_key -> expected hash
+        :param progress: show a progress bar while hashing
+        :return: dict of manifest_key -> "up_to_date" | "modified" | "missing"
+
+        Uses the same load-cache-once, hash-on-miss strategy as
+        track_modified_files_cached, so repeat calls over unchanged files
+        cost a stat() each rather than a full re-read.
+        """
+        if not expected:
+            return {}
+
+        with self._lock_context():
+            self.load_cache()
+
+        states = {}
+        cache_updates = {}
+
+        with tqdm(
+            total=len(expected),
+            desc="Checking files",
+            unit="file",
+            disable=not progress,
+        ) as pbar:
+            for manifest_key, expected_hash in expected.items():
+                pbar.update(1)
+                filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
+                if not filesystem_path.exists():
+                    states[manifest_key] = "missing"
+                    continue
+
+                stat = filesystem_path.stat()
+                metadata = {
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "inode": getattr(stat, "st_ino", None),
+                }
+                cache_key = str(Path(manifest_key).as_posix())
+
+                current_hash = self._check_cache_hit(cache_key, metadata)
+                if current_hash is None:
+                    current_hash = self.hash_file(filesystem_path)
+                    cache_updates[cache_key] = {
+                        "hash": current_hash,
+                        "metadata": metadata,
+                        "timestamp": time.time(),
+                    }
+
+                states[manifest_key] = (
+                    "up_to_date" if current_hash == expected_hash else "modified"
+                )
+
+        if cache_updates:
+            with self._lock_context():
+                self.hash_cache.update(cache_updates)
+                self._cache_dirty = True
+                self.save_cache()
+
+        return states
+
     def track_modified_files_cached(self, silence=True):
         """
         Check manifest for outdated hashes using cached hashing and upload

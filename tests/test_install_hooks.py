@@ -206,7 +206,13 @@ class TestInstallCommand(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         hooks_dir = Path(self.temp_dir) / ".git" / "hooks"
-        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
+        for hook_name in [
+            "post-merge",
+            "post-checkout",
+            "post-rewrite",
+            "pre-commit",
+            "pre-push",
+        ]:
             hook_path = hooks_dir / hook_name
             self.assertTrue(hook_path.exists(), f"{hook_name} not created")
             content = hook_path.read_text()
@@ -270,7 +276,7 @@ class TestInstallCommand(unittest.TestCase):
         runner = CliRunner()
         runner.invoke(cli, ["install"])
 
-        for hook_name in ["post-merge", "post-checkout"]:
+        for hook_name in ["post-merge", "post-checkout", "post-rewrite"]:
             hook_path = Path(self.temp_dir) / ".git" / "hooks" / hook_name
             content = hook_path.read_text()
             self.assertIn("ERROR", content, f"{hook_name} should report failure")
@@ -305,7 +311,13 @@ class TestInstallCommand(unittest.TestCase):
         runner = CliRunner()
         runner.invoke(cli, ["install"])
 
-        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
+        for hook_name in [
+            "post-merge",
+            "post-checkout",
+            "post-rewrite",
+            "pre-commit",
+            "pre-push",
+        ]:
             hook_path = Path(self.temp_dir) / ".git" / "hooks" / hook_name
             content = hook_path.read_text()
             self.assertIn("command -v s3lfs", content)
@@ -342,7 +354,13 @@ class TestUninstallCommand(unittest.TestCase):
         self.assertIn("Removed", result.output)
 
         hooks_dir = Path(self.temp_dir) / ".git" / "hooks"
-        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
+        for hook_name in [
+            "post-merge",
+            "post-checkout",
+            "post-rewrite",
+            "pre-commit",
+            "pre-push",
+        ]:
             hook_path = hooks_dir / hook_name
             if hook_path.exists():
                 content = hook_path.read_text()
