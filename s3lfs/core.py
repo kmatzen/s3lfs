@@ -47,6 +47,29 @@ DEFAULT_THREAD_POOL_SIZE = 8  # Fallback when os.cpu_count() is unavailable
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 
+try:
+    # The libyaml-backed loader parses and emits roughly an order of
+    # magnitude faster than the pure-Python one. Every command reads the
+    # whole manifest, so on a large repository this is the difference
+    # between a responsive tool and a stalled one. Output is identical.
+    from yaml import CSafeDumper as _YamlDumper
+    from yaml import CSafeLoader as _YamlLoader
+except ImportError:  # pragma: no cover - depends on the PyYAML build installed
+    from yaml import SafeDumper as _YamlDumper  # type: ignore[assignment]
+    from yaml import SafeLoader as _YamlLoader  # type: ignore[assignment]
+
+USING_LIBYAML = _YamlLoader.__name__.startswith("C")
+
+
+def yaml_load(stream):
+    """Parse YAML with the fastest safe loader available."""
+    return yaml.load(stream, Loader=_YamlLoader)
+
+
+def yaml_dump(data, stream=None, **kwargs):
+    """Emit YAML with the fastest safe dumper available."""
+    return yaml.dump(data, stream, Dumper=_YamlDumper, **kwargs)
+
 
 def _default_workers():
     """Compute a sensible default worker count based on available CPUs.
@@ -349,7 +372,7 @@ class S3LFS:
             return {}
         try:
             with open(self._inflight_file, "r") as f:
-                data = yaml.safe_load(f) or {}
+                data = yaml_load(f) or {}
             claims = data.get("claims", {})
             return claims if isinstance(claims, dict) else {}
         except Exception:
@@ -367,7 +390,7 @@ class S3LFS:
             f"{self._inflight_file.name}.{uuid4().hex}.tmp"
         )
         with open(temp_file, "w") as f:
-            yaml.safe_dump({"claims": claims}, f)
+            yaml_dump({"claims": claims}, f)
         temp_file.replace(self._inflight_file)
 
     def _live_inflight_keys(self):
@@ -595,7 +618,7 @@ class S3LFS:
             with open(self.manifest_file, "r") as f:
                 # Detect format based on extension
                 if self.manifest_file.suffix in [".yaml", ".yml"]:
-                    self.manifest = yaml.safe_load(f) or {"files": {}}
+                    self.manifest = yaml_load(f) or {"files": {}}
                 else:
                     self.manifest = json.load(f)
         else:
@@ -614,7 +637,7 @@ class S3LFS:
             with open(temp_file, "w") as f:
                 # Detect format based on extension
                 if self.manifest_file.suffix in [".yaml", ".yml"]:
-                    yaml.safe_dump(
+                    yaml_dump(
                         self.manifest, f, default_flow_style=False, sort_keys=True
                     )
                 else:
@@ -659,7 +682,7 @@ class S3LFS:
         try:
             with open(self.cache_file, "r") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
-                    self.hash_cache = yaml.safe_load(f) or {}
+                    self.hash_cache = yaml_load(f) or {}
                 else:
                     self.hash_cache = json.load(f)
         except (json.JSONDecodeError, yaml.YAMLError, IOError) as e:
@@ -685,7 +708,7 @@ class S3LFS:
         try:
             with open(temp_file, "w") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
-                    yaml.safe_dump(
+                    yaml_dump(
                         self.hash_cache, f, default_flow_style=False, sort_keys=True
                     )
                 else:
@@ -1063,7 +1086,7 @@ class S3LFS:
 
         return states
 
-    def track_modified_files_cached(self, silence=True):
+    def track_modified_files_cached(self, silence=True, keys=None):
         """
         Check manifest for outdated hashes using cached hashing and upload
         changed files in parallel.
@@ -1071,6 +1094,11 @@ class S3LFS:
         Loads the manifest and cache once at the start, checks all files
         against the in-memory snapshot without holding the lock, and
         batch-writes cache updates at the end.
+
+        :param keys: optional collection of manifest keys to check instead
+            of the whole manifest. A sparse working copy passes its
+            profile here so the per-commit cost tracks the slice it has
+            on disk rather than the size of the repository.
         """
         files_to_upload = []
         cache_hits = 0
@@ -1081,6 +1109,10 @@ class S3LFS:
             files_to_check = list(self.manifest["files"].keys())
             stored_hashes = dict(self.manifest["files"])
             self.load_cache()
+
+        if keys is not None:
+            allowed = set(keys)
+            files_to_check = [key for key in files_to_check if key in allowed]
 
         if not files_to_check:
             print(
@@ -1960,10 +1992,18 @@ class S3LFS:
                 f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
 
-    def parallel_download_all(self, silence=True):
-        """Download all files using block-level parallelism."""
+    def parallel_download_all(self, silence=True, only=None):
+        """Download all files using block-level parallelism.
+
+        :param only: optional collection of manifest keys to limit the
+            download to, used to honour a sparse profile.
+        """
         with self._lock_context():
             items = list(self.manifest["files"].items())
+
+        if only is not None:
+            only = set(only)
+            items = [(key, file_hash) for key, file_hash in items if key in only]
 
         if not items:
             print("Manifest is empty. Nothing to download.")
