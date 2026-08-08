@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import click
@@ -211,6 +212,7 @@ def track(
         s3lfs.track(
             manifest_key, silence=not verbose, interleaved=True, use_cache=False
         )
+        _protect_tracked_path(git_root, s3lfs, manifest_key)
     else:
         click.echo("Error: Must provide either a path or use --modified flag")
         raise click.Abort()
@@ -415,6 +417,9 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
         # The manifest_key is matched against manifest entries
         # Note: This is manifest-only; files on disk are not affected
         versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
+
+    if _remove_gitignore_entry(git_root, {f"/{manifest_key}", f"/{manifest_key}/"}):
+        click.echo(f"Removed '{manifest_key}' from the s3lfs block in .gitignore")
 
 
 @click.command()
@@ -771,6 +776,181 @@ def _remove_lfs_from_gitattributes(gitattributes_path, lfs_patterns):
     gitattributes_path.write_text(text)
 
 
+S3LFS_GITIGNORE_START = "# >>> s3lfs tracked files >>>"
+S3LFS_GITIGNORE_END = "# <<< s3lfs tracked files <<<"
+
+
+def _load_gitignore_block(git_root):
+    """Split .gitignore into (lines_before, block_entries, lines_after).
+
+    The s3lfs block is delimited by marker comments so entries can be
+    added and removed without disturbing the rest of the file.
+    """
+    gitignore = git_root / ".gitignore"
+    if not gitignore.exists():
+        return [], [], []
+    lines = gitignore.read_text().splitlines()
+    if S3LFS_GITIGNORE_START not in lines:
+        return lines, [], []
+    start = lines.index(S3LFS_GITIGNORE_START)
+    try:
+        end = lines.index(S3LFS_GITIGNORE_END, start)
+    except ValueError:
+        # Malformed block (no end marker): drop only the start marker and
+        # keep everything else out of the block rather than swallowing
+        # user content into it.
+        return lines[:start], [], lines[start + 1 :]
+    entries = [line for line in lines[start + 1 : end] if line.strip()]
+    return lines[:start], entries, lines[end + 1 :]
+
+
+def _save_gitignore_block(git_root, before, entries, after):
+    """Write .gitignore back with the s3lfs block holding these entries."""
+    gitignore = git_root / ".gitignore"
+    lines = list(before)
+    if entries:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(S3LFS_GITIGNORE_START)
+        lines.extend(entries)
+        lines.append(S3LFS_GITIGNORE_END)
+    lines.extend(after)
+    if not lines and not gitignore.exists():
+        return
+    gitignore.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def _add_gitignore_entry(git_root, entry):
+    """Add an entry to the s3lfs block in .gitignore. Returns True if added."""
+    before, entries, after = _load_gitignore_block(git_root)
+    if entry in entries:
+        return False
+    entries.append(entry)
+    _save_gitignore_block(git_root, before, entries, after)
+    return True
+
+
+def _remove_gitignore_entry(git_root, entry_variants):
+    """Remove any of these entries from the s3lfs block. Returns True if removed."""
+    before, entries, after = _load_gitignore_block(git_root)
+    kept = [e for e in entries if e not in entry_variants]
+    if kept == entries:
+        return False
+    _save_gitignore_block(git_root, before, kept, after)
+    return True
+
+
+def _gitignore_entry_for(git_root, manifest_key):
+    """Root-anchored .gitignore pattern covering a tracked path spec.
+
+    Manifest keys are relative to the git root, so anchoring with a
+    leading slash keeps the pattern from matching same-named paths in
+    other directories. Glob specs pass through: both glob.glob (used to
+    resolve them at track time) and gitignore give an unanchored '*' the
+    same single-level meaning.
+    """
+    if (git_root / manifest_key).is_dir():
+        return f"/{manifest_key}/"
+    return f"/{manifest_key}"
+
+
+def _deindex_tracked_files(git_root, tracked_keys):
+    """Drop s3lfs-tracked files from the git index; files stay on disk.
+
+    .gitignore has no effect on files git already tracks, so anything
+    committed before it was handed to s3lfs must be removed from the
+    index or git will keep versioning it alongside S3.
+
+    Returns the list of paths that were removed.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode != 0:
+        return []
+    indexed = {p for p in result.stdout.split("\0") if p}
+    offenders = sorted(indexed & set(tracked_keys))
+    if not offenders:
+        return []
+    result = subprocess.run(
+        [
+            "git",
+            "rm",
+            "--cached",
+            # --force is index-only here: with --cached, git rm never touches
+            # the working copy. Without it, git refuses files whose staged
+            # content differs from HEAD.
+            "--force",
+            "--quiet",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        input="\0".join(f":(literal){p}" for p in offenders),
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode != 0:
+        click.echo(
+            "Warning: failed to remove tracked files from the git index:\n"
+            f"{result.stderr.strip()}"
+        )
+        return []
+    return offenders
+
+
+def _protect_tracked_path(git_root, s3lfs, manifest_key):
+    """Keep a newly tracked path spec out of git: ignore it and de-index it."""
+    s3lfs.load_manifest()
+    matched = s3lfs._resolve_manifest_paths(manifest_key)
+    if not matched:
+        # The spec tracked nothing; leave git configuration alone.
+        return
+
+    entry = _gitignore_entry_for(git_root, manifest_key)
+    if _add_gitignore_entry(git_root, entry):
+        click.echo(f"Added '{entry}' to .gitignore (s3lfs block)")
+
+    removed = _deindex_tracked_files(git_root, matched.keys())
+    if removed:
+        click.echo(
+            f"Removed {len(removed)} s3lfs-tracked file(s) from the git index "
+            "(files remain on disk):"
+        )
+        for path in removed[:10]:
+            click.echo(f"  {path}")
+        if len(removed) > 10:
+            click.echo(f"  ... and {len(removed) - 10} more")
+        click.echo("Commit to finalize their removal from git.")
+
+
+def _manifest_files_at_revision(git_root, revision):
+    """Load the manifest's files mapping as of a git revision.
+
+    Returns None when the revision has no manifest or is not available
+    locally (e.g. a remote sha that was never fetched).
+    """
+    names = [get_manifest_path(git_root).name]
+    for other in (".s3_manifest.yaml", ".s3_manifest.json"):
+        if other not in names:
+            names.append(other)
+    for name in names:
+        result = subprocess.run(
+            ["git", "show", f"{revision}:{name}"],
+            capture_output=True,
+            text=True,
+            cwd=str(git_root),
+        )
+        if result.returncode == 0:
+            # yaml.safe_load handles both the YAML and JSON manifest formats
+            data = yaml.safe_load(result.stdout) or {}
+            return data.get("files") or {}
+    return None
+
+
 S3LFS_HOOK_START = "# >>> s3lfs hook >>>"
 S3LFS_HOOK_END = "# <<< s3lfs hook <<<"
 
@@ -793,20 +973,45 @@ if [ "$3" = "1" ] && command -v s3lfs >/dev/null 2>&1; then
     fi
 fi"""
 
-_PRE_PUSH_BODY = """\
-# Auto-track modified s3lfs files before push.
+_PRE_COMMIT_BODY = """\
+# Upload modified s3lfs files and stage the manifest before commit.
 #
-# This hook aborts the push on failure, and that is deliberate. It uploads
-# the content the manifest being pushed refers to; if the upload fails and
-# the push proceeds, collaborators fetch a manifest whose hashes have no
-# objects behind them and every checkout 404s. Failing here is recoverable,
-# pushing a broken manifest is not.
+# Running at commit time (not push time) keeps every commit self-consistent:
+# the commit that changes a tracked file is the commit whose manifest points
+# at the new hash, and the content is already in S3 by the time that commit
+# can be pushed. This hook also blocks committing s3lfs-tracked files into
+# git itself.
 if command -v s3lfs >/dev/null 2>&1; then
-    if ! s3lfs track --modified 2>&1; then
-        echo "s3lfs: pre-push track failed; aborting push" >&2
-        echo "s3lfs: push anyway with --no-verify if you are sure" >&2
+    if ! s3lfs pre-commit 2>&1; then
+        echo "s3lfs: pre-commit failed; aborting commit" >&2
+        echo "s3lfs: commit anyway with --no-verify if you are sure" >&2
         exit 1
     fi
+fi"""
+
+_PRE_PUSH_BODY = """\
+# Verify the manifests being pushed reference content that exists in S3.
+#
+# Uploads happen at commit time (pre-commit hook); this is the last line of
+# defense against publishing a manifest whose hashes have no objects behind
+# them (commits made with --no-verify, or before hooks were installed).
+# If the push proceeded anyway, every collaborator checkout would 404.
+if command -v s3lfs >/dev/null 2>&1; then
+    zero=0000000000000000000000000000000000000000
+    while read local_ref local_sha remote_ref remote_sha; do
+        [ "$local_sha" = "$zero" ] && continue
+        if [ "$remote_sha" = "$zero" ]; then
+            base_args=""
+        else
+            base_args="--base $remote_sha"
+        fi
+        if ! s3lfs verify --revision "$local_sha" $base_args 2>&1; then
+            echo "s3lfs: content referenced by this push is missing from S3; aborting push" >&2
+            echo "s3lfs: run 's3lfs track --modified', commit the manifest, and retry" >&2
+            echo "s3lfs: or push with --no-verify to skip this check" >&2
+            exit 1
+        fi
+    done
 fi"""
 
 HOOK_SCRIPTS = {
@@ -814,6 +1019,7 @@ HOOK_SCRIPTS = {
     "post-checkout": (
         S3LFS_HOOK_START + "\n" + _POST_CHECKOUT_BODY + "\n" + S3LFS_HOOK_END
     ),
+    "pre-commit": S3LFS_HOOK_START + "\n" + _PRE_COMMIT_BODY + "\n" + S3LFS_HOOK_END,
     "pre-push": S3LFS_HOOK_START + "\n" + _PRE_PUSH_BODY + "\n" + S3LFS_HOOK_END,
 }
 
@@ -933,9 +1139,13 @@ def install():
     click.echo()
     click.echo("s3lfs hooks installed. Your git workflow now automatically:")
     click.echo(
+        "  - Uploads modified files and stages the manifest on commit (pre-commit)"
+    )
+    click.echo("  - Blocks committing s3lfs-tracked files into git (pre-commit)")
+    click.echo(
         "  - Downloads tracked files after checkout/merge (post-checkout, post-merge)"
     )
-    click.echo("  - Uploads modified files before push (pre-push)")
+    click.echo("  - Verifies pushed manifests reference uploaded content (pre-push)")
     click.echo()
     click.echo("Run 's3lfs uninstall' to remove hooks.")
 
@@ -962,6 +1172,136 @@ def uninstall():
         click.echo("No s3lfs hooks found.")
 
 
+@click.command()
+@click.option(
+    "--revision",
+    default=None,
+    help="Git revision whose manifest to verify (default: working tree manifest)",
+)
+@click.option(
+    "--base",
+    default=None,
+    help="Only verify entries added or changed relative to this revision's manifest",
+)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
+def verify(revision, base, no_sign_request, use_acceleration, endpoint_url, workers):
+    """Verify that manifest entries have content behind them in S3.
+
+    Exits non-zero if any entry references content that was never uploaded.
+    Used by the pre-push hook to stop a push that would publish a manifest
+    whose hashes have no objects behind them.
+    """
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
+        no_sign_request=no_sign_request,
+        use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
+        workers=workers,
+    )
+
+    if revision:
+        files = _manifest_files_at_revision(git_root, revision)
+        if files is None:
+            click.echo(f"No manifest at revision {revision}; nothing to verify.")
+            return
+    else:
+        files = dict(s3lfs.manifest.get("files", {}))
+
+    if base:
+        base_files = _manifest_files_at_revision(git_root, base) or {}
+        files = {k: h for k, h in files.items() if base_files.get(k) != h}
+
+    if not files:
+        click.echo("No manifest entries to verify.")
+        return
+
+    noun = "entry" if len(files) == 1 else "entries"
+    click.echo(f"Verifying {len(files)} manifest {noun} against S3...")
+    missing = s3lfs.find_missing_assets(files)
+    if missing:
+        click.echo("Content missing from S3:")
+        for key, file_hash in sorted(missing):
+            click.echo(f"  {key} ({file_hash[:12]})")
+        click.echo(
+            f"Error: {len(missing)} of {len(files)} {noun} have no content in S3."
+        )
+        raise SystemExit(1)
+    click.echo(f"All {len(files)} {noun} verified present in S3.")
+
+
+@click.command("pre-commit")
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def pre_commit(no_sign_request, use_acceleration, endpoint_url):
+    """Prepare a commit (run by the pre-commit git hook).
+
+    Blocks the commit if any staged file is tracked by s3lfs, uploads
+    modified tracked content, and stages the updated manifest so the
+    commit's manifest matches what is in S3.
+    """
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
+        no_sign_request=no_sign_request,
+        use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
+    )
+    tracked = set(s3lfs.manifest.get("files", {}))
+
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=d", "-z"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    staged = {p for p in result.stdout.split("\0") if p}
+    offenders = sorted(staged & tracked)
+    if offenders:
+        click.echo(
+            "Error: these files are tracked by s3lfs but staged for commit in git:"
+        )
+        for path in offenders:
+            click.echo(f"  {path}")
+        click.echo("Unstage them (the files stay on disk):")
+        for path in offenders:
+            click.echo(f"  git rm --cached '{path}'")
+        raise SystemExit(1)
+
+    if tracked:
+        s3lfs.track_modified_files_cached(silence=True)
+
+    subprocess.run(
+        ["git", "add", "--", manifest_path.name],
+        cwd=str(git_root),
+    )
+
+
 cli.add_command(init)
 cli.add_command(track)
 cli.add_command(checkout)
@@ -972,6 +1312,8 @@ cli.add_command(migrate)
 cli.add_command(migrate_from_lfs)
 cli.add_command(install)
 cli.add_command(uninstall)
+cli.add_command(verify)
+cli.add_command(pre_commit)
 
 
 def main():

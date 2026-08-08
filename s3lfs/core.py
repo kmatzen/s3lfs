@@ -452,6 +452,38 @@ class S3LFS:
         head, sep, tail = key.rpartition(".chunk")
         return bool(sep) and tail.isdigit() and head in base_keys
 
+    def find_missing_assets(self, files):
+        """Return the manifest entries whose content is absent from S3.
+
+        :param files: dict of manifest_key -> file_hash to check
+        :return: list of (manifest_key, file_hash) tuples with no object behind them
+
+        An entry is present if its base key exists, or at least one of its
+        chunks does (a large file is stored only as base_key.chunk0..N).
+        Chunk completeness is not verified; this answers "was this content
+        ever uploaded", which is what push-time verification needs.
+        """
+
+        @retry(3, (BotoCoreError, ClientError, SSLError))
+        def check(item):
+            manifest_key, file_hash = item
+            base_key = self._asset_base_key(manifest_key, file_hash)
+            resp = self._get_s3_client().list_objects_v2(
+                Bucket=self.bucket_name, Prefix=base_key
+            )
+            keys = [obj["Key"] for obj in resp.get("Contents", [])]
+            # A prefix match can hit an unrelated, longer key.
+            if any(self._key_covered_by(k, {base_key}) for k in keys):
+                return None
+            return item
+
+        if not files:
+            return []
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            results = list(pool.map(check, files.items()))
+        return [item for item in results if item is not None]
+
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
         if not hasattr(self.thread_local, "s3"):
