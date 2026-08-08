@@ -5,12 +5,12 @@ import tempfile
 from pathlib import Path
 
 import click
-import yaml
 
 from s3lfs import metrics
 from s3lfs.config import load_config
-from s3lfs.core import S3LFS
+from s3lfs.core import S3LFS, yaml_dump, yaml_load
 from s3lfs.path_resolver import PathResolver
+from s3lfs.sparse import SparseProfile
 from s3lfs.utils import find_git_root
 
 
@@ -69,6 +69,14 @@ def _setup_s3lfs_command(cli_path=None, require_manifest=True):
         return git_root, manifest_path, path_resolver, manifest_key
 
     return git_root, manifest_path, path_resolver
+
+
+def _sparse_profile(git_root):
+    """The working copy's sparse profile, warning once if it can't apply."""
+    profile = SparseProfile.detect(git_root)
+    if profile.degraded_reason:
+        click.echo(f"Warning: {profile.degraded_reason}")
+    return profile
 
 
 def get_manifest_path(git_root):
@@ -283,11 +291,28 @@ def checkout(
     )
 
     if all:
-        # Download all files from manifest
-        s3lfs.parallel_download_all(silence=not verbose)
+        # "All" means everything this working copy materializes, which is
+        # the whole manifest unless a sparse profile narrows it.
+        profile = _sparse_profile(git_root)
+        wanted, skipped = profile.partition(dict(s3lfs.manifest.get("files", {})))
+        if skipped:
+            click.echo(f"Skipping {len(skipped)} file(s) outside your sparse profile.")
+        s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
     elif manifest_key:
         # MANIFEST GLOB: Find files in manifest and download them
         # The manifest_key is matched against manifest entries (files may not exist on disk)
+        profile = _sparse_profile(git_root)
+        if profile.active:
+            matched = s3lfs._resolve_manifest_paths(manifest_key)
+            _, outside = profile.partition(matched)
+            if outside:
+                # An explicit path is an explicit request, so honour it --
+                # but say so, because a later sync will prune it again.
+                click.echo(
+                    f"Note: {len(outside)} of {len(matched)} matching file(s) are "
+                    "outside your sparse profile; downloading them anyway. "
+                    "Widen the profile with 'git sparse-checkout' to keep them."
+                )
         s3lfs.checkout(manifest_key, silence=not verbose)
     else:
         click.echo("Error: Must provide either a path or use --all flag")
@@ -361,10 +386,21 @@ def sync(
         workers=workers,
     )
 
+    profile = _sparse_profile(git_root)
     current = dict(s3lfs.manifest.get("files", {}))
+    wanted, out_of_profile = profile.partition(current)
+
     previous = (
         _manifest_files_at_revision(git_root, from_revision) if from_revision else None
     )
+
+    # Files to take off disk: entries this manifest dropped (expected to
+    # still hold the old content) and, when the profile narrowed, entries
+    # still tracked but no longer wanted here (expected to hold current).
+    to_remove = {}
+    if previous is not None:
+        to_remove.update({k: h for k, h in previous.items() if k not in current})
+    to_remove.update(out_of_profile)
 
     if previous is None:
         # No baseline to diff against (no --from, an unavailable revision, or
@@ -374,44 +410,40 @@ def sync(
                 f"No manifest available at {from_revision}; "
                 "falling back to a full checkout."
             )
-        s3lfs.parallel_download_all(silence=not verbose)
-        return
+        s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
+    else:
+        changed = {k: h for k, h in wanted.items() if previous.get(k) != h}
+        if not changed and not to_remove:
+            click.echo("Tracked files are already in sync.")
+            return
+        if changed:
+            # The diff says which entries could differ on disk; the disk says
+            # which actually do (a file may already hold the target content).
+            states = s3lfs.compare_to_hashes(changed, progress=verbose)
+            to_download = [
+                (key, changed[key])
+                for key, state in states.items()
+                if state != "up_to_date"
+            ]
+            if to_download:
+                click.echo(f"Downloading {len(to_download)} changed file(s)...")
+                s3lfs.parallel_download_chunked(to_download, silence=not verbose)
+            else:
+                click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
 
-    changed = {k: h for k, h in current.items() if previous.get(k) != h}
-    dropped = {k: h for k, h in previous.items() if k not in current}
-
-    if not changed and not dropped:
-        click.echo("Tracked files are already in sync.")
-        return
-
-    if changed:
-        # The diff says which entries could differ on disk; the disk says
-        # which actually do (a file may already hold the target content).
-        states = s3lfs.compare_to_hashes(changed, progress=verbose)
-        to_download = [
-            (key, changed[key])
-            for key, state in states.items()
-            if state != "up_to_date"
-        ]
-        if to_download:
-            click.echo(f"Downloading {len(to_download)} changed file(s)...")
-            s3lfs.parallel_download_chunked(to_download, silence=not verbose)
-        else:
-            click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
-
-    if dropped and prune:
-        # Only remove content that still matches what the old manifest
-        # recorded. Anything else is local work the user has not tracked,
-        # and deleting it would destroy the only copy.
-        states = s3lfs.compare_to_hashes(dropped, progress=verbose)
+    if to_remove and prune:
+        # Only remove content that still matches the hash recorded for it.
+        # Anything else is local work, and deleting it would destroy the
+        # only copy.
+        states = s3lfs.compare_to_hashes(to_remove, progress=verbose)
         removed = 0
         for key, state in sorted(states.items()):
             if state == "missing":
                 continue
             if state == "modified":
                 click.echo(
-                    f"Keeping {key}: it is no longer tracked but has local "
-                    "modifications."
+                    f"Keeping {key}: it is no longer materialized here but has "
+                    "local modifications."
                 )
                 continue
             filesystem_path = path_resolver.to_filesystem_path(key)
@@ -421,7 +453,7 @@ def sync(
             if verbose:
                 click.echo(f"  Removed {key}")
         if removed:
-            click.echo(f"Removed {removed} file(s) no longer tracked.")
+            click.echo(f"Removed {removed} file(s) not materialized here.")
 
 
 @cli.command()
@@ -563,6 +595,19 @@ def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoin
             click.echo("No files are tracked by s3lfs.")
         return
 
+    # Files outside the sparse profile are absent on purpose. Reporting
+    # them as missing would bury the real signal.
+    profile = _sparse_profile(git_root)
+    expected, outside_profile = profile.partition(expected)
+
+    if not expected:
+        if not porcelain:
+            click.echo(
+                f"No tracked files here: all {len(outside_profile)} matching "
+                "file(s) are outside your sparse profile."
+            )
+        return
+
     states = s3lfs.compare_to_hashes(expected)
 
     # Show paths relative to where the user is standing, as ls does.
@@ -597,6 +642,10 @@ def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoin
         f"{len(states)} tracked file(s): {len(up_to_date)} up-to-date, "
         f"{len(modified)} modified, {len(missing)} missing"
     )
+    if outside_profile:
+        click.echo(
+            f"({len(outside_profile)} more outside your sparse profile, not shown)"
+        )
 
     if modified:
         click.echo()
@@ -756,7 +805,7 @@ def migrate(force):
     # Write YAML manifest
     try:
         with open(yaml_manifest, "w") as f:
-            yaml.safe_dump(manifest_data, f, default_flow_style=False, sort_keys=True)
+            yaml_dump(manifest_data, f, default_flow_style=False, sort_keys=True)
         click.echo(f"Successfully created {yaml_manifest.name}")
     except Exception as e:
         click.echo(f"Error: Failed to write YAML manifest: {e}")
@@ -771,7 +820,7 @@ def migrate(force):
             with open(json_cache, "r") as f:
                 cache_data = json.load(f)
             with open(yaml_cache, "w") as f:
-                yaml.safe_dump(cache_data, f, default_flow_style=False, sort_keys=True)
+                yaml_dump(cache_data, f, default_flow_style=False, sort_keys=True)
             click.echo(f"Successfully migrated cache file to {yaml_cache.name}")
         except Exception as e:
             click.echo(f"Warning: Failed to migrate cache file: {e}")
@@ -1216,7 +1265,7 @@ def _manifest_files_at_revision(git_root, revision):
         )
         if result.returncode == 0:
             # yaml.safe_load handles both the YAML and JSON manifest formats
-            data = yaml.safe_load(result.stdout) or {}
+            data = yaml_load(result.stdout) or {}
             return data.get("files") or {}
     return None
 
@@ -1598,7 +1647,7 @@ def _read_manifest_for_merge(path):
     if not path.exists():
         return {}
     # safe_load parses both the YAML and JSON manifest formats
-    data = yaml.safe_load(path.read_text()) or {}
+    data = yaml_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} is not a manifest mapping")
     return data
@@ -1667,6 +1716,53 @@ def _merge_gitignore(base, ours, theirs):
     return "\n".join(lines) + ("\n" if lines else ""), conflict
 
 
+@cli.command()
+@click.option(
+    "--porcelain",
+    is_flag=True,
+    help="Machine-readable output: one '<code> <path>' line per file",
+)
+def sparse(porcelain):
+    """Show which tracked files this working copy materializes.
+
+    s3lfs has no sparse profile of its own: it applies git's
+    sparse-checkout rules to tracked files, which git itself cannot do
+    because those files are gitignored and so absent from its index.
+    Narrow or widen the profile with 'git sparse-checkout', then run
+    's3lfs sync' to match the working copy to it.
+    """
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+    s3lfs = _make_s3lfs(git_root, manifest_path)
+
+    profile = _sparse_profile(git_root)
+    inside, outside = profile.partition(dict(s3lfs.manifest.get("files", {})))
+
+    if porcelain:
+        for key in sorted(inside):
+            click.echo(f"+ {key}")
+        for key in sorted(outside):
+            click.echo(f"- {key}")
+        return
+
+    if not profile.active:
+        click.echo("Sparse checkout is not enabled; all tracked files are wanted here.")
+        click.echo(f"  {len(inside)} tracked file(s)")
+        click.echo()
+        click.echo("Enable it with 'git sparse-checkout set <dir>...',")
+        click.echo("then run 's3lfs sync' to drop what falls outside.")
+        return
+
+    click.echo("Sparse checkout is enabled. Patterns:")
+    for pattern in profile.patterns():
+        click.echo(f"  {pattern}")
+    click.echo()
+    click.echo(
+        f"{len(inside)} of {len(inside) + len(outside)} tracked file(s) are "
+        "materialized here."
+    )
+    click.echo("Run 's3lfs sync' after changing the patterns.")
+
+
 @click.command("merge-driver")
 @click.argument("base", type=click.Path())
 @click.argument("ours", type=click.Path())
@@ -1728,7 +1824,7 @@ def merge_driver(base, ours, theirs, target):
         if as_json:
             json.dump(merged, f, indent=4, sort_keys=True)
         else:
-            yaml.safe_dump(merged, f, default_flow_style=False, sort_keys=True)
+            yaml_dump(merged, f, default_flow_style=False, sort_keys=True)
 
     conflicts = file_conflicts + meta_conflicts
     if conflicts:
@@ -1906,7 +2002,11 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         raise SystemExit(1)
 
     if tracked:
-        s3lfs.track_modified_files_cached(silence=True)
+        # Only walk what this working copy materializes: in a sparse
+        # checkout the rest is absent by design, and stat-ing it would
+        # make every commit cost the size of the whole repository.
+        profile = _sparse_profile(git_root)
+        s3lfs.track_modified_files_cached(silence=True, keys=profile.select(tracked))
 
     subprocess.run(
         ["git", "add", "--", manifest_path.name],

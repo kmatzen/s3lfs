@@ -10,6 +10,7 @@ A Python-based version control system for large assets using Amazon S3 and S3-co
 - **Automatic parallel compression**: Uses pigz when available, falls back to gzip
 - **Git hook integration**: `s3lfs install` sets up pre-commit, post-checkout, post-merge, post-rewrite, and pre-push hooks
 - **Accident-proof tracking**: `s3lfs track` gitignores tracked paths and removes them from the git index, so large files can't sneak into git history
+- **Sparse checkouts**: applies your `git sparse-checkout` rules to tracked files, so a working copy only materializes its slice of a large repository
 - **Cheap branch switches**: `s3lfs sync` diffs the manifest between revisions and transfers only what changed
 - **Conflict-free manifests**: a git merge driver unions concurrent changes to the manifest and `.gitignore`
 - **One-command setup**: `s3lfs clone` clones, installs hooks, and downloads tracked files
@@ -199,6 +200,16 @@ s3lfs sync --from HEAD~1
 - `--no-prune`: Keep files the manifest no longer lists
 - `--verbose`, `--no-sign-request`, `--endpoint-url`, `--workers`: As in other commands
 
+### Show Sparse Profile
+```sh
+s3lfs sparse
+s3lfs sparse --porcelain
+```
+**Description**: Shows which tracked files this working copy materializes. See [Sparse Checkouts](#sparse-checkouts) below.
+
+**Options**:
+- `--porcelain`: One line per file, `+` in profile and `-` outside it
+
 ### Clone a Repository
 ```sh
 s3lfs clone <url> [directory]
@@ -357,6 +368,49 @@ Periodically clean up unreferenced files (use with caution - this feature is unt
 ```sh
 s3lfs cleanup
 ```
+
+## Sparse Checkouts
+
+When a repository tracks more content than any one person needs on disk, a sparse checkout materializes only your slice of it. s3lfs supports this by applying **git's own `sparse-checkout` rules** to tracked files rather than carrying a second profile format of its own.
+
+That choice matters for two reasons. One source of truth means a repository describes its slice once, and the same rule governs both source files and tracked assets — you don't maintain two configurations that can silently disagree. And it means s3lfs inherits git's pattern semantics, cone and non-cone alike, instead of reimplementing them. Matching is delegated to `git sparse-checkout check-rules`, which is git's own matcher.
+
+The rules have to be applied by s3lfs rather than left to git, because tracked files are gitignored and therefore absent from git's index — git never considers them when it materializes a sparse working copy.
+
+### Using it
+
+```sh
+# Narrow the working copy to the slice you need (plain git)
+git sparse-checkout set --cone assets/textures models/production
+
+# Make the tracked files match: downloads what's now in scope,
+# removes what's now out of scope
+s3lfs sync
+
+# See what this working copy materializes
+s3lfs sparse
+```
+
+Widening works the same way -- adjust the patterns with `git sparse-checkout`, then run `s3lfs sync`.
+
+### What respects the profile
+
+- `s3lfs sync` downloads only in-profile files, and removes materialized files that fall outside it. As always, it only deletes content that still matches the hash the manifest recorded, so local modifications are never destroyed -- it reports them and moves on.
+- `s3lfs checkout --all` means "everything this working copy materializes," and says how many files it skipped.
+- `s3lfs status` reports only in-profile files, with a count of the rest. Out-of-profile files are absent on purpose, so reporting them as missing would bury the real signal.
+- The `pre-commit` hook walks only in-profile entries, so the cost of a commit tracks the size of your slice rather than the size of the repository.
+
+An explicit `s3lfs checkout <path>` outside the profile is honored -- an explicit request is explicit intent -- but it says so, since a later `sync` will prune the file again unless you widen the profile.
+
+`s3lfs verify` deliberately ignores the profile: it asks what exists in S3, not what is on disk.
+
+### Requirements and fallback
+
+Needs git 2.42 or newer (for `check-rules`). If sparse checkout is enabled but s3lfs can't apply the rules -- older git, or a half-configured working copy -- it warns and treats every tracked file as in-profile. A degraded match can only ever download too much, never too little, so it can't silently hide files from you.
+
+### Scope
+
+This governs s3lfs-tracked content only. If your working copy is large because of the sheer number of *source* files, `git sparse-checkout` is what shrinks that, and s3lfs simply follows the same rules. If it's large because of tracked binary assets, this is what shrinks it. Most large repositories have both problems, which is exactly why the two share one configuration here.
 
 ## CI/CD Integration
 

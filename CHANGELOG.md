@@ -8,17 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Sparse checkout support: s3lfs now applies the working copy's `git sparse-checkout` rules to tracked files, so a large repository can be checked out one slice at a time. Rules are matched by `git sparse-checkout check-rules` (git's own matcher, cone and non-cone), because tracked files are gitignored and therefore invisible to git's own sparse machinery. `sync` downloads only in-profile files and prunes ones that leave the profile, `checkout --all` means "everything this working copy materializes", `status` hides out-of-profile files behind a count, and the pre-commit hook walks only the slice so commit cost tracks the working copy rather than the repository. Requires git 2.42+; degrades to treating everything as in-profile (with a warning) otherwise, so it can only ever over-download.
+- `s3lfs sparse` command: shows whether sparse checkout is active, the patterns in effect, and how many tracked files are materialized here
 - `s3lfs sync [--from REV]` command: brings tracked files in line with the manifest by diffing against a revision's manifest, transferring only what changed and removing files the manifest no longer lists (only when their content still matches what it recorded). Replaces the blanket `checkout --all` in the post-checkout and post-merge hooks, which re-hashed every tracked file on every branch switch.
 - `post-rewrite` git hook, so `git pull --rebase` -- which fires neither post-merge nor a branch post-checkout -- no longer leaves tracked files stale
 - `s3lfs status` command: shows which tracked files are modified or missing, the view `git status` cannot give for gitignored files. Supports a path filter, `--all`, and `--porcelain`.
 - `s3lfs merge-driver` and automatic registration by `s3lfs install`: merges concurrent changes to `.s3_manifest.yaml` key-wise and to the `.gitignore` s3lfs block as a set union, so two branches tracking different files no longer conflict. A conflict is still reported when both sides change the same path to different content.
 - `s3lfs clone <url> [dir]` command: clone, install hooks, and download tracked files in one step, since git hooks are never cloned
-- `S3LFS.compare_to_hashes()`: cached disk-state comparison shared by `sync` and `status`
 - `s3lfs verify` command: checks that manifest entries reference content that exists in S3, with `--revision` to verify a committed manifest and `--base` to verify only the entries a push introduces
 - `s3lfs pre-commit` command and pre-commit git hook: uploads modified tracked files and stages the updated manifest at commit time, so every commit's manifest matches the content in S3; blocks the commit if an s3lfs-tracked file is staged for commit in git itself
 - `s3lfs track` now adds tracked paths to a marked block in `.gitignore` and removes already-committed tracked files from the git index, preventing large files from entering git history; `s3lfs remove` removes the `.gitignore` entry
+- `S3LFS.compare_to_hashes()`: cached disk-state comparison shared by `sync` and `status`
 
 ### Changed
+- Manifest and cache YAML now use the libyaml-backed loader and dumper when available, which parses roughly 8x faster (4.31s to 0.50s for a 100,000-entry manifest) and emits byte-identical output. Every command reads the whole manifest, so this is felt everywhere.
 - The pre-push hook now verifies that pushed manifests reference uploaded content (`s3lfs verify`) instead of uploading at push time. Uploading during pre-push updated only the working-tree manifest, so the commits being pushed still referenced the old hashes; uploads now happen in the pre-commit hook where the manifest change lands in the commit itself.
 
 ### Fixed

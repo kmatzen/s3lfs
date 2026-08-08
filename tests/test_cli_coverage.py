@@ -448,8 +448,8 @@ class TestCLICoverage(unittest.TestCase):
         with open(json_manifest, "w") as f:
             json.dump(manifest_data, f)
 
-        # Mock yaml.safe_dump to raise an exception
-        with patch("s3lfs.cli.yaml.safe_dump") as mock_dump:
+        # Mock the YAML writer to raise an exception
+        with patch("s3lfs.cli.yaml_dump") as mock_dump:
             mock_dump.side_effect = Exception("Write failed")
 
             # Run migrate command
