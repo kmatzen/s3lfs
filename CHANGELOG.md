@@ -8,12 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `s3lfs sync [--from REV]` command: brings tracked files in line with the manifest by diffing against a revision's manifest, transferring only what changed and removing files the manifest no longer lists (only when their content still matches what it recorded). Replaces the blanket `checkout --all` in the post-checkout and post-merge hooks, which re-hashed every tracked file on every branch switch.
+- `post-rewrite` git hook, so `git pull --rebase` -- which fires neither post-merge nor a branch post-checkout -- no longer leaves tracked files stale
+- `s3lfs status` command: shows which tracked files are modified or missing, the view `git status` cannot give for gitignored files. Supports a path filter, `--all`, and `--porcelain`.
+- `s3lfs merge-driver` and automatic registration by `s3lfs install`: merges concurrent changes to `.s3_manifest.yaml` key-wise and to the `.gitignore` s3lfs block as a set union, so two branches tracking different files no longer conflict. A conflict is still reported when both sides change the same path to different content.
+- `s3lfs clone <url> [dir]` command: clone, install hooks, and download tracked files in one step, since git hooks are never cloned
+- `S3LFS.compare_to_hashes()`: cached disk-state comparison shared by `sync` and `status`
 - `s3lfs verify` command: checks that manifest entries reference content that exists in S3, with `--revision` to verify a committed manifest and `--base` to verify only the entries a push introduces
 - `s3lfs pre-commit` command and pre-commit git hook: uploads modified tracked files and stages the updated manifest at commit time, so every commit's manifest matches the content in S3; blocks the commit if an s3lfs-tracked file is staged for commit in git itself
 - `s3lfs track` now adds tracked paths to a marked block in `.gitignore` and removes already-committed tracked files from the git index, preventing large files from entering git history; `s3lfs remove` removes the `.gitignore` entry
 
 ### Changed
 - The pre-push hook now verifies that pushed manifests reference uploaded content (`s3lfs verify`) instead of uploading at push time. Uploading during pre-push updated only the working-tree manifest, so the commits being pushed still referenced the old hashes; uploads now happen in the pre-commit hook where the manifest change lands in the commit itself.
+
+### Fixed
+- `test_load_cache_stat_oserror` assumed `Path.exists()` is implemented in terms of `Path.stat`, which is no longer true on Python 3.14; the test now patches both explicitly
 
 ## [0.2.0] - 2026-04-11
 

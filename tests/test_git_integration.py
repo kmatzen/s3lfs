@@ -1,14 +1,17 @@
 """Tests for the git-workflow integration: .gitignore protection of tracked
 paths, the pre-commit command, and push-time verification."""
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import boto3
+import yaml
 from click.testing import CliRunner
 from moto import mock_s3
 
@@ -16,7 +19,9 @@ from s3lfs.cli import (
     S3LFS_GITIGNORE_END,
     S3LFS_GITIGNORE_START,
     _add_gitignore_entry,
+    _install_merge_driver,
     _load_gitignore_block,
+    _merge_gitignore,
     _remove_gitignore_entry,
     cli,
 )
@@ -327,6 +332,501 @@ class TestVerifyCommand(GitRepoTestCase):
         result = self.runner.invoke(cli, ["verify", "--revision", "HEAD"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertIn("No manifest at revision", result.output)
+
+
+class TestSyncCommand(GitRepoTestCase):
+    """s3lfs sync: manifest-diff-based branch switching."""
+
+    def _track_and_commit(self, rel_path, content, message):
+        self._write(rel_path, content)
+        self.runner.invoke(cli, ["track", rel_path])
+        self._commit_all(message)
+
+    def test_sync_downloads_only_changed_entries(self):
+        """The diff, not the whole manifest, decides what gets downloaded.
+
+        Both files are deleted from disk; syncing from the revision that
+        only lacked the second one must restore that one alone. A full
+        checkout would restore both.
+        """
+        self._track_and_commit("data/a.bin", "a", "track a")
+        self._track_and_commit("data/b.bin", "b", "track b")
+
+        Path("data/a.bin").unlink()
+        Path("data/b.bin").unlink()
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        self.assertTrue(Path("data/b.bin").exists(), "changed entry not restored")
+        self.assertFalse(
+            Path("data/a.bin").exists(),
+            "unchanged entry was downloaded; sync did a full checkout",
+        )
+
+    def test_sync_updates_changed_content(self):
+        self._track_and_commit("data/a.bin", "v1", "track v1")
+        self._write("data/a.bin", "v2")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track v2")
+
+        self._write("data/a.bin", "stale")
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(Path("data/a.bin").read_text(), "v2")
+
+    def test_sync_reports_when_already_in_sync(self):
+        self._track_and_commit("data/a.bin", "a", "track a")
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("already in sync", result.output)
+
+    def test_sync_prunes_untracked_files(self):
+        """A file dropped from the manifest is removed from disk, as git
+        does for files absent from the branch being switched to."""
+        self._track_and_commit("data/a.bin", "a", "track a")
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertFalse(Path("data/a.bin").exists())
+        self.assertIn("Removed 1 file(s)", result.output)
+
+    def test_sync_prune_removes_emptied_directories(self):
+        self._track_and_commit("data/nested/a.bin", "a", "track a")
+        self.runner.invoke(cli, ["remove", "data/nested/a.bin"])
+        self._commit_all("untrack a")
+
+        self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertFalse(Path("data/nested").exists())
+
+    def test_sync_keeps_locally_modified_file_when_pruning(self):
+        """Pruning must never destroy content that is not in S3."""
+        self._track_and_commit("data/a.bin", "a", "track a")
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+        self._write("data/a.bin", "local edits worth keeping")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(Path("data/a.bin").exists())
+        self.assertEqual(Path("data/a.bin").read_text(), "local edits worth keeping")
+        self.assertIn("local modifications", result.output)
+
+    def test_sync_no_prune_keeps_dropped_files(self):
+        self._track_and_commit("data/a.bin", "a", "track a")
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1", "--no-prune"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(Path("data/a.bin").exists())
+
+    def test_sync_falls_back_to_full_checkout_without_baseline(self):
+        """An unknown revision (fresh clone, shallow history) must still
+        produce correct files, just without the diff optimization."""
+        self._track_and_commit("data/a.bin", "a", "track a")
+        Path("data/a.bin").unlink()
+
+        zero = "0" * 40
+        result = self.runner.invoke(cli, ["sync", "--from", zero])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("falling back to a full checkout", result.output)
+        self.assertTrue(Path("data/a.bin").exists())
+
+    def test_sync_without_from_does_full_checkout(self):
+        self._track_and_commit("data/a.bin", "a", "track a")
+        Path("data/a.bin").unlink()
+
+        result = self.runner.invoke(cli, ["sync"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(Path("data/a.bin").exists())
+
+
+class TestStatusCommand(GitRepoTestCase):
+    """s3lfs status: the view git status cannot give for ignored files."""
+
+    def test_status_reports_up_to_date(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+
+        result = self.runner.invoke(cli, ["status"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("1 up-to-date", result.output)
+
+    def test_status_reports_modified(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._write("data/a.bin", "changed")
+
+        result = self.runner.invoke(cli, ["status"])
+        self.assertIn("1 modified", result.output)
+        self.assertIn("Modified", result.output)
+        self.assertIn("data/a.bin", result.output)
+
+    def test_status_reports_missing(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        Path("data/a.bin").unlink()
+
+        result = self.runner.invoke(cli, ["status"])
+        self.assertIn("1 missing", result.output)
+        self.assertIn("Missing from disk", result.output)
+
+    def test_status_porcelain_codes(self):
+        self._write("data/a.bin", "a")
+        self._write("data/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self._write("data/a.bin", "changed")
+        Path("data/b.bin").unlink()
+
+        result = self.runner.invoke(cli, ["status", "--porcelain"])
+        lines = sorted(result.output.splitlines())
+        self.assertEqual(lines, ["D data/b.bin", "M data/a.bin"])
+
+    def test_status_path_filter(self):
+        self._write("data/a.bin", "a")
+        self._write("other/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "other"])
+
+        result = self.runner.invoke(cli, ["status", "data", "--porcelain", "--all"])
+        self.assertIn("data/a.bin", result.output)
+        self.assertNotIn("other/b.bin", result.output)
+
+    def test_status_with_nothing_tracked(self):
+        result = self.runner.invoke(cli, ["status"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("No files are tracked", result.output)
+
+
+class TestMergeDriver(unittest.TestCase):
+    """The manifest merge driver: union by key, conflict only on real
+    disagreement about the same path."""
+
+    def setUp(self):
+        self.temp_dir = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.runner = CliRunner()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _manifest(self, name, files, **extra):
+        import yaml as _yaml
+
+        path = self.temp_dir / name
+        data = {"bucket_name": "b", "repo_prefix": "p", "files": files}
+        data.update(extra)
+        path.write_text(_yaml.safe_dump(data))
+        return path
+
+    def _merged_files(self):
+        import yaml as _yaml
+
+        return _yaml.safe_load((self.temp_dir / "ours.yaml").read_text())["files"]
+
+    def test_disjoint_additions_merge_cleanly(self):
+        base = self._manifest("base.yaml", {"shared.bin": "h0"})
+        ours = self._manifest("ours.yaml", {"shared.bin": "h0", "a.bin": "ha"})
+        theirs = self._manifest("theirs.yaml", {"shared.bin": "h0", "b.bin": "hb"})
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(
+            self._merged_files(),
+            {"shared.bin": "h0", "a.bin": "ha", "b.bin": "hb"},
+        )
+
+    def test_identical_change_on_both_sides_is_not_a_conflict(self):
+        base = self._manifest("base.yaml", {"a.bin": "h0"})
+        ours = self._manifest("ours.yaml", {"a.bin": "h1"})
+        theirs = self._manifest("theirs.yaml", {"a.bin": "h1"})
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(self._merged_files(), {"a.bin": "h1"})
+
+    def test_one_sided_change_is_taken(self):
+        base = self._manifest("base.yaml", {"a.bin": "h0"})
+        ours = self._manifest("ours.yaml", {"a.bin": "h0"})
+        theirs = self._manifest("theirs.yaml", {"a.bin": "h2"})
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(self._merged_files(), {"a.bin": "h2"})
+
+    def test_one_sided_deletion_is_taken(self):
+        base = self._manifest("base.yaml", {"a.bin": "h0", "b.bin": "hb"})
+        ours = self._manifest("ours.yaml", {"a.bin": "h0", "b.bin": "hb"})
+        theirs = self._manifest("theirs.yaml", {"b.bin": "hb"})
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(self._merged_files(), {"b.bin": "hb"})
+
+    def test_same_path_different_hashes_conflicts(self):
+        base = self._manifest("base.yaml", {"a.bin": "h0"})
+        ours = self._manifest("ours.yaml", {"a.bin": "h1"})
+        theirs = self._manifest("theirs.yaml", {"a.bin": "h2"})
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("a.bin", result.output)
+        # Our side is kept so the file stays a valid manifest to edit
+        self.assertEqual(self._merged_files(), {"a.bin": "h1"})
+
+    def test_json_output_format_from_target_name(self):
+        base = self._manifest("base.yaml", {})
+        ours = self._manifest("ours.yaml", {"a.bin": "ha"})
+        theirs = self._manifest("theirs.yaml", {"b.bin": "hb"})
+
+        result = self.runner.invoke(
+            cli,
+            [
+                "merge-driver",
+                str(base),
+                str(ours),
+                str(theirs),
+                ".s3_manifest.json",
+            ],
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        data = json.loads((self.temp_dir / "ours.yaml").read_text())
+        self.assertEqual(data["files"], {"a.bin": "ha", "b.bin": "hb"})
+
+
+class TestMergeDriverEndToEnd(GitRepoTestCase):
+    """git itself must invoke the driver and merge divergent branches.
+
+    Only the merge driver is registered here, not the hooks: the hooks
+    would shell out to s3lfs for real S3 work in a subprocess that moto
+    does not patch. The merge driver touches no network.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Put an `s3lfs` on PATH for git to invoke as the merge driver.
+        self.bin_dir = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, self.bin_dir, ignore_errors=True)
+        repo_root = Path(__file__).resolve().parent.parent
+        shim = self.bin_dir / "s3lfs"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f'PYTHONPATH="{repo_root}" exec "{sys.executable}" '
+            '-m s3lfs.cli "$@"\n'
+        )
+        shim.chmod(0o755)
+        self.env = dict(os.environ)
+        self.env["PATH"] = f"{self.bin_dir}:{self.env['PATH']}"
+
+        _install_merge_driver(Path(self.temp_dir))
+
+    def _git_with_shim(self, *args):
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            cwd=self.temp_dir,
+            env=self.env,
+        )
+
+    def test_git_merge_unions_divergent_branches(self):
+        self._commit_all("register merge driver")
+        default_branch = self._git("branch", "--show-current").stdout.strip()
+
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        self._git("checkout", "-b", "feature", default_branch + "~1")
+        self._write("data/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data/b.bin"])
+        self._commit_all("track b")
+
+        self._git("checkout", default_branch)
+        merge = self._git_with_shim("merge", "feature", "--no-edit")
+        self.assertEqual(merge.returncode, 0, msg=merge.stdout + merge.stderr)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertIn("data/a.bin", files)
+        self.assertIn("data/b.bin", files)
+
+        # The .gitignore block must union too, and stay a single block
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/data/a.bin", entries)
+        self.assertIn("/data/b.bin", entries)
+        content = Path(".gitignore").read_text()
+        self.assertEqual(content.count(S3LFS_GITIGNORE_START), 1)
+
+    def test_git_merge_reports_real_manifest_conflict(self):
+        """Both branches changing the same path to different content is a
+        genuine conflict and must still stop the merge."""
+        self._write("data/a.bin", "base")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+        default_branch = self._git("branch", "--show-current").stdout.strip()
+
+        self._git("checkout", "-b", "feature")
+        self._write("data/a.bin", "theirs")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("their a")
+
+        self._git("checkout", default_branch)
+        self._write("data/a.bin", "ours")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("our a")
+
+        merge = self._git_with_shim("merge", "feature", "--no-edit")
+        self.assertNotEqual(merge.returncode, 0, "real conflict was silently merged")
+        self.assertIn("data/a.bin", merge.stdout + merge.stderr)
+
+
+class TestGitignoreMerge(unittest.TestCase):
+    """Unit-level checks on the .gitignore three-way merge."""
+
+    def setUp(self):
+        self.temp_dir = Path(os.path.realpath(tempfile.mkdtemp()))
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _side(self, name, text):
+        path = self.temp_dir / name
+        path.write_text(text)
+        return path
+
+    def _block(self, *entries):
+        lines = [S3LFS_GITIGNORE_START, *entries, S3LFS_GITIGNORE_END]
+        return "\n".join(lines) + "\n"
+
+    def test_unions_block_entries(self):
+        base = self._side("base", "*.pyc\n")
+        ours = self._side("ours", "*.pyc\n\n" + self._block("/a.bin"))
+        theirs = self._side("theirs", "*.pyc\n\n" + self._block("/b.bin"))
+
+        merged, conflict = _merge_gitignore(base, ours, theirs)
+
+        self.assertFalse(conflict)
+        self.assertIn("*.pyc", merged)
+        self.assertIn("/a.bin", merged)
+        self.assertIn("/b.bin", merged)
+        self.assertEqual(merged.count(S3LFS_GITIGNORE_START), 1)
+
+    def test_entry_removed_on_one_side_stays_removed(self):
+        base = self._side("base", self._block("/a.bin", "/b.bin"))
+        ours = self._side("ours", self._block("/a.bin", "/b.bin"))
+        theirs = self._side("theirs", self._block("/b.bin"))
+
+        merged, conflict = _merge_gitignore(base, ours, theirs)
+
+        self.assertFalse(conflict)
+        self.assertNotIn("/a.bin", merged)
+        self.assertIn("/b.bin", merged)
+
+    def test_conflicting_user_edits_are_reported(self):
+        base = self._side("base", "shared\n")
+        ours = self._side("ours", "ours-only\n")
+        theirs = self._side("theirs", "theirs-only\n")
+
+        merged, conflict = _merge_gitignore(base, ours, theirs)
+
+        self.assertTrue(conflict, "conflicting user edits should not merge silently")
+        self.assertIn("<<<<<<<", merged)
+
+
+class TestInstallRegistersMergeDriver(GitRepoTestCase):
+    def test_install_writes_gitattributes_and_config(self):
+        result = self.runner.invoke(cli, ["install"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        attributes = Path(".gitattributes").read_text()
+        self.assertIn(".s3_manifest.yaml merge=s3lfs", attributes)
+
+        driver = self._git("config", "merge.s3lfs.driver").stdout.strip()
+        self.assertIn("s3lfs merge-driver", driver)
+
+    def test_uninstall_removes_registration(self):
+        self.runner.invoke(cli, ["install"])
+        result = self.runner.invoke(cli, ["uninstall"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        attributes = Path(".gitattributes")
+        if attributes.exists():
+            self.assertNotIn("merge=s3lfs", attributes.read_text())
+        self.assertEqual(self._git("config", "merge.s3lfs.driver").stdout.strip(), "")
+
+    def test_install_preserves_existing_gitattributes(self):
+        Path(".gitattributes").write_text("*.txt text\n")
+        self.runner.invoke(cli, ["install"])
+        self.runner.invoke(cli, ["uninstall"])
+
+        self.assertIn("*.txt text", Path(".gitattributes").read_text())
+
+
+class TestCloneCommand(GitRepoTestCase):
+    """s3lfs clone: clone + hooks + download in one command."""
+
+    def _make_source_repo(self):
+        self._write("data/a.bin", "payload")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+        return self.temp_dir
+
+    def test_clone_installs_hooks_and_downloads_files(self):
+        source = self._make_source_repo()
+        dest = Path(os.path.realpath(tempfile.mkdtemp())) / "cloned"
+        self.addCleanup(shutil.rmtree, dest.parent, ignore_errors=True)
+
+        result = self.runner.invoke(cli, ["clone", source, str(dest)])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        # The tracked file is gitignored, so it can only be here via S3
+        self.assertTrue((dest / "data/a.bin").exists())
+        self.assertEqual((dest / "data/a.bin").read_text(), "payload")
+        self.assertTrue((dest / ".git/hooks/pre-commit").exists())
+
+    def test_clone_no_checkout_skips_download(self):
+        source = self._make_source_repo()
+        dest = Path(os.path.realpath(tempfile.mkdtemp())) / "cloned"
+        self.addCleanup(shutil.rmtree, dest.parent, ignore_errors=True)
+
+        result = self.runner.invoke(cli, ["clone", source, str(dest), "--no-checkout"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertFalse((dest / "data/a.bin").exists())
+        self.assertTrue((dest / ".git/hooks/pre-commit").exists())
+
+    def test_clone_non_s3lfs_repo_reports_and_stops(self):
+        self._write("readme.txt", "hello")
+        Path(".s3_manifest.yaml").unlink()
+        self._commit_all("plain repo")
+
+        dest = Path(os.path.realpath(tempfile.mkdtemp())) / "cloned"
+        self.addCleanup(shutil.rmtree, dest.parent, ignore_errors=True)
+
+        result = self.runner.invoke(cli, ["clone", self.temp_dir, str(dest)])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("not s3lfs-initialized", result.output)
+        self.assertTrue((dest / "readme.txt").exists())
+
+    def test_clone_restores_cwd(self):
+        source = self._make_source_repo()
+        dest = Path(os.path.realpath(tempfile.mkdtemp())) / "cloned"
+        self.addCleanup(shutil.rmtree, dest.parent, ignore_errors=True)
+
+        before = Path.cwd()
+        self.runner.invoke(cli, ["clone", source, str(dest)])
+        self.assertEqual(Path.cwd(), before)
 
 
 if __name__ == "__main__":

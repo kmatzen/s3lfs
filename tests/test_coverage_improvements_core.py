@@ -103,19 +103,28 @@ class TestCoreCoverageImprovements(unittest.TestCase):
         s3lfs._cache_dirty = True
         s3lfs.save_cache()  # creates the cache file on disk
 
+        # Hold the cache file's existence check True while its stat() fails,
+        # so load_cache reaches the explicit stat() rather than the
+        # file-absent branch. Counting stat() calls instead would depend on
+        # whether Path.exists() is implemented in terms of Path.stat, which
+        # varies by Python version.
         real_stat = Path.stat
-        call_count = {"n": 0}
+        real_exists = Path.exists
 
-        def flaky_stat(self_path, *a, **kw):
+        def failing_stat(self_path, *a, **kw):
             if self_path == s3lfs.cache_file:
-                call_count["n"] += 1
-                # Let exists() (which calls stat() internally) succeed, but
-                # make the explicit stat() call inside load_cache() raise.
-                if call_count["n"] >= 2:
-                    raise OSError("boom")
+                raise OSError("boom")
             return real_stat(self_path, *a, **kw)
 
-        with patch("s3lfs.core.Path.stat", flaky_stat):
+        def always_exists(self_path, *a, **kw):
+            if self_path == s3lfs.cache_file:
+                return True
+            return real_exists(self_path, *a, **kw)
+
+        with (
+            patch("s3lfs.core.Path.stat", failing_stat),
+            patch("s3lfs.core.Path.exists", always_exists),
+        ):
             s3lfs.load_cache(force=True)
         self.assertIsNone(s3lfs._cache_mtime)
 
