@@ -8,7 +8,8 @@ A Python-based version control system for large assets using Amazon S3 and S3-co
 - Works with any S3-compatible storage (MinIO, Cloudflare R2, Backblaze B2, Wasabi)
 - **Block-level parallel transfers**: Downloads and uploads flatten all chunks across all files into a single worker pool
 - **Automatic parallel compression**: Uses pigz when available, falls back to gzip
-- **Git hook integration**: `s3lfs install` sets up post-checkout, post-merge, and pre-push hooks
+- **Git hook integration**: `s3lfs install` sets up pre-commit, post-checkout, post-merge, and pre-push hooks
+- **Accident-proof tracking**: `s3lfs track` gitignores tracked paths and removes them from the git index, so large files can't sneak into git history
 - **Git LFS migration**: One-command migration with `s3lfs migrate-from-lfs`
 - **GitHub Action**: Built-in CI/CD support with selective checkout
 - **Per-repo config**: `.s3lfsconfig` file for team-wide defaults
@@ -70,6 +71,8 @@ s3lfs track data/                        # Track entire directory
 s3lfs track "*.mp4"                      # Track all MP4 files
 s3lfs track --modified                   # Track only changed files
 ```
+
+**Git protection**: Tracking a path also adds it to a marked block in `.gitignore` (so `git add .` won't commit the large files to git) and, if any of the files were already committed to git, removes them from the git index (`git rm --cached`; the files stay on disk). `s3lfs remove` removes the corresponding `.gitignore` entry again.
 
 ### Checkout Files
 ```sh
@@ -156,18 +159,32 @@ s3lfs cleanup
 s3lfs cleanup --force                    # Clean up without confirmation
 ```
 
+### Verify Uploaded Content
+```sh
+s3lfs verify
+s3lfs verify --revision HEAD
+s3lfs verify --revision HEAD --base origin/main
+```
+**Description**: Checks that every manifest entry references content that actually exists in S3, and exits non-zero listing any entries whose content was never uploaded. This is what the pre-push hook runs for each pushed ref.
+
+**Options**:
+- `--revision REV`: Verify the manifest as committed at a git revision (default: the working tree manifest)
+- `--base REV`: Only verify entries added or changed relative to this revision's manifest (used by the pre-push hook to check just the entries the push introduces)
+- `--no-sign-request`, `--endpoint-url`, `--workers`: As in other commands
+
 ### Install Git Hooks
 ```sh
 s3lfs install
 ```
-**Description**: Installs git hooks for transparent s3lfs integration. After installation, tracked files are automatically downloaded after `git checkout` and `git merge`, and modified files are automatically uploaded before `git push`.
+**Description**: Installs git hooks for transparent s3lfs integration. After installation, modified tracked files are automatically uploaded and the manifest staged when you `git commit`, tracked files are automatically downloaded after `git checkout` and `git merge`, and `git push` verifies that every pushed manifest references content that actually exists in S3.
 
 **Installed hooks**:
+- `pre-commit`: Uploads modified tracked files and stages the updated manifest, so each commit's manifest matches the content in S3. Also blocks the commit if an s3lfs-tracked file is staged for commit in git itself.
 - `post-checkout`: Downloads tracked files after branch checkouts
 - `post-merge`: Downloads tracked files after merges
-- `pre-push`: Uploads modified tracked files before push
+- `pre-push`: Verifies the manifests being pushed reference uploaded content (runs `s3lfs verify` for each pushed ref); aborts the push if content is missing
 
-The hooks are non-blocking -- if s3lfs fails or is not available, the git operation continues with a warning. Hooks are appended to existing hook files, preserving any other hooks you have.
+The post-* hooks are non-blocking -- if s3lfs fails or is not available, the git operation continues with a warning. The pre-commit and pre-push hooks abort their git operation on failure (bypass with `--no-verify`), because committing or pushing a manifest whose hashes have no objects behind them breaks every collaborator's checkout. Hooks are appended to existing hook files, preserving any other hooks you have.
 
 ### Uninstall Git Hooks
 ```sh
@@ -220,7 +237,7 @@ For a Git LFS-like experience where files sync automatically:
 ```sh
 s3lfs install
 ```
-With hooks installed, `git pull` and `git checkout` automatically download tracked files, and `git push` automatically uploads modified files.
+With hooks installed, `git commit` automatically uploads modified tracked files and stages the manifest, `git pull` and `git checkout` automatically download tracked files, and `git push` verifies the pushed manifests reference uploaded content.
 
 ### 2. Track Large Files
 Instead of committing large files directly to Git, track them with S3LFS:
@@ -229,14 +246,16 @@ s3lfs track data/large_dataset.zip
 s3lfs track models/
 s3lfs track "*.mp4"
 ```
+Tracking uploads the files to S3, adds the paths to `.gitignore` so they can't be committed to git by accident, and removes them from the git index if they were previously committed (the files stay on disk).
 
 ### 3. Commit Changes
-After tracking files, commit the updated manifest:
+After tracking files, commit the updated manifest and `.gitignore`:
 ```sh
-git add .s3_manifest.yaml
+git add .s3_manifest.yaml .gitignore
 git commit -m "Track large files with S3LFS"
 git push
 ```
+With hooks installed, the pre-commit hook re-uploads any modified tracked files and stages the manifest for you, so `git commit` is enough for day-to-day changes.
 
 ### 4. Clone and Restore Files
 When cloning the repository, restore tracked files:

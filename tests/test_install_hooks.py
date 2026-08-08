@@ -199,14 +199,14 @@ class TestInstallCommand(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_install_creates_all_hooks(self):
-        """Install command creates post-merge, post-checkout, and pre-push hooks."""
+        """Install command creates post-merge, post-checkout, pre-commit, and pre-push hooks."""
         runner = CliRunner()
         result = runner.invoke(cli, ["install"])
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         hooks_dir = Path(self.temp_dir) / ".git" / "hooks"
-        for hook_name in ["post-merge", "post-checkout", "pre-push"]:
+        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
             hook_path = hooks_dir / hook_name
             self.assertTrue(hook_path.exists(), f"{hook_name} not created")
             content = hook_path.read_text()
@@ -220,6 +220,7 @@ class TestInstallCommand(unittest.TestCase):
 
         self.assertIn("post-merge", result.output)
         self.assertIn("post-checkout", result.output)
+        self.assertIn("pre-commit", result.output)
         self.assertIn("pre-push", result.output)
 
     def test_install_fails_without_manifest(self):
@@ -280,9 +281,9 @@ class TestInstallCommand(unittest.TestCase):
     def test_pre_push_aborts_on_failure(self):
         """pre-push is the last point at which a bad push can be stopped.
 
-        It uploads the content the manifest being pushed refers to; letting
-        the push proceed after a failed upload publishes a manifest whose
-        hashes have no objects behind them.
+        It verifies the manifests being pushed reference uploaded content;
+        letting the push proceed after a failed verification publishes a
+        manifest whose hashes have no objects behind them.
         """
         runner = CliRunner()
         runner.invoke(cli, ["install"])
@@ -290,12 +291,21 @@ class TestInstallCommand(unittest.TestCase):
         content = (Path(self.temp_dir) / ".git" / "hooks" / "pre-push").read_text()
         self.assertIn("exit 1", content)
 
+    def test_pre_commit_aborts_on_failure(self):
+        """pre-commit uploads the content the commit's manifest refers to;
+        a failed upload must abort the commit."""
+        runner = CliRunner()
+        runner.invoke(cli, ["install"])
+
+        content = (Path(self.temp_dir) / ".git" / "hooks" / "pre-commit").read_text()
+        self.assertIn("exit 1", content)
+
     def test_hooks_check_s3lfs_exists(self):
         """Hook scripts check that s3lfs command exists before running."""
         runner = CliRunner()
         runner.invoke(cli, ["install"])
 
-        for hook_name in ["post-merge", "post-checkout", "pre-push"]:
+        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
             hook_path = Path(self.temp_dir) / ".git" / "hooks" / hook_name
             content = hook_path.read_text()
             self.assertIn("command -v s3lfs", content)
@@ -332,7 +342,7 @@ class TestUninstallCommand(unittest.TestCase):
         self.assertIn("Removed", result.output)
 
         hooks_dir = Path(self.temp_dir) / ".git" / "hooks"
-        for hook_name in ["post-merge", "post-checkout", "pre-push"]:
+        for hook_name in ["post-merge", "post-checkout", "pre-commit", "pre-push"]:
             hook_path = hooks_dir / hook_name
             if hook_path.exists():
                 content = hook_path.read_text()

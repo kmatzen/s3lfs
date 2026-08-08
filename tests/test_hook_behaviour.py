@@ -10,12 +10,20 @@ from s3lfs.cli import HOOK_SCRIPTS, _install_hook, _uninstall_hook
 
 
 class TestHookExitStatus(unittest.TestCase):
-    """pre-push must abort the push when tracking fails.
+    """The blocking hooks must abort their git operation when s3lfs fails.
 
-    pre-push uploads the content the manifest being pushed refers to. If the
-    upload fails and the push proceeds, collaborators fetch a manifest whose
+    pre-commit uploads the content the commit's manifest refers to, and
+    pre-push verifies pushed manifests reference uploaded content. Letting
+    either git operation proceed after a failure publishes a manifest whose
     hashes have no objects behind them.
     """
+
+    # A pre-push hook receives one "<local_ref> <local_sha> <remote_ref>
+    # <remote_sha>" line per ref being pushed on stdin.
+    PUSH_REF_LINE = (
+        "refs/heads/main aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+        "refs/heads/main bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+    )
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -39,7 +47,7 @@ class TestHookExitStatus(unittest.TestCase):
         env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
         return env
 
-    def _run_hook(self, hook_name, exit_code, args=()):
+    def _run_hook(self, hook_name, exit_code, args=(), stdin=""):
         env = self._fake_s3lfs(exit_code)
         hook_path = _install_hook(self.hooks_dir, hook_name, HOOK_SCRIPTS[hook_name])
         return subprocess.run(
@@ -47,17 +55,40 @@ class TestHookExitStatus(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            input=stdin,
         )
 
-    def test_pre_push_fails_when_track_fails(self):
-        result = self._run_hook("pre-push", exit_code=1)
+    def test_pre_push_fails_when_verify_fails(self):
+        result = self._run_hook("pre-push", exit_code=1, stdin=self.PUSH_REF_LINE)
         self.assertNotEqual(
-            result.returncode, 0, "pre-push masked a failed track and allowed the push"
+            result.returncode,
+            0,
+            "pre-push masked a failed verification and allowed the push",
         )
         self.assertIn("aborting push", result.stderr)
 
-    def test_pre_push_succeeds_when_track_succeeds(self):
-        result = self._run_hook("pre-push", exit_code=0)
+    def test_pre_push_succeeds_when_verify_succeeds(self):
+        result = self._run_hook("pre-push", exit_code=0, stdin=self.PUSH_REF_LINE)
+        self.assertEqual(result.returncode, 0)
+
+    def test_pre_push_skips_deleted_refs(self):
+        """Deleting a remote branch pushes a zero local sha; nothing to verify."""
+        zero = "0" * 40
+        line = f"(delete) {zero} refs/heads/gone bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+        result = self._run_hook("pre-push", exit_code=1, stdin=line)
+        self.assertEqual(result.returncode, 0)
+
+    def test_pre_commit_fails_when_s3lfs_fails(self):
+        result = self._run_hook("pre-commit", exit_code=1)
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "pre-commit masked a failed upload and allowed the commit",
+        )
+        self.assertIn("aborting commit", result.stderr)
+
+    def test_pre_commit_succeeds_when_s3lfs_succeeds(self):
+        result = self._run_hook("pre-commit", exit_code=0)
         self.assertEqual(result.returncode, 0)
 
     def test_post_merge_does_not_fail_the_merge(self):
