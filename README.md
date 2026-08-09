@@ -11,6 +11,7 @@ A Python-based version control system for large assets using Amazon S3 and S3-co
 - **Git hook integration**: `s3lfs install` sets up pre-commit, post-checkout, post-merge, post-rewrite, and pre-push hooks
 - **Accident-proof tracking**: `s3lfs track` gitignores tracked paths and removes them from the git index, so large files can't sneak into git history
 - **Sparse checkouts**: applies your `git sparse-checkout` rules to tracked files, so a working copy only materializes its slice of a large repository
+- **Sharded manifest**: `s3lfs shard` splits the manifest by directory and reads only the shards you touch -- opening a 200,000-entry manifest drops from 1.1s to 20ms ([details](#performance))
 - **Cheap branch switches**: `s3lfs sync` diffs the manifest between revisions and transfers only what changed
 - **Conflict-free manifests**: a git merge driver unions concurrent changes to the manifest and `.gitignore`
 - **One-command setup**: `s3lfs clone` clones, installs hooks, and downloads tracked files
@@ -214,7 +215,7 @@ s3lfs shard --undo
 
 Commit the shards -- they *are* the manifest. `s3lfs` keeps `.s3lfs_manifest/` inside your sparse-checkout cone if you use one: a working copy that cannot read the manifest does not know what is tracked.
 
-Shards are read on demand. Looking up one path parses one shard, and a sparse working copy never opens the shards its profile cannot reach. On a 200,000-entry manifest across 100 shards, `s3lfs status` in a checkout covering one directory takes 0.32s instead of 6.8s. `s3lfs install` registers the merge driver for them, and the pre-commit hook stages them alongside the root file.
+Shards are read on demand: looking up one path parses one shard, and a sparse working copy never opens the shards its profile cannot reach. See [Performance](#performance) for what that costs at scale. `s3lfs install` registers the merge driver for them, and the pre-commit hook stages them alongside the root file.
 
 **Options**:
 - `--undo`: Merge the shards back into a single manifest file
@@ -588,6 +589,59 @@ Files with identical content (same hash) are stored only once in S3, regardless 
 S3LFS supports both SHA-256 (default) and MD5 hashing:
 - SHA-256: More secure, used for file integrity
 - MD5: Available for compatibility with legacy systems
+
+## Performance
+
+The manifest is the one thing every command reads, so its size sets a floor on
+how fast anything can be. Sharding splits it by top-level directory and shards
+are read only when something touches a key in them.
+
+Measured on a synthetic manifest of 200,000 entries spread over 100
+directories (18.8 MB), Apple silicon, Python 3.14, PyYAML with libyaml:
+
+| | single file | sharded |
+|---|---|---|
+| open the manifest | 1,103 ms | **20 ms** |
+| look up one path | — (already loaded) | 8 ms |
+| read 5 of 100 directories | — (not possible) | **43 ms** |
+| read every entry | 1,182 ms | 901 ms |
+
+Reproduce it with:
+
+```sh
+python benchmarks/manifest_scaling.py            # 200,000 entries, 100 shards
+python benchmarks/manifest_scaling.py 50000 25   # or pick your own
+```
+
+A single file has to be parsed in full before any command can start, so
+opening it is the floor for `status`, `ls`, `sync` and every hook. Sharding
+removes that floor: you pay only for the directories you touch. Reading
+*everything* is still roughly the same work either way, because it is the same
+bytes -- sharding does not make a full scan cheaper, it makes a full scan
+unnecessary.
+
+End to end, in a working copy whose sparse profile covers 1 of those 100
+directories:
+
+```
+s3lfs status  (no sparse profile, 200,000 entries)   6,787 ms
+s3lfs status  (sparse, 2,000 entries in profile)       304 ms
+```
+
+Two related effects worth knowing:
+
+- **Git history.** A flat manifest is rewritten in full by every `track`, so
+  each commit that touches one asset adds another whole copy of it to history.
+  With shards, only the affected directory's file changes -- about 190 KB
+  instead of 18.8 MB in the example above.
+- **The YAML parser.** s3lfs uses the libyaml-backed loader when PyYAML
+  provides it, which is roughly 8x faster than the pure-Python one (4.31s vs
+  0.50s to parse a 100,000-entry manifest). Nothing to configure; installing
+  a PyYAML wheel built with libyaml is enough.
+
+If your manifest is small, none of this matters and a single file is simpler.
+Sharding earns its keep somewhere in the tens of thousands of entries, or
+sooner if you commit assets often and care about repository size.
 
 ## Correctness
 
