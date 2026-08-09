@@ -536,6 +536,7 @@ endpoint_url: https://minio.internal:9000
 workers: 16
 no_sign_request: true
 use_acceleration: false
+encryption: false  # MinIO without KMS rejects the SSE header
 ```
 
 When `.s3lfsconfig` exists, its values are used as defaults for all commands. CLI flags still override config values - for example, `s3lfs track --no-sign-request` always uses unsigned requests regardless of the config.
@@ -546,6 +547,7 @@ When `.s3lfsconfig` exists, its values are used as defaults for all commands. CL
 - `endpoint_url`: S3-compatible endpoint for the whole team (default: none, i.e. AWS)
 - `workers`: Parallel worker count (default: auto-detected from CPU count)
 - `compression`: `auto` (sample each file; store incompressible ones raw), `always`, or `never`
+- `encryption`: AES256 server-side encryption on uploads (default: `true`). Set to `false` for MinIO and other S3-compatibles without KMS, which reject the SSE header and fail every upload with `NotImplemented`
 
 Unrecognised keys are reported rather than ignored -- a misspelled setting that changes where your data goes should not fail silently.
 
@@ -643,8 +645,8 @@ The manifest is the one thing every command reads, so its size sets a floor on
 how fast anything can be. Sharding splits it by top-level directory and shards
 are read only when something touches a key in them.
 
-Measured on a synthetic manifest of 200,000 entries spread over 100
-directories (18.8 MB), Apple silicon, Python 3.14, PyYAML with libyaml:
+Measured August 2026 on a synthetic manifest of 200,000 entries spread over
+100 directories (18.8 MB), Apple silicon, Python 3.14, PyYAML with libyaml:
 
 | | single file | sharded |
 |---|---|---|
@@ -659,6 +661,14 @@ Reproduce it with:
 python benchmarks/manifest_scaling.py            # 200,000 entries, 100 shards
 python benchmarks/manifest_scaling.py 50000 25   # or pick your own
 ```
+
+Both benchmark scripts also run in CI on every pull request. The manifest
+one gates the build: `--check` asserts that sharding still beats a flat
+manifest by a wide ratio (ratios hold on any machine speed, so the guard
+does not flake with runner load). The transfer comparison publishes its
+table to the job summary for trend-watching; it runs against localhost
+MinIO there, which overstates per-file costs, so the numbers below from
+real S3 remain the ones to quote.
 
 A single file has to be parsed in full before any command can start, so
 opening it is the floor for `status`, `ls`, `sync` and every hook. Sharding
@@ -699,8 +709,8 @@ Two related effects worth knowing:
 
 ### Against a raw copy tool, on real S3
 
-Transferring 24 files (201 MB) to and from AWS S3 us-west-2, versus s5cmd
-v2.3.0 (`benchmarks/transfer_comparison.py`):
+Measured 2026-08-08: transferring 24 files (201 MB) to and from AWS S3
+us-west-2, versus s5cmd v2.3.0 (`benchmarks/transfer_comparison.py`):
 
 | scenario | s3lfs | s5cmd |
 |---|---|---|

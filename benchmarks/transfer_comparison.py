@@ -91,6 +91,12 @@ def main():
         action="store_true",
         help="Skip download scenarios (for write-only credentials)",
     )
+    ap.add_argument(
+        "--no-encryption",
+        action="store_true",
+        help="Disable SSE (needed for MinIO and other S3-compatibles "
+        "without KMS, which reject the AES256 header)",
+    )
     args = ap.parse_args()
 
     env = dict(os.environ)
@@ -116,8 +122,13 @@ def main():
         init = run(
             s3lfs + ["init", args.bucket, args.prefix] + endpoint, cwd=root, env=env
         )
+        config_lines = []
         if args.workers:
-            (root / ".s3lfsconfig").write_text(f"workers: {args.workers}\n")
+            config_lines.append(f"workers: {args.workers}")
+        if args.no_encryption:
+            config_lines.append("encryption: false")
+        if config_lines:
+            (root / ".s3lfsconfig").write_text("\n".join(config_lines) + "\n")
         if init.returncode != 0:
             print("s3lfs init failed:\n" + init.stdout + init.stderr)
             return 1
@@ -218,16 +229,21 @@ def main():
             )
 
         print(f"{'scenario':38} {'wall clock':>10}   status")
+        failed = 0
         for label, elapsed, proc in results:
             status = "ok" if proc.returncode == 0 else f"FAILED rc={proc.returncode}"
             print(f"{label:38} {human(elapsed)}   {status}")
             if proc.returncode != 0:
-                tail = (proc.stdout + proc.stderr).strip().splitlines()[-2:]
+                failed += 1
+                tail = (proc.stdout + proc.stderr).strip().splitlines()[-4:]
                 for line in tail:
                     print(f"    | {line[:110]}")
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    return 0
+    # The timings are informational; a scenario that did not run is not.
+    # A failed cold upload turns every later scenario into a no-op on an
+    # empty manifest, so the whole table is fiction -- say so loudly.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

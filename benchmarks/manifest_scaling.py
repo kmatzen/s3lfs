@@ -5,6 +5,11 @@ every s3lfs command depends on. Reproduces the table in the README:
 
     python benchmarks/manifest_scaling.py            # 200,000 entries
     python benchmarks/manifest_scaling.py 50000 25   # entries, shards
+
+With --check, exits non-zero unless sharding still pays for itself. The
+assertions compare sharded against single-file timings from the same run,
+so they hold on any machine speed; only the ratio matters. CI runs this on
+every pull request.
 """
 
 import hashlib
@@ -73,6 +78,7 @@ def measure(entries, shards):
     )
     print(f"{entries:,} entries over {shards} directories\n")
 
+    results = {}
     for sharded in (False, True):
         root = Path(tempfile.mkdtemp())
         try:
@@ -98,6 +104,12 @@ def measure(entries, shards):
             if sharded:
                 subset = [f"dir{i:03d}" for i in range(max(1, shards // 20))]
                 slice_time, _ = timed(lambda: make().manifest["files"].preload(subset))
+            results[label] = {
+                "open": open_time,
+                "lookup": lookup,
+                "full": full,
+                "slice": slice_time,
+            }
 
             print(f"  {label:12}  {size:6.1f} MB on disk")
             print(f"    open manifest        {open_time * 1000:8.1f} ms")
@@ -110,9 +122,33 @@ def measure(entries, shards):
             print(f"    read every entry     {full * 1000:8.1f} ms\n")
         finally:
             shutil.rmtree(root, ignore_errors=True)
+    return results
+
+
+def check(results):
+    """Ratio-based regression guard: sharding must still pay for itself.
+
+    Thresholds sit far below the measured ratios (~55x open, ~25x slice)
+    so runner noise cannot trip them; tripping means the lazy-loading
+    machinery actually broke.
+    """
+    single, sharded = results["single file"], results["sharded"]
+    checks = [
+        ("sharded open vs full parse", single["open"] / sharded["open"], 5.0),
+        ("partial read vs full read", single["full"] / sharded["slice"], 3.0),
+    ]
+    failed = False
+    for name, ratio, floor in checks:
+        verdict = "ok" if ratio >= floor else "REGRESSION"
+        failed |= ratio < floor
+        print(f"  {name:28} {ratio:6.1f}x (floor {floor}x)  {verdict}")
+    return not failed
 
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 200_000
-    k = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    measure(n, k)
+    argv = [a for a in sys.argv[1:] if a != "--check"]
+    n = int(argv[0]) if argv else 200_000
+    k = int(argv[1]) if len(argv) > 1 else 100
+    results = measure(n, k)
+    if "--check" in sys.argv and not check(results):
+        raise SystemExit(1)

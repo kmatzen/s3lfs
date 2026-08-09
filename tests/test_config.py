@@ -309,6 +309,31 @@ class TestConfigKeysTeamsNeed(unittest.TestCase):
         self.assertEqual(config["endpoint_url"], "http://minio.internal:9000")
         self.assertEqual(config["workers"], 4)
 
+    def test_encryption_false_is_loaded(self):
+        """MinIO without KMS rejects the SSE header, so a team on MinIO
+        needs encryption: false to be honoured -- the CLI has no flag
+        for it."""
+        (self.temp_dir / ".s3lfsconfig").write_text("encryption: false\n")
+        config = load_config(self.temp_dir)
+        self.assertIs(config["encryption"], False)
+
+    def test_encryption_config_reaches_s3lfs(self):
+        from s3lfs.cli import _make_s3lfs
+
+        (self.temp_dir / ".s3lfsconfig").write_text("encryption: false\n")
+        with patch("s3lfs.cli.S3LFS") as mock_cls:
+            _make_s3lfs(self.temp_dir, self.temp_dir / ".s3_manifest.yaml")
+        self.assertIs(mock_cls.call_args[1]["encryption"], False)
+
+    def test_encryption_defaults_to_on(self):
+        """No config value must not pass encryption at all, leaving the
+        S3LFS constructor default (on) in charge."""
+        from s3lfs.cli import _make_s3lfs
+
+        with patch("s3lfs.cli.S3LFS") as mock_cls:
+            _make_s3lfs(self.temp_dir, self.temp_dir / ".s3_manifest.yaml")
+        self.assertNotIn("encryption", mock_cls.call_args[1])
+
     def test_unknown_keys_are_reported(self):
         (self.temp_dir / ".s3lfsconfig").write_text("endpint_url: typo\n")
         with patch("builtins.print") as mock_print:

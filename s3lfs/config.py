@@ -24,6 +24,11 @@ DEFAULTS = {
     "endpoint_url": None,
     "workers": None,
     "compression": None,
+    # AES256 server-side encryption on uploads. MinIO and some other
+    # S3-compatibles reject the SSE header unless KMS is configured, which
+    # makes every upload fail with NotImplemented; those repos need
+    # "encryption: false" here since encryption is otherwise on.
+    "encryption": None,
 }
 
 
