@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- A sharded manifest is now read one shard at a time. Constructing `S3LFS` parses no shards at all; looking up or writing a path parses that path's shard only; iterating still parses everything, because that is what the caller asked for. On a 200,000-entry manifest across 100 shards (18.4 MB): construction went from parsing all of it to 0 shards, a single lookup reads 1 shard in 10 ms, and a three-shard slice costs 24 ms against 861 ms for the whole manifest.
+- Sparse working copies read only the shards their profile can reach. `s3lfs status` in a checkout covering 1 of 100 directories went from 6.8 s to 0.32 s -- 21x -- because the other 99 shards are never opened.
+
+### Fixed
+- Enabling a git sparse checkout removed the entire sharded manifest from the working copy, and s3lfs then reported that nothing was tracked at all. Shards are git-tracked files under a directory, so any cone that does not name that directory excludes them. s3lfs now keeps the shard directory inside the cone, detecting exclusion with git's own matcher rather than by looking at the disk -- the files can still be present from before the rules changed, and git removes them the next time it applies them.
+
 ## [0.4.1] - 2026-08-08
 
 ### Fixed
