@@ -230,9 +230,16 @@ def track(
     )
 
     if modified:
-        # Track only modified files using cached version for better performance
+        # Only walk what this working copy materializes. Out-of-profile
+        # files are absent by design, and examining them would both cost
+        # the size of the whole repository and risk reading a deliberate
+        # absence as a deletion.
+        profile = _sparse_profile(git_root)
+        tracked = s3lfs.manifest.get("files", {})
         s3lfs.track_modified_files_cached(
-            silence=not verbose, prune_deleted=prune_deleted
+            silence=not verbose,
+            keys=profile.select(tracked) if profile.active else None,
+            prune_deleted=prune_deleted,
         )
     elif manifest_key:
         # FILESYSTEM GLOB: Find files on disk and upload them
@@ -516,6 +523,7 @@ def sync(
         recoverable = _recoverable(s3lfs, on_disk)
         removed = 0
         failed = []
+        pruned = []
         for key in sorted(to_remove):
             if on_disk.get(key) is None:
                 continue
@@ -528,6 +536,7 @@ def sync(
             filesystem_path = path_resolver.to_filesystem_path(key)
             try:
                 filesystem_path.unlink()
+                pruned.append(key)
             except OSError as e:
                 # Keep going: a partial prune that reports what it could not
                 # remove beats stopping halfway with no summary.
@@ -543,6 +552,9 @@ def sync(
             click.echo(f"Could not remove {len(failed)} file(s):")
             for message in failed:
                 click.echo(f"  {message}")
+        # s3lfs removed these, not the user, so they must not read as
+        # deletions on the next scan.
+        s3lfs.forget_hashes(pruned)
 
 
 @cli.command()

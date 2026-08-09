@@ -52,6 +52,12 @@ DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 MANIFEST_SHARD_DIR = ".s3lfs_manifest"
 MANIFEST_ROOT_SHARD = "_root"
 
+# Bulk-absence guard for deletion detection: more than this many missing
+# files, and more than this fraction of those checked, reads as a wiped
+# working copy rather than a set of deliberate deletions.
+BULK_DELETION_FLOOR = 5
+BULK_DELETION_FRACTION = 0.5
+
 try:
     # The libyaml-backed loader parses and emits roughly an order of
     # magnitude faster than the pure-Python one. Every command reads the
@@ -1269,6 +1275,29 @@ class S3LFS:
 
         return hashes
 
+    def forget_hashes(self, keys):
+        """Drop cache entries for files s3lfs itself removed from disk.
+
+        The cache doubles as the record of what this working copy has held,
+        which is how a file the user deleted is told apart from one that was
+        never materialized here. A file s3lfs prunes -- because it left the
+        sparse profile, say -- is neither: leaving its entry behind would
+        make the next scan read it as a user deletion and untrack it for
+        everyone.
+        """
+        keys = [str(Path(k).as_posix()) for k in keys]
+        if not keys:
+            return
+        with self._lock_context():
+            self.load_cache()
+            changed = False
+            for key in keys:
+                if self.hash_cache.pop(key, None) is not None:
+                    changed = True
+            if changed:
+                self._cache_dirty = True
+                self.save_cache()
+
     def record_hashes(self, entries):
         """Record known hashes for files currently on disk.
 
@@ -1422,7 +1451,26 @@ class S3LFS:
                 f"Hash cache performance: " f"{cache_hits} hits, {cache_misses} misses"
             )
 
-        if deleted and prune_deleted:
+        # A wiped working copy is not a deletion. `git clean -xfd` removes
+        # every gitignored file, which is every tracked file; so does a
+        # stale cache after a manual rm -rf. Untracking in bulk is almost
+        # never what someone meant and takes the entries away from everyone,
+        # so past a threshold this refuses and asks for an explicit removal.
+        bulk = len(deleted) > BULK_DELETION_FLOOR and len(deleted) > (
+            len(files_to_check) * BULK_DELETION_FRACTION
+        )
+        if deleted and prune_deleted and bulk:
+            print(
+                f"WARNING: {len(deleted)} of {len(files_to_check)} tracked "
+                "file(s) are missing -- that looks like a wiped working copy, "
+                "not a deletion."
+            )
+            print(
+                "Nothing was untracked. Restore them with 's3lfs checkout "
+                "--all', or if you really meant to stop tracking them, use "
+                "'s3lfs remove <path>'."
+            )
+        elif deleted and prune_deleted:
             with self._lock_context():
                 self.load_manifest()
                 for file_path in deleted:
