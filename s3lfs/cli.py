@@ -415,7 +415,13 @@ def checkout(
         wanted, skipped = profile.partition(dict(_manifest_files(s3lfs, profile)))
         if skipped:
             click.echo(f"Skipping {len(skipped)} file(s) outside your sparse profile.")
-        s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
+        failed = s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
+        if failed:
+            click.echo(
+                f"Error: {failed} file(s) could not be downloaded. The "
+                "working copy is incomplete."
+            )
+            raise SystemExit(1)
     elif manifest_key:
         # MANIFEST GLOB: Find files in manifest and download them
         # The manifest_key is matched against manifest entries (files may not exist on disk)
@@ -563,9 +569,12 @@ def sync(
                 f"No manifest available at {from_revision}; "
                 "falling back to a full checkout."
             )
-        s3lfs.parallel_download_all(
+        failed = s3lfs.parallel_download_all(
             silence=not verbose, only=set(wanted), preserve_modified=not force
         )
+        if failed:
+            click.echo(f"Error: {failed} file(s) could not be downloaded.")
+            raise SystemExit(1)
     else:
         changed = {k: h for k, h in wanted.items() if previous.get(k) != h}
         if not changed and not to_remove:
@@ -607,7 +616,12 @@ def sync(
 
             if to_download:
                 click.echo(f"Downloading {len(to_download)} changed file(s)...")
-                s3lfs.parallel_download_chunked(to_download, silence=not verbose)
+                failed = s3lfs.parallel_download_chunked(
+                    to_download, silence=not verbose
+                )
+                if failed:
+                    click.echo(f"Error: {failed} file(s) could not be downloaded.")
+                    raise SystemExit(1)
             elif not locally_modified:
                 click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
 
