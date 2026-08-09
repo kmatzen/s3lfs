@@ -79,7 +79,9 @@ s3lfs track --modified                   # Track only changed files
 
 **Git protection**: Tracking a path also adds it to a marked block in `.gitignore` (so `git add .` won't commit the large files to git) and, if any of the files were already committed to git, removes them from the git index (`git rm --cached`; the files stay on disk). `s3lfs remove` removes the corresponding `.gitignore` entries again.
 
-A literal path or directory becomes one `.gitignore` entry per tracked file, not a blanket `/dir/` pattern -- so a source file added under a tracked directory later stays visible to git rather than being silently ignored by one tool and untracked by the other. A glob spec (`"*.mp4"`) is used as-is, since it is already precise.
+A directory becomes a single `/dir/` pattern, a file becomes one entry, and a glob (`"*.mp4"`) is used as-is. One entry per tracked file would be more precise, but git matches every candidate path against every pattern with no pruning, so the cost is quadratic -- at 100,000 tracked files a per-file block took `git status` from 17ms to 70s.
+
+The precision that buys is recovered elsewhere: because a directory pattern also hides anything put there later, `s3lfs status` and the pre-commit hook report files under a tracked directory that s3lfs is *not* tracking. Such a file would otherwise be invisible to git and absent from the manifest -- present on one machine and gone on the next clone. The check on every commit is bounded by directory mtime, so it costs ~70ms over 100,000 files rather than a full walk.
 
 ### Checkout Files
 ```sh

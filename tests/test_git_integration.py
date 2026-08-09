@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -159,12 +160,12 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         check = self._git("check-ignore", "data/big.bin")
         self.assertEqual(check.returncode, 0, "tracked file is not gitignored")
 
-    def test_track_directory_ignores_each_tracked_file(self):
-        """A directory spec must not ignore the directory wholesale.
+    def test_track_directory_uses_one_directory_pattern(self):
+        """One pattern, not one per file.
 
-        `/data/` would hide any source file added there later from git,
-        while s3lfs would not be tracking it either -- the file would live
-        on one machine only.
+        git matches every candidate path against every pattern with no
+        pruning, so a per-file block is quadratic: at 100,000 tracked files
+        it took `git status` from 17ms to 70s.
         """
         self._write("data/a.bin", "a")
         self._write("data/sub/b.bin", "b")
@@ -172,16 +173,47 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, ["/data/a.bin", "/data/sub/b.bin"])
+        self.assertEqual(entries, ["/data/"])
         self.assertEqual(self._git("check-ignore", "data/sub/b.bin").returncode, 0)
 
-        # A file added under the tracked directory afterwards stays visible
+    def test_a_file_added_under_a_tracked_directory_is_reported(self):
+        """The directory pattern hides anything put there later, so s3lfs
+        reports what it is hiding but not tracking -- otherwise the file is
+        invisible to both systems and lost on the next clone."""
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data"])
+
         self._write("data/schema.json", "{}")
-        self.assertNotEqual(
+        self.assertEqual(
             self._git("check-ignore", "data/schema.json").returncode,
             0,
-            "a newly added source file was hidden from git",
+            "the directory pattern should hide it from git",
         )
+
+        result = self.runner.invoke(cli, ["status"])
+        self.assertIn("data/schema.json", result.output)
+        self.assertIn("exist only here", result.output)
+
+    def test_editor_droppings_are_not_reported(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data"])
+        self._write("data/.DS_Store", "junk")
+        self._write("data/x.tmp", "junk")
+
+        result = self.runner.invoke(cli, ["status"])
+        self.assertNotIn(".DS_Store", result.output)
+        self.assertNotIn("x.tmp", result.output)
+
+    def test_pre_commit_warns_about_hidden_untracked_files(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data"])
+        self._commit_all("track data")
+        self._write("data/schema.json", "{}")
+
+        result = self.runner.invoke(cli, ["pre-commit"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("data/schema.json", result.output)
+        self.assertIn("only on this machine", result.output)
 
     def test_track_glob_keeps_the_glob(self):
         """A glob is already precise, so it is used as-is."""
@@ -200,14 +232,14 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         matches nothing, so the file would stay visible to git and get
         committed -- the outcome the .gitignore block exists to prevent.
         """
-        self._write("data/runs[2024]/a.bin", "a")
-        result = self.runner.invoke(cli, ["track", "data"])
+        self._write("runs[2024]/a.bin", "a")
+        result = self.runner.invoke(cli, ["track", "runs[2024]/a.bin"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, [r"/data/runs\[2024\]/a.bin"])
+        self.assertEqual(entries, [r"/runs\[2024\]/a.bin"])
         self.assertEqual(
-            self._git("check-ignore", "data/runs[2024]/a.bin").returncode,
+            self._git("check-ignore", "runs[2024]/a.bin").returncode,
             0,
             "tracked file under a bracketed directory is not ignored",
         )
@@ -1427,3 +1459,54 @@ class TestLazyShardLoading(GitRepoTestCase):
 
         self.assertIn("alpha/new.bin", Path(".s3lfs_manifest/alpha.yaml").read_text())
         self.assertEqual(untouched.stat().st_mtime_ns, stamp)
+
+
+class TestHiddenFileScanCost(GitRepoTestCase):
+    """The scan that replaces per-file .gitignore entries runs on every
+    commit, so it is bounded by directory mtime: adding a file updates its
+    directory, which is far cheaper to check than every file."""
+
+    def test_bounded_scan_skips_unchanged_directories(self):
+        self._write("data/a.bin", "a")
+        self._write("data/deep/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+
+        from s3lfs.cli import _hidden_untracked_files
+        from s3lfs.core import S3LFS
+
+        s3lfs = S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+        tracked = set(s3lfs.manifest["files"])
+        root = Path(self.temp_dir)
+
+        # Nothing added since: a bounded scan finds nothing.
+        future = time.time() + 60
+        self.assertEqual(
+            _hidden_untracked_files(root, s3lfs, tracked, since=future), []
+        )
+
+        # A file added afterwards updates its directory's mtime.
+        self._write("data/deep/schema.json", "{}")
+        found = _hidden_untracked_files(root, s3lfs, tracked, since=0)
+        self.assertIn("data/deep/schema.json", found)
+
+    def test_unbounded_scan_finds_it_too(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data"])
+        self._write("data/notes.md", "notes")
+
+        from s3lfs.cli import _hidden_untracked_files
+        from s3lfs.core import S3LFS
+
+        s3lfs = S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+        found = _hidden_untracked_files(
+            Path(self.temp_dir), s3lfs, set(s3lfs.manifest["files"])
+        )
+        self.assertEqual(found, ["data/notes.md"])
