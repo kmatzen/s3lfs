@@ -57,6 +57,12 @@ MANIFEST_ROOT_SHARD = "_root"
 # files, and more than this fraction of those checked, reads as a wiped
 # working copy rather than a set of deliberate deletions.
 BULK_DELETION_FLOOR = 5
+
+# Adaptive compression: gzip a sample from the head of each file and store
+# the object raw unless compressing saves at least this fraction.
+COMPRESSION_SAMPLE_BYTES = 256 * 1024
+COMPRESSION_SAMPLE_LEVEL = 1
+COMPRESSION_MIN_SAVINGS_RATIO = 0.9
 BULK_DELETION_FRACTION = 0.5
 
 try:
@@ -295,6 +301,7 @@ class S3LFS:
         use_acceleration=False,
         endpoint_url=None,
         workers=None,
+        compression="auto",
     ):
         """
         :param bucket_name: Name of the S3 bucket (can be stored in manifest)
@@ -313,6 +320,11 @@ class S3LFS:
         self.use_acceleration = use_acceleration
         self.endpoint_url = endpoint_url
         self.workers = workers if workers is not None else _default_workers()
+        if compression not in ("auto", "always", "never"):
+            raise ValueError(
+                f"compression must be 'auto', 'always' or 'never', got {compression!r}"
+            )
+        self.compression = compression
 
         def default_s3_factory(no_sign_request):
             """Default S3 client factory with proper boto3 usage."""
@@ -546,26 +558,32 @@ class S3LFS:
             self._save_inflight(claims)
 
     def _asset_base_key(self, manifest_key, file_hash):
-        """The S3 key a file's content is stored under."""
-        return f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+        """The stem of the S3 key a file's content is stored under.
 
-    def _list_keys(self, prefix):
-        """Every key under a prefix, following pagination.
+        The stored object is either <stem>.gz (compressed) or <stem>
+        itself (raw), each optionally chunked as <object>.chunkN. Raw
+        objects keep the file's natural name and exact bytes, so anything
+        that speaks S3 can fetch and use them without s3lfs.
+        """
+        return f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}"
+
+    def _list_objects(self, prefix):
+        """Every key under a prefix with its size, following pagination.
 
         A single list_objects_v2 call stops at 1000 keys. Deriving a chunk
         count from a truncated listing rebuilds a short file and calls it a
         success, which is worse than failing outright.
         """
         client = self._get_s3_client()
-        keys: list = []
+        objects: dict = {}
         token = None
         while True:
             kwargs = {"Bucket": self.bucket_name, "Prefix": prefix}
             if token:
                 kwargs["ContinuationToken"] = token
             resp = client.list_objects_v2(**kwargs)
-            contents = resp.get("Contents") or []
-            keys.extend(obj["Key"] for obj in contents)
+            for obj in resp.get("Contents") or []:
+                objects[obj["Key"]] = obj.get("Size", 0)
 
             # Continue only on a genuine continuation token. Testing
             # IsTruncated for truthiness is not enough: any object that is
@@ -573,7 +591,53 @@ class S3LFS:
             # reads as "more pages" and spins forever.
             token = resp.get("NextContinuationToken")
             if resp.get("IsTruncated") is not True or not isinstance(token, str):
-                return keys
+                return objects
+
+    def _list_keys(self, prefix):
+        """Every key under a prefix, following pagination."""
+        return list(self._list_objects(prefix))
+
+    def _locate_asset(self, manifest_key, file_hash):
+        """Find the stored object(s) for an entry.
+
+        Returns (keys, sizes, is_chunked, compressed) with keys in chunk
+        order. Which form exists -- raw or .gz, single or chunked -- is
+        discovered from the bucket rather than assumed, so a mix of writer
+        versions in one repository works.
+        """
+        stem = self._asset_base_key(manifest_key, file_hash)
+        objects = {
+            k: size
+            for k, size in self._list_objects(stem).items()
+            if self._key_covered_by(k, {stem})
+        }
+
+        def chunks_of(base):
+            found = {}
+            for k in objects:
+                head, sep, tail = k.rpartition(".chunk")
+                if sep and head == base and tail.isdigit():
+                    found[int(tail)] = k
+            return found
+
+        for base, compressed in ((stem, False), (stem + ".gz", True)):
+            if base in objects:
+                return [base], objects, False, compressed
+            chunks = chunks_of(base)
+            if chunks:
+                if set(chunks) != set(range(len(chunks))):
+                    raise RuntimeError(
+                        f"Stored chunks for {manifest_key} are not contiguous: "
+                        f"have indices {sorted(chunks)}. The object is "
+                        "incomplete; re-upload with 's3lfs track'."
+                    )
+                keys = [chunks[i] for i in range(len(chunks))]
+                return keys, objects, True, compressed
+
+        raise RuntimeError(
+            f"No stored object for {manifest_key} ({file_hash[:12]}). "
+            "The content may never have been uploaded, or was removed."
+        )
 
     def _delete_asset(self, base_key):
         """Delete an asset and every chunk belonging to it.
@@ -620,11 +684,15 @@ class S3LFS:
         the storage layout keys on. Judging on the hash alone means an object
         stays reachable as long as any path shares its content, so a removed
         or renamed path leaks its object permanently.
+
+        Base keys are stems; each asset may be stored as <stem>.gz or as
+        <stem> raw, so both spellings (and their chunks) are covered.
         """
-        if key in base_keys:
+        variants = set(base_keys) | {b + ".gz" for b in base_keys}
+        if key in variants:
             return True
         head, sep, tail = key.rpartition(".chunk")
-        return bool(sep) and tail.isdigit() and head in base_keys
+        return bool(sep) and tail.isdigit() and head in variants
 
     def find_missing_assets(self, files):
         """Return the manifest entries whose content is absent from S3.
@@ -1952,10 +2020,19 @@ class S3LFS:
         file_hash = self.hash_file(file_path)
         # Use manifest key (relative to git root) for S3 key
         manifest_key = self._get_manifest_key(file_path)
-        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
+        stem = self._asset_base_key(manifest_key, file_hash)
 
         extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
-        compressed_path = self.compress_file(file_path)
+        if self._should_compress(file_path):
+            s3_key = stem + ".gz"
+            compressed_path = self.compress_file(file_path)
+        else:
+            # Raw storage: the object keeps the file's natural name and
+            # exact bytes. Stage a copy so a concurrent edit cannot change
+            # the content between hashing and upload.
+            s3_key = stem
+            compressed_path = self.temp_dir / f"{uuid4()}.raw"
+            shutil.copyfile(file_path, compressed_path)
 
         chunked = False
         if compressed_path.stat().st_size > self.chunk_size:
@@ -2204,6 +2281,33 @@ class S3LFS:
         """Upload multiple files with block-level parallelism."""
         self.parallel_upload_chunked(files, silence=silence)
 
+    def _should_compress(self, file_path):
+        """Decide whether compressing this file is worth anything.
+
+        Most large assets -- images, video, model weights, archives -- are
+        already compressed, and gzip on such data costs ~20ms/MB to save
+        nothing. Worse, it makes the stored object unusable without s3lfs.
+        A file stored raw sits in the bucket under its natural name with
+        its exact bytes, fetchable by any S3 tool.
+
+        The decision samples the head of the file rather than reading all
+        of it: compressibility is a property of the encoding, which does
+        not change partway through for the formats that matter.
+        """
+        if self.compression == "always":
+            return True
+        if self.compression == "never":
+            return False
+        try:
+            with open(file_path, "rb") as f:
+                sample = f.read(COMPRESSION_SAMPLE_BYTES)
+        except OSError:
+            return True
+        if not sample:
+            return False
+        compressed = gzip.compress(sample, COMPRESSION_SAMPLE_LEVEL)
+        return len(compressed) < len(sample) * COMPRESSION_MIN_SAVINGS_RATIO
+
     def _prepare_file_for_upload(self, file_path):
         """Hash, compress, and split a file into uploadable chunks."""
         file_path = Path(file_path)
@@ -2215,10 +2319,19 @@ class S3LFS:
         if file_hash == stored_hash:
             return None
 
-        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
         extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
 
-        compressed_path = self.compress_file(file_path)
+        stem = self._asset_base_key(manifest_key, file_hash)
+        if self._should_compress(file_path):
+            s3_key = stem + ".gz"
+            compressed_path = self.compress_file(file_path)
+        else:
+            # Stage a copy so a concurrent edit cannot change the bytes
+            # between hashing and upload -- the same snapshot property the
+            # compressed path gets from writing a temp file.
+            s3_key = stem
+            compressed_path = self.temp_dir / f"{uuid4()}.raw"
+            shutil.copyfile(file_path, compressed_path)
 
         if compressed_path.stat().st_size > self.chunk_size:
             chunk_paths = self.split_file(compressed_path)
@@ -2479,34 +2592,22 @@ class S3LFS:
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def _discover_chunks_for_file(self, manifest_key, file_hash):
-        """Discover S3 chunks for a single file."""
-        s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
-
-        chunk_keys = self._list_keys(f"{s3_key}.chunk")
-
-        if chunk_keys:
-            return [
-                {
-                    "manifest_key": manifest_key,
-                    "file_hash": file_hash,
-                    "s3_key": f"{s3_key}.chunk{i}",
-                    "chunk_index": i,
-                    "is_chunked": True,
-                    "num_chunks": len(chunk_keys),
-                }
-                for i in range(len(chunk_keys))
-            ]
-        else:
-            return [
-                {
-                    "manifest_key": manifest_key,
-                    "file_hash": file_hash,
-                    "s3_key": s3_key,
-                    "chunk_index": 0,
-                    "is_chunked": False,
-                    "num_chunks": 1,
-                }
-            ]
+        """Discover the stored object(s) for a file, raw or compressed."""
+        keys, _sizes, is_chunked, compressed = self._locate_asset(
+            manifest_key, file_hash
+        )
+        return [
+            {
+                "manifest_key": manifest_key,
+                "file_hash": file_hash,
+                "s3_key": key,
+                "chunk_index": i,
+                "is_chunked": is_chunked,
+                "num_chunks": len(keys),
+                "compressed": compressed,
+            }
+            for i, key in enumerate(keys)
+        ]
 
     @retry(3, (BotoCoreError, ClientError, SSLError))
     def _download_chunk(self, chunk_info, target_path):
@@ -2531,7 +2632,13 @@ class S3LFS:
         )
 
     def _finalize_file(
-        self, manifest_key, chunk_paths, is_chunked, expected_hash=None, silence=True
+        self,
+        manifest_key,
+        chunk_paths,
+        is_chunked,
+        expected_hash=None,
+        silence=True,
+        compressed=True,
     ):
         """Merge chunks (if needed) and decompress to final location.
 
@@ -2556,7 +2663,10 @@ class S3LFS:
 
         os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
         try:
-            self.decompress_file(compressed_path, filesystem_path)
+            if compressed:
+                self.decompress_file(compressed_path, filesystem_path)
+            else:
+                shutil.move(str(compressed_path), str(filesystem_path))
         finally:
             try:
                 os.remove(compressed_path)
@@ -2625,6 +2735,7 @@ class S3LFS:
                             "received": [],
                             "is_chunked": chunks[0]["is_chunked"],
                             "file_hash": chunks[0]["file_hash"],
+                            "compressed": chunks[0]["compressed"],
                         }
                         total_chunks += len(chunks)
                         pbar.total = total_chunks
@@ -2673,6 +2784,7 @@ class S3LFS:
                                     entry["is_chunked"],
                                     expected_hash=entry["file_hash"],
                                     silence=silence,
+                                    compressed=entry["compressed"],
                                 )
                                 files_finalized += 1
                             except Exception as e:
@@ -3701,30 +3813,11 @@ class S3LFS:
                 return 0  # Skip download if hashes match
 
         # Proceed with download if file is missing or different
-        s3_key = f"{self.repo_prefix}/assets/{expected_hash}/{manifest_key}.gz"
+        compressed_path = self.temp_dir / f"{uuid4()}.part"
 
-        compressed_path = self.temp_dir / f"{uuid4()}.gz"
-
-        chunk_resp = self._get_s3_client().list_objects_v2(
-            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
+        keys, key_sizes, is_chunked, compressed = self._locate_asset(
+            manifest_key, expected_hash
         )
-        chunk_contents = chunk_resp.get("Contents", [])
-
-        # Build key list and size map from list_objects_v2 response
-        # (avoids separate head_object calls for chunked files)
-        key_sizes = {}
-        if chunk_contents:
-            for i in range(len(chunk_contents)):
-                k = f"{s3_key}.chunk{i}"
-                for obj in chunk_contents:
-                    if obj["Key"] == k:
-                        key_sizes[k] = obj["Size"]
-                        break
-            keys = list(key_sizes.keys())
-        else:
-            keys = [s3_key]
-            obj = self._get_s3_client().head_object(Bucket=self.bucket_name, Key=s3_key)
-            key_sizes[s3_key] = obj["ContentLength"]
 
         base_directory = os.path.dirname(compressed_path)
         os.makedirs(base_directory, exist_ok=True)
@@ -3740,7 +3833,7 @@ class S3LFS:
 
         for idx, key in enumerate(keys):
             try:
-                target_path = self.temp_dir / f"{uuid4()}.gz"
+                target_path = self.temp_dir / f"{uuid4()}.part"
                 target_paths.append(target_path)
                 file_size = key_sizes[key]
 
@@ -3786,7 +3879,7 @@ class S3LFS:
             except Exception as e:
                 print(f"Error downloading {key}: {e}")
 
-        if chunk_contents:
+        if is_chunked and len(target_paths) > 1:
             compressed_path = self.merge_files(compressed_path, target_paths)
             for path in target_paths:
                 os.remove(path)
@@ -3796,14 +3889,21 @@ class S3LFS:
         if os.path.dirname(filesystem_path):
             os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
         try:
-            with metrics.track("decompression", str(filesystem_path)):
-                self.decompress_file(compressed_path, filesystem_path)
+            if compressed:
+                with metrics.track("decompression", str(filesystem_path)):
+                    self.decompress_file(compressed_path, filesystem_path)
+            else:
+                shutil.move(str(compressed_path), str(filesystem_path))
         except Exception as e:
-            print(f"Error decompressing {compressed_path} for key {keys}: {e}")
+            print(f"Error finalizing {compressed_path} for key {keys}: {e}")
             raise
-        os.remove(compressed_path)  # Ensure temp file is deleted
+        # The raw path moves the temp file into place, so it is already gone.
+        Path(compressed_path).unlink(missing_ok=True)
         if not silence:
-            print(f"Downloaded {filesystem_path} from s3://{self.bucket_name}/{s3_key}")
+            print(
+                f"Downloaded {filesystem_path} from "
+                f"s3://{self.bucket_name}/{keys[0]}"
+            )
 
         # Return bytes transferred for progress tracking
         return filesystem_path.stat().st_size if filesystem_path.exists() else 0

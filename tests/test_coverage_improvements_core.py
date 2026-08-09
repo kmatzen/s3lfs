@@ -730,6 +730,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     "chunk_index": 0,
                     "is_chunked": False,
                     "num_chunks": 1,
+                    "compressed": True,
                 }
             ]
 
@@ -758,6 +759,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                         "chunk_index": 0,
                         "is_chunked": False,
                         "num_chunks": 1,
+                        "compressed": True,
                     }
                 ],
             ):
@@ -795,6 +797,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     "chunk_index": i,
                     "is_chunked": True,
                     "num_chunks": 2,
+                    "compressed": True,
                 }
                 for i in range(2)
             ]
@@ -834,6 +837,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     "chunk_index": 0,
                     "is_chunked": False,
                     "num_chunks": 1,
+                    "compressed": True,
                 }
             ]
 
@@ -873,6 +877,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     "chunk_index": 0,
                     "is_chunked": False,
                     "num_chunks": 1,
+                    "compressed": True,
                 }
             ],
         ):
@@ -919,6 +924,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     "chunk_index": i,
                     "is_chunked": True,
                     "num_chunks": 2,
+                    "compressed": True,
                 }
                 for i in range(2)
             ]

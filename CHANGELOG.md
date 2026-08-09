@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Adaptive compression.** Each file's content is sampled at upload; files that don't compress -- images, video, model weights, archives -- are stored **raw, under their natural key, byte-identical to the original**. Two effects: no more gzip time spent achieving nothing (cold upload of 200 MB of incompressible data: 2.34s to 1.49s even against a local server), and the stored object is directly usable by any S3 tool, addressing the "opaque format" objection to adopting s3lfs for long-term storage. `compression: auto|always|never` in `.s3lfsconfig`; compressible files still get gzip.
+- The storage layout is now documented in the README as a contract, with a "getting your data out without s3lfs" recipe -- and a test that restores files using nothing but an S3 client and the manifest, so the recipe cannot silently rot.
+- `benchmarks/transfer_comparison.py`: measures s3lfs against a raw transfer tool (s5cmd) across cold/no-op/incremental upload and download, per scenario rather than as one misleading number.
+
+### Changed
+- A missing stored object is now a loud error at download time instead of a fabricated key that 404s downstream. Non-contiguous chunk sets are also rejected with an explanation rather than reassembled short.
+- Unchunked downloads no longer issue a `head_object` per file; sizes come from the discovery listing.
+
+### Compatibility
+- Objects stored raw by this version are invisible to older s3lfs clients (they only look for `.gz` keys and will fail loudly at checkout). Teams with mixed versions can set `compression: always` until everyone upgrades. Buckets written by older versions are fully readable -- discovery handles both forms.
+
 ## [0.5.2] - 2026-08-09
 
 ### Changed
