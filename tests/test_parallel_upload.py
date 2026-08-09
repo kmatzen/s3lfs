@@ -64,11 +64,25 @@ class TestPrepareFileForUpload(unittest.TestCase):
             mock_boto3.return_value = Mock()
             s3lfs = S3LFS(bucket_name="test-bucket")
 
+            # Tiny content: gzip would inflate it, so it is stored raw
+            # under its natural name -- fetchable by any S3 tool.
             Path("file.txt").write_bytes(b"data")
             result = s3lfs._prepare_file_for_upload("file.txt")
 
             _, file_hash, chunks = result
-            expected_key = f"pfx/assets/{file_hash}/file.txt.gz"
+            expected_key = f"pfx/assets/{file_hash}/file.txt"
+            self.assertEqual(chunks[0]["s3_key"], expected_key)
+
+    def test_compressible_content_still_gets_gz_key(self):
+        with patch("boto3.client") as mock_boto3:
+            mock_boto3.return_value = Mock()
+            s3lfs = S3LFS(bucket_name="test-bucket")
+
+            Path("big.txt").write_bytes(b"the same line again\n" * 20000)
+            result = s3lfs._prepare_file_for_upload("big.txt")
+
+            _, file_hash, chunks = result
+            expected_key = f"pfx/assets/{file_hash}/big.txt.gz"
             self.assertEqual(chunks[0]["s3_key"], expected_key)
 
 

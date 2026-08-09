@@ -66,8 +66,9 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             # head_object should NOT have been called for chunked files
             mock_client.head_object.assert_not_called()
 
-    def test_unchunked_download_one_head_object(self):
-        """For unchunked files, exactly one head_object is needed for size."""
+    def test_unchunked_download_no_head_object(self):
+        """Sizes come from the discovery listing; head_object is never
+        needed, even for unchunked files."""
         with patch("boto3.client") as mock_boto3:
             mock_client = Mock()
             mock_boto3.return_value = mock_client
@@ -75,9 +76,10 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             data = b"single file"
             compressed = gzip.compress(data)
 
-            # No chunks found
-            mock_client.list_objects_v2.return_value = {}
-            mock_client.head_object.return_value = {"ContentLength": len(compressed)}
+            def fake_list(Bucket=None, Prefix=None, **kw):
+                return {"Contents": [{"Key": Prefix + ".gz", "Size": len(compressed)}]}
+
+            mock_client.list_objects_v2.side_effect = fake_list
 
             def fake_download(Bucket, Key, Fileobj, **kwargs):
                 Fileobj.write(compressed)
@@ -87,8 +89,7 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             s3lfs = S3LFS(bucket_name="test-bucket")
             s3lfs.download("data.bin", silence=True, expected_hash="hash1")
 
-            # Exactly one head_object for the single file
-            self.assertEqual(mock_client.head_object.call_count, 1)
+            self.assertEqual(mock_client.head_object.call_count, 0)
 
 
 if __name__ == "__main__":
