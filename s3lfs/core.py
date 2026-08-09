@@ -2153,7 +2153,18 @@ class S3LFS:
                                 progress_callback(file_size)
                             continue
                     except ClientError as e:
-                        if e.response["Error"]["Code"] != "404":
+                        # 404 means not uploaded yet. Anything else -- most
+                        # commonly 403 from a write-only policy, since
+                        # HeadObject requires s3:GetObject -- means we cannot
+                        # check, and the safe response is to upload anyway:
+                        # worst case is re-sending bytes that were already
+                        # there. Raising here made `track` unusable under
+                        # upload-only credentials, a legitimate CI setup.
+                        if e.response["Error"]["Code"] not in (
+                            "404",
+                            "403",
+                            "AccessDenied",
+                        ):
                             raise
                     with metrics.track("s3_upload", str(path)):
                         with open(path, "rb") as f:
