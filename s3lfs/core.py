@@ -47,6 +47,11 @@ DEFAULT_THREAD_POOL_SIZE = 8  # Fallback when os.cpu_count() is unavailable
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 
+# Sharded manifests keep entries in per-directory files under this directory,
+# beside the root manifest.
+MANIFEST_SHARD_DIR = ".s3lfs_manifest"
+MANIFEST_ROOT_SHARD = "_root"
+
 try:
     # The libyaml-backed loader parses and emits roughly an order of
     # magnitude faster than the pure-Python one. Every command reads the
@@ -277,6 +282,8 @@ class S3LFS:
         self._cache_mtime: Optional[float] = None
         self._cache_dirty = False
         self.hash_cache: dict = {}
+        self.manifest: dict = {"files": {}}
+        self._loaded_shards: dict = {}
         self.load_manifest()
         self.load_cache()
 
@@ -540,11 +547,16 @@ class S3LFS:
                 return None
             return item
 
-        if not files:
+        # Accepts a mapping or an iterable of (manifest_key, hash) pairs.
+        # A verification over a range of commits needs the latter: the same
+        # path can carry different content at different commits, and each
+        # one is a separate object that has to exist.
+        items = list(files.items()) if hasattr(files, "items") else list(files)
+        if not items:
             return []
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            results = list(pool.map(check, files.items()))
+            results = list(pool.map(check, items))
         return [item for item in results if item is not None]
 
     def _get_s3_client(self):
@@ -652,8 +664,91 @@ class S3LFS:
         else:
             print(".gitignore already contains S3LFS cache exclusions")
 
+    @property
+    def shard_dir(self):
+        """Directory holding manifest shards, when the manifest is sharded."""
+        return self.manifest_file.parent / MANIFEST_SHARD_DIR
+
+    @staticmethod
+    def shard_for(manifest_key):
+        """Which shard a manifest key belongs to.
+
+        The first path component, so a change under one top-level directory
+        rewrites one small file instead of the whole manifest. That matters
+        twice over: every command parses what it loads, and every rewrite
+        becomes a new blob in git history.
+        """
+        head, sep, _ = manifest_key.partition("/")
+        return head if sep and head else MANIFEST_ROOT_SHARD
+
+    def _shard_path(self, shard):
+        # Shard names come from path components, so they can contain
+        # anything a directory name can. Percent-encode everything outside
+        # a conservative set rather than trusting them as filenames.
+        safe = "".join(
+            ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
+        )
+        return self.shard_dir / f"{safe}.yaml"
+
+    def _load_shards(self):
+        """Merge every shard into one files mapping."""
+        files: dict = {}
+        if not self.shard_dir.is_dir():
+            return files
+        for path in sorted(self.shard_dir.glob("*.yaml")):
+            try:
+                with open(path, "r") as f:
+                    data = yaml_load(f) or {}
+            except yaml.YAMLError as e:
+                hint = ""
+                if "<<<<<<<" in path.read_text(errors="replace"):
+                    hint = (
+                        " It contains merge conflict markers -- resolve the "
+                        "conflict, or run 's3lfs install' to register the "
+                        "merge driver that prevents it."
+                    )
+                raise RuntimeError(f"Cannot read manifest shard {path}: {e}.{hint}")
+            if isinstance(data, dict):
+                files.update(data)
+        return files
+
+    def _save_shards(self):
+        """Write only the shards whose contents actually changed."""
+        grouped: dict = {}
+        for key, file_hash in self.manifest.get("files", {}).items():
+            grouped.setdefault(self.shard_for(key), {})[key] = file_hash
+
+        self.shard_dir.mkdir(parents=True, exist_ok=True)
+        for shard, entries in grouped.items():
+            if self._loaded_shards.get(shard) == entries:
+                continue
+            self._write_atomic(self._shard_path(shard), entries)
+
+        # A shard that lost its last entry is removed, so an empty file does
+        # not linger in the tree forever.
+        for shard in set(self._loaded_shards) - set(grouped):
+            self._shard_path(shard).unlink(missing_ok=True)
+
+        self._loaded_shards = {s: dict(e) for s, e in grouped.items()}
+
+    def _write_atomic(self, path, data):
+        temp_file = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+        try:
+            with open(temp_file, "w") as f:
+                yaml_dump(data, f, default_flow_style=False, sort_keys=True)
+            temp_file.replace(path)
+        except Exception as e:
+            print(f"Failed to write {path}: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+
+    @property
+    def is_sharded(self):
+        return self.manifest.get("manifest_format") == "sharded"
+
     def load_manifest(self):
         """Load the local manifest (YAML or JSON format)."""
+        self._loaded_shards = {}
         if self.manifest_file.exists():
             try:
                 with open(self.manifest_file, "r") as f:
@@ -682,11 +777,25 @@ class S3LFS:
                     "it may have been overwritten."
                 )
             self.manifest.setdefault("files", {})
+            if self.is_sharded:
+                # The root file carries configuration only; entries live in
+                # per-directory shards beside it.
+                self.manifest["files"] = self._load_shards()
+                for key, file_hash in self.manifest["files"].items():
+                    self._loaded_shards.setdefault(self.shard_for(key), {})[
+                        key
+                    ] = file_hash
         else:
             self.manifest = {"files": {}}  # Use file paths as keys
 
     def save_manifest(self):
         """Save the manifest back to disk atomically (YAML or JSON format)."""
+        if self.is_sharded:
+            self._save_shards()
+            root = {k: v for k, v in self.manifest.items() if k != "files"}
+            self._write_atomic(self.manifest_file, root)
+            return
+
         # Unique temp name. A shared one lets two writers interleave into the
         # same file before either renames: the rename is atomic, the content
         # is not.
@@ -1160,7 +1269,41 @@ class S3LFS:
 
         return hashes
 
-    def track_modified_files_cached(self, silence=True, keys=None):
+    def record_hashes(self, entries):
+        """Record known hashes for files currently on disk.
+
+        Called after an upload, where the hash was just computed from the
+        bytes on disk. Two reasons to keep it: the next modified-file scan
+        gets a cache hit instead of re-reading the file, and the cache
+        becomes a reliable record of what this working copy has actually
+        held -- which is how a file the user deleted is told apart from one
+        that was never downloaded here.
+        """
+        updates = {}
+        for manifest_key, file_hash in entries.items():
+            filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
+            try:
+                stat = filesystem_path.stat()
+            except OSError:
+                continue
+            updates[str(Path(manifest_key).as_posix())] = {
+                "hash": file_hash,
+                "metadata": {
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "inode": getattr(stat, "st_ino", None),
+                },
+                "timestamp": time.time(),
+            }
+        if not updates:
+            return
+        with self._lock_context():
+            self.load_cache()
+            self.hash_cache.update(updates)
+            self._cache_dirty = True
+            self.save_cache()
+
+    def track_modified_files_cached(self, silence=True, keys=None, prune_deleted=True):
         """
         Check manifest for outdated hashes using cached hashing and upload
         changed files in parallel.
@@ -1173,8 +1316,13 @@ class S3LFS:
             of the whole manifest. A sparse working copy passes its
             profile here so the per-commit cost tracks the slice it has
             on disk rather than the size of the repository.
+        :param prune_deleted: drop manifest entries for files this working
+            copy had and the user deleted. Without it a deletion never
+            reaches collaborators: their next sync downloads the file again,
+            and keeps doing so forever.
         """
         files_to_upload = []
+        deleted = []
         cache_hits = 0
         cache_misses = 0
 
@@ -1208,7 +1356,18 @@ class S3LFS:
                     filesystem_path = self.path_resolver.to_filesystem_path(file_path)
 
                     if not filesystem_path.exists():
-                        print(f"Warning: File {file_path} is missing. Skipping.")
+                        # Absent for one of two very different reasons. If
+                        # this working copy has hashed the file before, it
+                        # was here and the user deleted it -- a real change
+                        # that should reach collaborators. If it has never
+                        # been hashed here, it was simply never downloaded
+                        # (a fresh clone, or outside a sparse profile), and
+                        # untracking it would delete other people's data.
+                        cache_key = str(fp.as_posix())
+                        if cache_key in self.hash_cache:
+                            deleted.append(file_path)
+                        else:
+                            print(f"Warning: File {file_path} is missing. Skipping.")
                         pbar.update(1)
                         continue
 
@@ -1261,6 +1420,25 @@ class S3LFS:
         if not silence:
             print(
                 f"Hash cache performance: " f"{cache_hits} hits, {cache_misses} misses"
+            )
+
+        if deleted and prune_deleted:
+            with self._lock_context():
+                self.load_manifest()
+                for file_path in deleted:
+                    self.manifest["files"].pop(file_path, None)
+                self.save_manifest()
+            noun = "entry" if len(deleted) == 1 else "entries"
+            print(f"Removed {len(deleted)} manifest {noun} for deleted file(s):")
+            for file_path in sorted(deleted)[:10]:
+                print(f"  {file_path}")
+            if len(deleted) > 10:
+                print(f"  ... and {len(deleted) - 10} more")
+            print("The objects stay in S3 so earlier commits still check out.")
+        elif deleted:
+            print(
+                f"{len(deleted)} tracked file(s) were deleted here but left "
+                "in the manifest."
             )
 
         # Upload files in parallel if needed
@@ -2483,6 +2661,10 @@ class S3LFS:
         if ".git" in parts:
             return True
         if ".s3lfs_temp" in parts or self.temp_dir.name in parts:
+            return True
+        # Manifest shards are the manifest. Tracking them would upload the
+        # index of what is tracked into the store it indexes.
+        if MANIFEST_SHARD_DIR in parts:
             return True
         if resolved.name in {self.manifest_file.name, self.cache_file.name}:
             return True

@@ -1,6 +1,18 @@
 # TLA+ specifications
 
-Formal models of s3lfs's concurrency-sensitive protocols, checked with TLC.
+Formal models of s3lfs's concurrency-sensitive protocols and of the operations
+that can lose data, checked with TLC.
+
+`specs/check.sh` runs every configuration whose expected outcome is known and
+fails if any disagrees. CI runs it on every pull request. It checks both
+directions: configurations modelling the shipped design must hold, and
+configurations modelling a defect the code no longer has must still violate
+their invariant -- otherwise the corresponding property is vacuous and proves
+nothing about the code.
+
+Which configuration corresponds to the shipped design is recorded in
+`check.sh`, not only in prose here, so a stale label fails the build rather
+than misleading a reader.
 
 References below name functions rather than line numbers, which go stale as
 the code moves.
@@ -97,7 +109,7 @@ a file the manifest claims is tracked.
 Three configurations, selected by the `REVALIDATE` and `INFLIGHT` constants:
 
 ```sh
-java -jar tla2tools.jar -config S3lfsGC.cfg         S3lfsGC.tla  # current code
+java -jar tla2tools.jar -config S3lfsGC.cfg         S3lfsGC.tla  # original defect
 java -jar tla2tools.jar -config S3lfsGCFixed.cfg    S3lfsGC.tla  # revalidate under lock
 java -jar tla2tools.jar -config S3lfsGCInflight.cfg S3lfsGC.tla  # in-flight registry
 ```
@@ -215,7 +227,13 @@ Models `S3LFS.parallel_upload_chunked` followed by the checkout that
 reassembles the file (`S3LFS._discover_chunks_for_file`,
 `S3LFS._finalize_file`).
 
-Three defects interact:
+**The code now implements `CommitAfter`.** `parallel_upload_chunked` records a
+manifest entry only once every chunk of that file has landed, and prints a
+warning naming any file whose chunks did not all upload. `specs/check.sh`
+asserts `CommitAfter` holds and that `Baseline` still violates
+`NoSilentCorruption`, so a regression toward the original behaviour fails CI.
+
+The three defects the `Baseline` configuration models, kept for the record:
 
 1. The manifest entry is recorded at *prep* time, in `_prepare_file_for_upload`,
    before any chunk is PUT.
@@ -237,7 +255,7 @@ done
 
 | Config | `NoSilentCorruption` | `ManifestImpliesChunks` |
 | --- | --- | --- |
-| `Baseline` (current code) | Violated | Violated |
+| `Baseline` (the original defect, since fixed) | Violated | Violated |
 | `StoreCount` | No error | Violated |
 | `VerifyHash` | No error | Violated |
 | `CommitAfter` | No error | **No error** |
