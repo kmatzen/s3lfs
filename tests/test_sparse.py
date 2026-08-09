@@ -143,11 +143,14 @@ class TestSparseProfileDetection(SparseRepoTestCase):
         self._enable_sparse("keep")
 
         profile = SparseProfile.detect(Path(self.temp_dir))
-        keys = [f"keep/f{i}.bin" for i in range(6000)]
-        keys += [f"drop/f{i}.bin" for i in range(6000)]
+        # Just over CHECK_RULES_BATCH, so more than one batch runs without
+        # making the test pay for tens of thousands of paths.
+        per_side = 3000
+        keys = [f"keep/f{i}.bin" for i in range(per_side)]
+        keys += [f"drop/f{i}.bin" for i in range(per_side)]
         selected = profile.select(keys)
 
-        self.assertEqual(len(selected), 6000)
+        self.assertEqual(len(selected), per_side)
         self.assertTrue(all(k.startswith("keep/") for k in selected))
 
 
@@ -202,7 +205,7 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
 
         self.assertTrue(Path("drop/out.bin").exists())
         self.assertEqual(Path("drop/out.bin").read_text(), "unsaved local work")
-        self.assertIn("local modifications", result.output)
+        self.assertIn("not in S3", result.output)
 
     def test_sync_no_prune_keeps_out_of_profile_files(self):
         self._track_both_dirs()

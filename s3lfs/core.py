@@ -438,6 +438,32 @@ class S3LFS:
         """The S3 key a file's content is stored under."""
         return f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
 
+    def _list_keys(self, prefix):
+        """Every key under a prefix, following pagination.
+
+        A single list_objects_v2 call stops at 1000 keys. Deriving a chunk
+        count from a truncated listing rebuilds a short file and calls it a
+        success, which is worse than failing outright.
+        """
+        client = self._get_s3_client()
+        keys: list = []
+        token = None
+        while True:
+            kwargs = {"Bucket": self.bucket_name, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = client.list_objects_v2(**kwargs)
+            contents = resp.get("Contents") or []
+            keys.extend(obj["Key"] for obj in contents)
+
+            # Continue only on a genuine continuation token. Testing
+            # IsTruncated for truthiness is not enough: any object that is
+            # not a bool -- a stub client, an unexpected response shape --
+            # reads as "more pages" and spins forever.
+            token = resp.get("NextContinuationToken")
+            if resp.get("IsTruncated") is not True or not isinstance(token, str):
+                return keys
+
     def _delete_asset(self, base_key):
         """Delete an asset and every chunk belonging to it.
 
@@ -445,8 +471,7 @@ class S3LFS:
         itself, so deleting only the base key leaves the whole file behind.
         """
         client = self._get_s3_client()
-        resp = client.list_objects_v2(Bucket=self.bucket_name, Prefix=base_key)
-        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        keys = self._list_keys(base_key)
         # Guard against a prefix match on an unrelated, longer key.
         keys = [k for k in keys if self._key_covered_by(k, {base_key})]
         if not keys:
@@ -630,12 +655,33 @@ class S3LFS:
     def load_manifest(self):
         """Load the local manifest (YAML or JSON format)."""
         if self.manifest_file.exists():
-            with open(self.manifest_file, "r") as f:
-                # Detect format based on extension
-                if self.manifest_file.suffix in [".yaml", ".yml"]:
-                    self.manifest = yaml_load(f) or {"files": {}}
-                else:
-                    self.manifest = json.load(f)
+            try:
+                with open(self.manifest_file, "r") as f:
+                    # Detect format based on extension
+                    if self.manifest_file.suffix in [".yaml", ".yml"]:
+                        self.manifest = yaml_load(f) or {"files": {}}
+                    else:
+                        self.manifest = json.load(f)
+            except (yaml.YAMLError, json.JSONDecodeError) as e:
+                # The likeliest cause by far is an unresolved merge, which a
+                # teammate who has not run 's3lfs install' will hit. A bare
+                # parser traceback does not tell them that.
+                hint = ""
+                if "<<<<<<<" in self.manifest_file.read_text(errors="replace"):
+                    hint = (
+                        " It contains merge conflict markers -- resolve the "
+                        "conflict, or run 's3lfs install' to register the "
+                        "merge driver that prevents it."
+                    )
+                raise RuntimeError(
+                    f"Cannot read manifest {self.manifest_file}: {e}.{hint}"
+                ) from e
+            if not isinstance(self.manifest, dict):
+                raise RuntimeError(
+                    f"Manifest {self.manifest_file} is not a mapping; "
+                    "it may have been overwritten."
+                )
+            self.manifest.setdefault("files", {})
         else:
             self.manifest = {"files": {}}  # Use file paths as keys
 
@@ -1045,18 +1091,33 @@ class S3LFS:
         :param expected: dict of manifest_key -> expected hash
         :param progress: show a progress bar while hashing
         :return: dict of manifest_key -> "up_to_date" | "modified" | "missing"
+        """
+        return {
+            key: (
+                "missing"
+                if h is None
+                else "up_to_date" if h == expected[key] else "modified"
+            )
+            for key, h in self.disk_hashes(expected, progress=progress).items()
+        }
+
+    def disk_hashes(self, keys, progress=False):
+        """Hash what is currently on disk for each manifest key.
+
+        :return: dict of manifest_key -> hash, or None where no file exists
 
         Uses the same load-cache-once, hash-on-miss strategy as
         track_modified_files_cached, so repeat calls over unchanged files
         cost a stat() each rather than a full re-read.
         """
+        expected = keys
         if not expected:
             return {}
 
         with self._lock_context():
             self.load_cache()
 
-        states = {}
+        hashes: dict = {}
         cache_updates = {}
 
         with tqdm(
@@ -1065,11 +1126,11 @@ class S3LFS:
             unit="file",
             disable=not progress,
         ) as pbar:
-            for manifest_key, expected_hash in expected.items():
+            for manifest_key in expected:
                 pbar.update(1)
                 filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
                 if not filesystem_path.exists():
-                    states[manifest_key] = "missing"
+                    hashes[manifest_key] = None
                     continue
 
                 stat = filesystem_path.stat()
@@ -1089,9 +1150,7 @@ class S3LFS:
                         "timestamp": time.time(),
                     }
 
-                states[manifest_key] = (
-                    "up_to_date" if current_hash == expected_hash else "modified"
-                )
+                hashes[manifest_key] = current_hash
 
         if cache_updates:
             with self._lock_context():
@@ -1099,7 +1158,7 @@ class S3LFS:
                 self._cache_dirty = True
                 self.save_cache()
 
-        return states
+        return hashes
 
     def track_modified_files_cached(self, silence=True, keys=None):
         """
@@ -2067,10 +2126,7 @@ class S3LFS:
         """Discover S3 chunks for a single file."""
         s3_key = f"{self.repo_prefix}/assets/{file_hash}/{manifest_key}.gz"
 
-        resp = self._get_s3_client().list_objects_v2(
-            Bucket=self.bucket_name, Prefix=f"{s3_key}.chunk"
-        )
-        chunk_keys = [ck["Key"] for ck in resp.get("Contents", [])]
+        chunk_keys = self._list_keys(f"{s3_key}.chunk")
 
         if chunk_keys:
             return [

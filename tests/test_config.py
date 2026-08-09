@@ -289,3 +289,32 @@ class TestConfigCLIIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConfigKeysTeamsNeed(unittest.TestCase):
+    """endpoint_url and workers used to be dropped silently, so a team on
+    MinIO/R2 that set them in .s3lfsconfig had every request go to AWS."""
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_endpoint_url_and_workers_are_loaded(self):
+        (self.temp_dir / ".s3lfsconfig").write_text(
+            "endpoint_url: http://minio.internal:9000\nworkers: 4\n"
+        )
+        config = load_config(self.temp_dir)
+        self.assertEqual(config["endpoint_url"], "http://minio.internal:9000")
+        self.assertEqual(config["workers"], 4)
+
+    def test_unknown_keys_are_reported(self):
+        (self.temp_dir / ".s3lfsconfig").write_text("endpint_url: typo\n")
+        with patch("builtins.print") as mock_print:
+            config = load_config(self.temp_dir)
+        self.assertEqual(config, {})
+        self.assertTrue(
+            any("endpint_url" in str(c) for c in mock_print.call_args_list),
+            "a misspelled key that changes where data goes was ignored silently",
+        )

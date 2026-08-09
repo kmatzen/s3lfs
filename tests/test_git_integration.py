@@ -464,7 +464,7 @@ class TestSyncCommand(GitRepoTestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertEqual(Path("data/a.bin").read_text(), "PRECIOUS UNSAVED WORK")
-        self.assertIn("locally modified", result.output)
+        self.assertIn("not in S3", result.output)
 
     def test_sync_force_overwrites_locally_modified_file(self):
         self._track_and_commit("data/a.bin", "v1", "track v1")
@@ -527,7 +527,7 @@ class TestSyncCommand(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertTrue(Path("data/a.bin").exists())
         self.assertEqual(Path("data/a.bin").read_text(), "local edits worth keeping")
-        self.assertIn("local modifications", result.output)
+        self.assertIn("not in S3", result.output)
 
     def test_sync_no_prune_keeps_dropped_files(self):
         self._track_and_commit("data/a.bin", "a", "track a")
@@ -946,3 +946,197 @@ class TestCloneCommand(GitRepoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHooksDirResolution(GitRepoTestCase):
+    """Hooks must be found via git, not by assuming .git is a directory."""
+
+    def test_install_works_in_a_linked_worktree(self):
+        """In a linked worktree .git is a *file*, so guessing
+        git_root/.git/hooks fails with NotADirectoryError."""
+        self._commit_all("initial")
+        worktree = Path(self.temp_dir).parent / "s3lfs-wt"
+        self.addCleanup(shutil.rmtree, worktree, ignore_errors=True)
+        made = self._git("worktree", "add", "-q", str(worktree))
+        self.assertEqual(made.returncode, 0, msg=made.stdout + made.stderr)
+
+        os.chdir(worktree)
+        try:
+            self.assertTrue((worktree / ".git").is_file())
+            result = self.runner.invoke(cli, ["install"])
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertNotIn("Traceback", result.output)
+        finally:
+            os.chdir(self.temp_dir)
+
+
+class TestSyncOnBranchWithoutManifest(GitRepoTestCase):
+    def test_reports_instead_of_failing(self):
+        """Checking out a branch from before s3lfs is normal; the
+        post-checkout hook must not report an error for it."""
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        self._git("checkout", "-q", "-b", "pre-s3lfs")
+        self._git("rm", "-q", ".s3_manifest.yaml")
+        self._git("commit", "-qm", "before s3lfs")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("nothing to sync", result.output)
+
+
+class TestRevisionManifestRobustness(GitRepoTestCase):
+    def test_unparseable_baseline_is_treated_as_no_baseline(self):
+        """A manifest committed with conflict markers -- what a teammate
+        without the merge driver produces -- must not raise a traceback out
+        of a post-checkout hook."""
+        good = Path(".s3_manifest.yaml").read_text()
+        Path(".s3_manifest.yaml").write_text(
+            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n"
+        )
+        self._git("add", "-f", ".s3_manifest.yaml")
+        self._git("commit", "-qm", "conflicted manifest")
+        # Working tree is fine again; only the committed baseline is broken.
+        Path(".s3_manifest.yaml").write_text(good)
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("Traceback", result.output)
+
+    def test_conflicted_working_manifest_explains_itself(self):
+        """A bare YAML traceback does not tell the user what to do."""
+        Path(".s3_manifest.yaml").write_text(
+            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n"
+        )
+        result = self.runner.invoke(cli, ["status"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        message = str(result.exception) if result.exception else result.output
+        self.assertIn("merge conflict markers", message)
+        self.assertIn("s3lfs install", message)
+
+
+class TestPreCommitStaging(GitRepoTestCase):
+    def test_stages_gitignore_alongside_the_manifest(self):
+        """track writes both; committing one without the other leaves the
+        ignore rules and the tracked set out of step."""
+        self._commit_all("initial")
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+
+        result = self.runner.invoke(cli, ["pre-commit"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        staged = self._git("diff", "--cached", "--name-only").stdout.split()
+        self.assertIn(".s3_manifest.yaml", staged)
+        self.assertIn(".gitignore", staged)
+
+
+class TestMergeDriverRobustness(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.runner = CliRunner()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _write(self, name, text):
+        path = self.temp_dir / name
+        path.write_text(text)
+        return path
+
+    def test_null_valued_key_is_not_dropped(self):
+        """Absence and a null value are different things."""
+        doc = "bucket_name: b\nrepo_prefix: p\nendpoint_url: null\nfiles: {}\n"
+        base = self._write("base.yaml", doc)
+        ours = self._write("ours.yaml", doc.replace("files: {}", "files:\n  a: h1"))
+        theirs = self._write("theirs.yaml", doc.replace("files: {}", "files:\n  b: h2"))
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs), "m.yaml"]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        merged = yaml.safe_load(ours.read_text())
+        self.assertIn("endpoint_url", merged)
+        self.assertIsNone(merged["endpoint_url"])
+
+    def test_gitignore_detected_without_the_path_argument(self):
+        """A stale driver config may not pass %P; a .gitignore must not be
+        parsed as -- or overwritten by -- a manifest."""
+
+        def block(*entries):
+            lines = [S3LFS_GITIGNORE_START, *entries, S3LFS_GITIGNORE_END]
+            return "\n".join(lines) + "\n"
+
+        base = self._write("base.gi", block("/a.bin"))
+        ours = self._write("ours.gi", block("/a.bin", "/ours.bin"))
+        theirs = self._write("theirs.gi", block("/a.bin", "/theirs.bin"))
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs)]
+        )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        merged = ours.read_text()
+        self.assertIn("/ours.bin", merged)
+        self.assertIn("/theirs.bin", merged)
+        self.assertIn(S3LFS_GITIGNORE_START, merged)
+
+    def test_unmergeable_input_does_not_claim_git_falls_back(self):
+        base = self._write("base.yaml", "not: [a, manifest\n")
+        ours = self._write("ours.yaml", "files: {}\n")
+        theirs = self._write("theirs.yaml", "files: {}\n")
+
+        result = self.runner.invoke(
+            cli, ["merge-driver", str(base), str(ours), str(theirs), "m.yaml"]
+        )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertNotIn("falling back to git", result.output)
+        self.assertIn("resolve it by hand", result.output)
+
+
+class TestSyncNeverRemovesUnrecoverableContent(GitRepoTestCase):
+    """The rule verified in specs/S3lfsWorkingCopy.tla: only take bytes off
+    disk when those bytes can be fetched back from S3.
+
+    Matching the hash the manifest recorded is not enough -- the object
+    behind that hash may since have been garbage-collected, making the copy
+    on disk the last one. TLC found this trace against the weaker rule.
+    """
+
+    def test_prune_keeps_a_file_whose_object_was_collected(self):
+        # track -> commit -> remove -> cleanup -> sync
+        self._write("data/a.bin", "the only copy")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+        cleanup = self.runner.invoke(cli, ["cleanup", "--force"])
+        self.assertEqual(cleanup.exit_code, 0, msg=cleanup.output)
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(
+            Path("data/a.bin").exists(),
+            "sync deleted the last copy of content that is no longer in S3",
+        )
+        self.assertEqual(Path("data/a.bin").read_text(), "the only copy")
+        self.assertIn("not in S3", result.output)
+
+    def test_force_still_removes_it(self):
+        self._write("data/a.bin", "the only copy")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+        self.runner.invoke(cli, ["cleanup", "--force"])
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1", "--force"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertFalse(Path("data/a.bin").exists())

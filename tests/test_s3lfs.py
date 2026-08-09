@@ -3612,3 +3612,50 @@ class TestS3LFS(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestChunkListingPagination(unittest.TestCase):
+    """A single list_objects_v2 call stops at 1000 keys. Deriving a chunk
+    count from a truncated listing rebuilds a short file and reports
+    success, so the listing must follow continuation tokens."""
+
+    def test_list_keys_follows_continuation_tokens(self):
+        from unittest.mock import MagicMock
+
+        s3lfs = S3LFS.__new__(S3LFS)
+        s3lfs.bucket_name = "b"
+        client = MagicMock()
+        client.list_objects_v2.side_effect = [
+            {
+                "Contents": [{"Key": f"k{i}"} for i in range(1000)],
+                "IsTruncated": True,
+                "NextContinuationToken": "tok",
+            },
+            {"Contents": [{"Key": "k1000"}], "IsTruncated": False},
+        ]
+        s3lfs._get_s3_client = lambda: client
+
+        keys = s3lfs._list_keys("prefix")
+
+        self.assertEqual(len(keys), 1001)
+        self.assertIn("k1000", keys)
+        self.assertEqual(client.list_objects_v2.call_count, 2)
+        second = client.list_objects_v2.call_args_list[1].kwargs
+        self.assertEqual(second["ContinuationToken"], "tok")
+
+    def test_stops_on_a_response_that_is_not_a_real_page(self):
+        """Only a genuine continuation token continues the loop.
+
+        Testing IsTruncated for truthiness is not enough: a stub client or
+        an unexpected response shape makes every field truthy, which reads
+        as "more pages" forever. This hung the test suite once.
+        """
+        from unittest.mock import MagicMock
+
+        s3lfs = S3LFS.__new__(S3LFS)
+        s3lfs.bucket_name = "b"
+        client = MagicMock()
+        s3lfs._get_s3_client = lambda: client
+
+        self.assertEqual(s3lfs._list_keys("prefix"), [])
+        self.assertEqual(client.list_objects_v2.call_count, 1)
