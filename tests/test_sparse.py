@@ -164,10 +164,12 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
         self.runner.invoke(cli, ["track", "drop/out.bin"])
         self._commit_all("update both")
 
-        # Narrow to keep/ and remove the out-of-profile file from disk
+        # Narrow to keep/ and remove the out-of-profile file from disk.
+        # keep/in.bin goes back to the previous revision's content, which is
+        # the clean state sync is allowed to update.
         self._enable_sparse("keep")
         Path("drop/out.bin").unlink()
-        self._write("keep/in.bin", "stale")
+        self._write("keep/in.bin", "keep-v1")
 
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)

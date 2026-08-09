@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from s3lfs.cli import (
     S3LFS_HOOK_END,
     S3LFS_HOOK_START,
+    HookInstallError,
     _get_hooks_dir,
     _install_hook,
     _uninstall_hook,
@@ -75,6 +76,45 @@ class TestInstallHookHelper(unittest.TestCase):
         self.assertIn("echo v2", content)
         # Only one start marker
         self.assertEqual(content.count(S3LFS_HOOK_START), 1)
+
+    def test_block_goes_before_a_top_level_exit(self):
+        """Appending after `exit 0` installs dead code.
+
+        Plenty of real hooks end that way (git's own samples, husky). The
+        failure is silent: install reports success, nothing ever runs, and
+        the first collaborator to check out gets 404s on every asset.
+        """
+        hook_path = self.hooks_dir / "pre-commit"
+        hook_path.write_text("#!/bin/sh\necho existing\nexit 0\n")
+
+        block = f"{S3LFS_HOOK_START}\necho s3lfs\n{S3LFS_HOOK_END}"
+        _install_hook(self.hooks_dir, "pre-commit", block)
+
+        content = hook_path.read_text()
+        self.assertIn("echo existing", content)
+        self.assertLess(
+            content.index("echo s3lfs"),
+            content.index("exit 0"),
+            "s3lfs block is unreachable behind an exit",
+        )
+        # And it really runs
+        result = subprocess.run(
+            ["/bin/sh", str(hook_path)], capture_output=True, text=True
+        )
+        self.assertIn("s3lfs", result.stdout)
+
+    def test_refuses_a_non_shell_hook(self):
+        """A shell block in a Python hook is a syntax error that would
+        break every commit in the repository."""
+        hook_path = self.hooks_dir / "pre-commit"
+        original = "#!/usr/bin/env python3\nprint('hi')\n"
+        hook_path.write_text(original)
+
+        block = f"{S3LFS_HOOK_START}\necho s3lfs\n{S3LFS_HOOK_END}"
+        with self.assertRaises(HookInstallError):
+            _install_hook(self.hooks_dir, "pre-commit", block)
+
+        self.assertEqual(hook_path.read_text(), original)
 
     def test_preserves_existing_hook_content_on_replace(self):
         """Existing non-s3lfs content is preserved when replacing."""

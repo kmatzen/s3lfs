@@ -76,7 +76,9 @@ s3lfs track "*.mp4"                      # Track all MP4 files
 s3lfs track --modified                   # Track only changed files
 ```
 
-**Git protection**: Tracking a path also adds it to a marked block in `.gitignore` (so `git add .` won't commit the large files to git) and, if any of the files were already committed to git, removes them from the git index (`git rm --cached`; the files stay on disk). `s3lfs remove` removes the corresponding `.gitignore` entry again.
+**Git protection**: Tracking a path also adds it to a marked block in `.gitignore` (so `git add .` won't commit the large files to git) and, if any of the files were already committed to git, removes them from the git index (`git rm --cached`; the files stay on disk). `s3lfs remove` removes the corresponding `.gitignore` entries again.
+
+A literal path or directory becomes one `.gitignore` entry per tracked file, not a blanket `/dir/` pattern -- so a source file added under a tracked directory later stays visible to git rather than being silently ignored by one tool and untracked by the other. A glob spec (`"*.mp4"`) is used as-is, since it is already precise.
 
 ### Checkout Files
 ```sh
@@ -195,9 +197,12 @@ s3lfs sync --from HEAD~1
 ```
 **Description**: Brings tracked files in line with the current manifest. With `--from`, only entries that differ from that revision's manifest are considered, which is what makes branch switches cheap: `checkout --all` re-hashes every tracked file, while a diff touches only what actually changed. Files that the manifest no longer lists are deleted, mirroring what git does for files absent from the branch you switch to -- but only when their content still matches what the old manifest recorded, so local modifications are never destroyed. This is what the post-checkout, post-merge, and post-rewrite hooks run.
 
+**Safety**: `sync` never overwrites or deletes a tracked file whose content differs from what the manifest recorded -- that content exists nowhere else, and since tracked files are gitignored, git cannot warn you it is dirty. Such files are listed and left alone; upload them with `s3lfs track --modified`, or pass `--force` to discard them.
+
 **Options**:
 - `--from REV`: Diff against this revision's manifest (without it, checks every tracked file)
 - `--no-prune`: Keep files the manifest no longer lists
+- `--force`: Overwrite and delete locally modified files instead of keeping them
 - `--verbose`, `--no-sign-request`, `--endpoint-url`, `--workers`: As in other commands
 
 ### Show Sparse Profile
@@ -234,6 +239,8 @@ s3lfs install
 - `pre-push`: Verifies the manifests being pushed reference uploaded content (runs `s3lfs verify` for each pushed ref); aborts the push if content is missing
 
 **Merge driver**: `install` also registers a merge driver for `.s3_manifest.yaml` and `.gitignore`. Two branches that each track different files both rewrite those files, which git's line-based merge calls a conflict even though the change is a clean union. The driver merges the manifest key-wise and the s3lfs `.gitignore` block as a set union, and only reports a conflict when both sides really changed the same path to different content. The `.gitattributes` entry is committed so teammates inherit the rule; the driver itself is local config, and git falls back to its normal merge for anyone who hasn't run `s3lfs install`.
+
+If an existing hook file cannot safely host the s3lfs block -- it is not a shell script, for instance -- `install` says so and skips that hook rather than writing something that would break or silently never run.
 
 The post-* hooks are non-blocking -- if s3lfs fails or is not available, the git operation continues with a warning. The pre-commit and pre-push hooks abort their git operation on failure (bypass with `--no-verify`), because committing or pushing a manifest whose hashes have no objects behind them breaks every collaborator's checkout. Hooks are appended to existing hook files, preserving any other hooks you have.
 
