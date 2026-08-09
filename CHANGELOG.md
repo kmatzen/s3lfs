@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pre-commit and pre-push hooks warn when the repository uses s3lfs but `s3lfs` is not on `PATH` -- common when git is driven from an IDE. They previously did nothing at all, silently.
 
 ### Fixed
+- `specs/check.sh` runs the configurations that expect a violation with a single TLC worker, and accepts any of the invariants a multi-defect configuration legitimately breaks. TLC stops at the first violation it finds, so with several workers the invariant reported depends on which state a machine reaches first -- the check passed locally and failed in CI on a different core count.
 - `specs/README.md` described the chunked-upload defect as present in current code. It was fixed some releases ago; the code implements the verified `CommitAfter` design, and `check.sh` now enforces that.
 - `specs/check.sh` gives each model check its own TLC metadata directory. TLC names it from the wall clock to the second, so back-to-back runs of one module collided and the second died before checking anything -- which looked exactly like a property having changed. Failures now also print TLC's output, so "did not run" is distinguishable from "no longer holds".
 
