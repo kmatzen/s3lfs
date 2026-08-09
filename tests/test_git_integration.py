@@ -1547,3 +1547,39 @@ class TestGitignoreUpgrade(GitRepoTestCase):
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
         self.assertIn("/other/b.bin", entries)
         self.assertIn("/data/", entries)
+
+
+class TestHookQuietness(GitRepoTestCase):
+    """The pre-commit hook runs on every commit. A progress bar and a
+    running commentary for a scan that usually finds nothing is noise the
+    user cannot turn off, and it buries the messages that do matter."""
+
+    def test_pre_commit_says_nothing_when_there_is_nothing_to_say(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        result = self.runner.invoke(cli, ["pre-commit"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("Checking files", result.output)
+        self.assertNotIn("file/s", result.output)
+        self.assertNotIn("No modified files needing upload", result.output)
+
+    def test_it_still_reports_what_it_uploaded(self):
+        self._write("data/a.bin", "v1")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+        self._write("data/a.bin", "v2")
+
+        result = self.runner.invoke(cli, ["pre-commit"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("data/a.bin", result.output)
+
+    def test_verbose_track_still_shows_progress(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+
+        result = self.runner.invoke(cli, ["track", "--modified", "--verbose"])
+        self.assertIn("Checking", result.output)
