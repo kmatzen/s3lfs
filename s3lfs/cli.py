@@ -1598,6 +1598,38 @@ def _deindex_tracked_files(git_root, tracked_keys):
     return offenders
 
 
+def _apply_gitignore_entries(git_root, entries):
+    """Add these entries, dropping any a new directory entry makes redundant.
+
+    Versions 0.3.0-0.5.0 wrote one entry per tracked file. Adding the
+    directory pattern without removing those would leave the quadratic
+    block in place, so upgrading would fix nothing for the repositories
+    that need it most. Returns (added, removed).
+    """
+    before, existing, after = _load_gitignore_block(git_root)
+    directories = tuple(e for e in entries if e.endswith("/"))
+
+    kept, removed = [], []
+    for entry in existing:
+        if entry not in directories and entry.startswith(directories):
+            removed.append(entry)
+        else:
+            kept.append(entry)
+
+    added = [e for e in entries if e not in kept]
+    if not added and not removed:
+        return [], []
+    _save_marked_block(
+        git_root / ".gitignore",
+        S3LFS_GITIGNORE_START,
+        S3LFS_GITIGNORE_END,
+        before,
+        kept + added,
+        after,
+    )
+    return added, removed
+
+
 def _protect_tracked_path(git_root, s3lfs, manifest_key):
     """Keep a newly tracked path spec out of git: ignore it and de-index it."""
     s3lfs.load_manifest()
@@ -1612,9 +1644,15 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         )
         return
 
-    added = _add_gitignore_entries(
+    added, removed = _apply_gitignore_entries(
         git_root, _gitignore_entries_for(git_root, manifest_key, matched.keys())
     )
+    if removed:
+        click.echo(
+            f"Replaced {len(removed)} per-file .gitignore entr(y/ies) with a "
+            "directory pattern; git matches every path against every pattern, "
+            "so the per-file form made 'git status' quadratic."
+        )
     if added:
         shown = ", ".join(f"'{e}'" for e in added[:3])
         more = f" and {len(added) - 3} more" if len(added) > 3 else ""
