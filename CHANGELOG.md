@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-08-09
 
 ### Added
 - **Adaptive compression.** Each file's content is sampled at upload; files that don't compress -- images, video, model weights, archives -- are stored **raw, under their natural key, byte-identical to the original**. Two effects: no more gzip time spent achieving nothing (cold upload of 200 MB of incompressible data: 2.34s to 1.49s even against a local server), and the stored object is directly usable by any S3 tool, addressing the "opaque format" objection to adopting s3lfs for long-term storage. `compression: auto|always|never` in `.s3lfsconfig`; compressible files still get gzip.
