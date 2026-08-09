@@ -1809,7 +1809,7 @@ class S3LFS:
 
     def _hash_file_cli(self, file_path):
         """
-        Compute the SHA-256 hash using the `sha256sum` CLI utility (POSIX only).
+        Compute the SHA-256 hash using the `sha256sum` CLI utility.
         """
         result = subprocess.run(
             ["sha256sum", str(file_path)],
@@ -1817,7 +1817,16 @@ class S3LFS:
             text=True,
             check=True,
         )
-        return result.stdout.split()[0]  # Extract the hash from the output
+        # GNU coreutils prefixes the whole line with a backslash when the
+        # filename needed escaping -- which every Windows path does, since
+        # backslash is its separator. Taking that byte as part of the hash
+        # produced 65-character "hashes", which became S3 keys, which then
+        # failed every checksum comparison downstream.
+        digest = result.stdout.split()[0].lstrip("\\").lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            # Unparseable tool output must not become an object key.
+            return self._hash_file_mmap(file_path)
+        return digest
 
     def md5_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
         """
@@ -1891,7 +1900,11 @@ class S3LFS:
                 text=True,
                 check=True,
             )
-            return result.stdout.split()[0]  # Extract the hash from the output
+            # Same coreutils backslash-escape prefix as sha256sum.
+            digest = result.stdout.split()[0].lstrip("\\").lower()
+            if len(digest) != 32 or any(c not in "0123456789abcdef" for c in digest):
+                return self._md5_file_mmap(file_path)
+            return digest
         elif sys.platform.startswith("darwin") and shutil.which("md5"):
             # macOS: use md5 -r (for raw output similar to md5sum)
             result = subprocess.run(
