@@ -280,6 +280,15 @@ class S3LFS:
         self.load_manifest()
         self.load_cache()
 
+        def stored_config():
+            return (
+                self.manifest.get("bucket_name"),
+                self.manifest.get("repo_prefix"),
+                self.manifest.get("endpoint_url"),
+            )
+
+        config_before = stored_config()
+
         # Use the stored bucket name if none is provided
         with self._lock_context():
             if bucket_name:
@@ -307,7 +316,13 @@ class S3LFS:
             else:
                 self.endpoint_url = self.manifest.get("endpoint_url")
 
-            self.save_manifest()
+            # Only write when construction actually changed the stored
+            # configuration. The manifest is a git-tracked file, and an
+            # unconditional write here dirties the working tree on every
+            # read-only command and every sync hook -- which breaks clean-tree
+            # checks in CI and can overwrite an unresolved merge.
+            if stored_config() != config_before:
+                self.save_manifest()
 
         self.encryption = encryption
 
@@ -1992,11 +2007,15 @@ class S3LFS:
                 f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
             )
 
-    def parallel_download_all(self, silence=True, only=None):
+    def parallel_download_all(self, silence=True, only=None, preserve_modified=False):
         """Download all files using block-level parallelism.
 
         :param only: optional collection of manifest keys to limit the
             download to, used to honour a sparse profile.
+        :param preserve_modified: if True, never overwrite a file whose
+            content differs from the manifest. Tracked files are gitignored,
+            so git cannot warn about local edits to them; an automatic
+            caller (a hook) must not destroy work the user has not uploaded.
         """
         with self._lock_context():
             items = list(self.manifest["files"].items())
@@ -2012,6 +2031,7 @@ class S3LFS:
         print("Starting block-level parallel download of all tracked files...")
 
         files_to_download = []
+        modified = []
         for manifest_key, file_hash in items:
             filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
             if filesystem_path.exists():
@@ -2020,7 +2040,21 @@ class S3LFS:
                     if not silence:
                         print(f"  Skipping {manifest_key} (up-to-date)")
                     continue
+                if preserve_modified:
+                    modified.append(manifest_key)
+                    continue
             files_to_download.append((manifest_key, file_hash))
+
+        if modified:
+            print(
+                f"Keeping {len(modified)} locally modified file(s); "
+                "upload with 's3lfs track --modified' or overwrite with "
+                "'s3lfs checkout --all':"
+            )
+            for manifest_key in sorted(modified)[:10]:
+                print(f"  {manifest_key}")
+            if len(modified) > 10:
+                print(f"  ... and {len(modified) - 10} more")
 
         if not files_to_download:
             print("All files are up-to-date.")

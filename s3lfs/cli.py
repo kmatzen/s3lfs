@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -342,6 +343,11 @@ def _prune_empty_parents(git_root, path):
     default=True,
     help="Delete tracked files that the current manifest no longer lists",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite and delete locally modified files instead of keeping them",
+)
 @click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
 @click.option(
     "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
@@ -361,6 +367,7 @@ def _prune_empty_parents(git_root, path):
 def sync(
     from_revision,
     prune,
+    force,
     no_sign_request,
     use_acceleration,
     endpoint_url,
@@ -410,25 +417,52 @@ def sync(
                 f"No manifest available at {from_revision}; "
                 "falling back to a full checkout."
             )
-        s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
+        s3lfs.parallel_download_all(
+            silence=not verbose, only=set(wanted), preserve_modified=not force
+        )
     else:
         changed = {k: h for k, h in wanted.items() if previous.get(k) != h}
         if not changed and not to_remove:
             click.echo("Tracked files are already in sync.")
             return
         if changed:
-            # The diff says which entries could differ on disk; the disk says
-            # which actually do (a file may already hold the target content).
-            states = s3lfs.compare_to_hashes(changed, progress=verbose)
-            to_download = [
-                (key, changed[key])
-                for key, state in states.items()
-                if state != "up_to_date"
-            ]
+            # Two questions, two comparisons. Against the *new* hash: does
+            # this file already hold the target content, so no transfer is
+            # needed? Against the *old* hash: is what is on disk the content
+            # the previous manifest recorded, so overwriting it loses
+            # nothing? A file matching neither has been edited locally, and
+            # since tracked files are gitignored, git never warned about it
+            # and this is the only thing standing between that work and a
+            # silent overwrite.
+            at_target = s3lfs.compare_to_hashes(changed, progress=verbose)
+            baseline = {k: previous[k] for k in changed if k in previous}
+            at_baseline = s3lfs.compare_to_hashes(baseline, progress=verbose)
+
+            to_download = []
+            locally_modified = []
+            for key in changed:
+                if at_target.get(key) == "up_to_date":
+                    continue
+                if at_target.get(key) == "missing":
+                    to_download.append((key, changed[key]))
+                elif force or at_baseline.get(key) == "up_to_date":
+                    to_download.append((key, changed[key]))
+                else:
+                    locally_modified.append(key)
+
+            if locally_modified:
+                click.echo(
+                    f"Keeping {len(locally_modified)} locally modified file(s); "
+                    "upload with 's3lfs track --modified', or discard with "
+                    "'s3lfs sync --force':"
+                )
+                for key in sorted(locally_modified):
+                    click.echo(f"  {key}")
+
             if to_download:
                 click.echo(f"Downloading {len(to_download)} changed file(s)...")
                 s3lfs.parallel_download_chunked(to_download, silence=not verbose)
-            else:
+            elif not locally_modified:
                 click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
 
     if to_remove and prune:
@@ -437,23 +471,34 @@ def sync(
         # only copy.
         states = s3lfs.compare_to_hashes(to_remove, progress=verbose)
         removed = 0
+        failed = []
         for key, state in sorted(states.items()):
             if state == "missing":
                 continue
-            if state == "modified":
+            if state == "modified" and not force:
                 click.echo(
                     f"Keeping {key}: it is no longer materialized here but has "
                     "local modifications."
                 )
                 continue
             filesystem_path = path_resolver.to_filesystem_path(key)
-            filesystem_path.unlink()
+            try:
+                filesystem_path.unlink()
+            except OSError as e:
+                # Keep going: a partial prune that reports what it could not
+                # remove beats stopping halfway with no summary.
+                failed.append(f"{key}: {e}")
+                continue
             _prune_empty_parents(git_root, filesystem_path)
             removed += 1
             if verbose:
                 click.echo(f"  Removed {key}")
         if removed:
             click.echo(f"Removed {removed} file(s) not materialized here.")
+        if failed:
+            click.echo(f"Could not remove {len(failed)} file(s):")
+            for message in failed:
+                click.echo(f"  {message}")
 
 
 @cli.command()
@@ -698,6 +743,10 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
     filesystem_path = path_resolver.to_filesystem_path(manifest_key)
     is_single_file = not has_glob and filesystem_path.is_file()
 
+    # Capture what this spec covers before removing it, so the matching
+    # .gitignore entries can be dropped afterwards.
+    doomed = set(versioner._resolve_manifest_paths(manifest_key))
+
     if is_single_file:
         # Optimize single file removal
         versioner.remove_file(manifest_key, keep_in_s3=not purge_from_s3)
@@ -707,7 +756,9 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
         # Note: This is manifest-only; files on disk are not affected
         versioner.remove_subtree(manifest_key, keep_in_s3=not purge_from_s3)
 
-    if _remove_gitignore_entry(git_root, {f"/{manifest_key}", f"/{manifest_key}/"}):
+    stale = {f"/{manifest_key}", f"/{manifest_key}/"}
+    stale.update(f"/{_escape_gitignore(key)}" for key in doomed)
+    if _remove_gitignore_entry(git_root, stale):
         click.echo(f"Removed '{manifest_key}' from the s3lfs block in .gitignore")
 
 
@@ -1159,18 +1210,39 @@ def _remove_gitignore_entry(git_root, entry_variants):
     )
 
 
-def _gitignore_entry_for(git_root, manifest_key):
-    """Root-anchored .gitignore pattern covering a tracked path spec.
+_GITIGNORE_METACHARACTERS = re.compile(r"([\[\]*?\\])")
 
-    Manifest keys are relative to the git root, so anchoring with a
-    leading slash keeps the pattern from matching same-named paths in
-    other directories. Glob specs pass through: both glob.glob (used to
-    resolve them at track time) and gitignore give an unanchored '*' the
-    same single-level meaning.
+
+def _escape_gitignore(path):
+    """Escape a literal path so gitignore reads it as literal text.
+
+    A directory called `runs[2024]` is a character class to gitignore and
+    matches nothing, so the files under it would silently stay in git --
+    the exact outcome this .gitignore block exists to prevent.
     """
-    if (git_root / manifest_key).is_dir():
-        return f"/{manifest_key}/"
-    return f"/{manifest_key}"
+    return _GITIGNORE_METACHARACTERS.sub(r"\\\1", path)
+
+
+def _has_glob(spec):
+    return any(ch in spec for ch in "*?[")
+
+
+def _gitignore_entries_for(spec, matched_keys):
+    """Root-anchored .gitignore patterns covering what a spec actually tracked.
+
+    A glob spec is used verbatim: it is already precise, and gitignore
+    gives an unanchored '*' the same single-level meaning glob.glob does.
+
+    Anything else expands to one entry per tracked file rather than a
+    directory pattern. `/data/` would ignore everything under data/ for
+    all time, so a source file added there later is invisible to git
+    (ignored) *and* to s3lfs (not in the manifest) -- it exists only on
+    one machine. Listing the tracked files ignores exactly what s3lfs
+    stores and nothing else.
+    """
+    if _has_glob(spec):
+        return [f"/{spec}"]
+    return [f"/{_escape_gitignore(key)}" for key in sorted(matched_keys)]
 
 
 def _deindex_tracked_files(git_root, tracked_keys):
@@ -1226,12 +1298,24 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
     s3lfs.load_manifest()
     matched = s3lfs._resolve_manifest_paths(manifest_key)
     if not matched:
-        # The spec tracked nothing; leave git configuration alone.
+        # Silence here would be indistinguishable from success, and the user
+        # would believe a large file is safely in S3 when nothing was stored.
+        click.echo(
+            f"Warning: nothing was tracked for '{manifest_key}'. "
+            "Paths outside the repository (including symlinks that point "
+            "outside it) and paths matching no file are skipped."
+        )
         return
 
-    entry = _gitignore_entry_for(git_root, manifest_key)
-    if _add_gitignore_entry(git_root, entry):
-        click.echo(f"Added '{entry}' to .gitignore (s3lfs block)")
+    added = [
+        entry
+        for entry in _gitignore_entries_for(manifest_key, matched.keys())
+        if _add_gitignore_entry(git_root, entry)
+    ]
+    if added:
+        shown = ", ".join(f"'{e}'" for e in added[:3])
+        more = f" and {len(added) - 3} more" if len(added) > 3 else ""
+        click.echo(f"Added {shown}{more} to .gitignore (s3lfs block)")
 
     removed = _deindex_tracked_files(git_root, matched.keys())
     if removed:
@@ -1389,20 +1473,58 @@ def _get_hooks_dir(git_root):
     return git_root / ".git" / "hooks"
 
 
+class HookInstallError(Exception):
+    """The existing hook cannot safely carry an s3lfs block."""
+
+
+# A hook whose interpreter is not a POSIX shell cannot host a shell block:
+# appending one is a syntax error that breaks every commit in the repo.
+_SHELL_SHEBANGS = ("sh", "bash", "dash", "zsh", "ksh")
+
+# Any top-level `exit` ends the script, so a block appended after one never
+# runs -- silently, while `s3lfs install` reports success.
+_TOP_LEVEL_EXIT = re.compile(r"^[ \t]*exit\b", re.MULTILINE)
+
+
+def _hook_interpreter_is_shell(content):
+    lines = content.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        # No shebang: git runs it with sh, which is what we generate.
+        return True
+    return any(name in lines[0] for name in _SHELL_SHEBANGS)
+
+
 def _install_hook(hooks_dir, hook_name, hook_block):
-    """Install an s3lfs hook block into a git hook file."""
+    """Install an s3lfs hook block into a git hook file.
+
+    :raises HookInstallError: if the existing hook cannot host the block.
+    """
     hook_path = hooks_dir / hook_name
     shebang = "#!/bin/sh\n"
 
     if hook_path.exists():
         content = hook_path.read_text()
         if S3LFS_HOOK_START in content:
-            import re
-
             pattern = re.escape(S3LFS_HOOK_START) + r".*?" + re.escape(S3LFS_HOOK_END)
-            content = re.sub(pattern, hook_block, content, flags=re.DOTALL)
+            content = re.sub(pattern, lambda _m: hook_block, content, flags=re.DOTALL)
         else:
-            content = content.rstrip("\n") + "\n\n" + hook_block + "\n"
+            if not _hook_interpreter_is_shell(content):
+                raise HookInstallError(
+                    f"{hook_path} is not a shell script, so an s3lfs shell "
+                    "block cannot be added to it. Call 's3lfs' from that hook "
+                    "yourself, or move it aside."
+                )
+            lines = content.splitlines()
+            insert_at = 1 if lines and lines[0].startswith("#!") else 0
+            if _TOP_LEVEL_EXIT.search("\n".join(lines[insert_at:])):
+                # Appending would put the block after an `exit`, where it
+                # would never run. Go directly after the shebang instead so
+                # it executes, rather than installing dead code.
+                body = lines[:insert_at] + ["", *hook_block.splitlines(), ""]
+                body += lines[insert_at:]
+                content = "\n".join(body).rstrip("\n") + "\n"
+            else:
+                content = content.rstrip("\n") + "\n\n" + hook_block + "\n"
     else:
         content = shebang + "\n" + hook_block + "\n"
 
@@ -1432,8 +1554,6 @@ def _write_hook_atomically(hook_path, content):
 
 def _uninstall_hook(hooks_dir, hook_name):
     """Remove the s3lfs hook block from a git hook file."""
-    import re
-
     hook_path = hooks_dir / hook_name
     if not hook_path.exists():
         return False
@@ -1476,9 +1596,20 @@ def install():
     hooks_dir = _get_hooks_dir(git_root)
     hooks_dir.mkdir(parents=True, exist_ok=True)
 
+    problems = []
     for hook_name, hook_block in HOOK_SCRIPTS.items():
-        hook_path = _install_hook(hooks_dir, hook_name, hook_block)
+        try:
+            hook_path = _install_hook(hooks_dir, hook_name, hook_block)
+        except HookInstallError as e:
+            problems.append(str(e))
+            continue
         click.echo(f"  Installed {hook_name} hook -> {hook_path}")
+
+    if problems:
+        click.echo()
+        click.echo("Some hooks could not be installed:")
+        for problem in problems:
+            click.echo(f"  {problem}")
 
     _install_merge_driver(git_root)
     click.echo("  Registered manifest merge driver (.gitattributes, git config)")

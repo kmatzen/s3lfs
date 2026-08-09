@@ -159,15 +159,63 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         check = self._git("check-ignore", "data/big.bin")
         self.assertEqual(check.returncode, 0, "tracked file is not gitignored")
 
-    def test_track_directory_adds_anchored_dir_entry(self):
+    def test_track_directory_ignores_each_tracked_file(self):
+        """A directory spec must not ignore the directory wholesale.
+
+        `/data/` would hide any source file added there later from git,
+        while s3lfs would not be tracking it either -- the file would live
+        on one machine only.
+        """
         self._write("data/a.bin", "a")
         self._write("data/sub/b.bin", "b")
         result = self.runner.invoke(cli, ["track", "data"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertIn("/data/", entries)
+        self.assertEqual(entries, ["/data/a.bin", "/data/sub/b.bin"])
         self.assertEqual(self._git("check-ignore", "data/sub/b.bin").returncode, 0)
+
+        # A file added under the tracked directory afterwards stays visible
+        self._write("data/schema.json", "{}")
+        self.assertNotEqual(
+            self._git("check-ignore", "data/schema.json").returncode,
+            0,
+            "a newly added source file was hidden from git",
+        )
+
+    def test_track_glob_keeps_the_glob(self):
+        """A glob is already precise, so it is used as-is."""
+        self._write("clips/one.mp4", "a")
+        self._write("clips/notes.txt", "b")
+        self.runner.invoke(cli, ["track", "clips/*.mp4"])
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertEqual(entries, ["/clips/*.mp4"])
+        self.assertNotEqual(self._git("check-ignore", "clips/notes.txt").returncode, 0)
+
+    def test_track_escapes_gitignore_metacharacters(self):
+        """Expanded entries must be literal, even for bracketed paths.
+
+        `/data/runs[2024]/a.bin` is a character class to gitignore and
+        matches nothing, so the file would stay visible to git and get
+        committed -- the outcome the .gitignore block exists to prevent.
+        """
+        self._write("data/runs[2024]/a.bin", "a")
+        result = self.runner.invoke(cli, ["track", "data"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertEqual(entries, [r"/data/runs\[2024\]/a.bin"])
+        self.assertEqual(
+            self._git("check-ignore", "data/runs[2024]/a.bin").returncode,
+            0,
+            "tracked file under a bracketed directory is not ignored",
+        )
+
+    def test_track_reports_when_nothing_matched(self):
+        """Silence would be indistinguishable from success."""
+        result = self.runner.invoke(cli, ["track", "no/such/file.bin"])
+        self.assertIn("nothing was tracked", result.output.lower())
 
     def test_track_removes_committed_file_from_index(self):
         """A file already committed to git is de-indexed when handed to s3lfs.
@@ -334,6 +382,31 @@ class TestVerifyCommand(GitRepoTestCase):
         self.assertIn("No manifest at revision", result.output)
 
 
+class TestReadOnlyCommandsLeaveTreeClean(GitRepoTestCase):
+    """The manifest is git-tracked, so commands that only read must not
+    rewrite it -- that dirties the tree on every sync hook and breaks
+    clean-tree checks in CI."""
+
+    def test_read_only_commands_do_not_touch_the_manifest(self):
+        self._commit_all("initial")
+        self.assertEqual(self._git("status", "--porcelain").stdout.strip(), "")
+
+        for args in (["status"], ["sparse"], ["ls"], ["verify"]):
+            self.runner.invoke(cli, args)
+
+        self.assertEqual(
+            self._git("status", "--porcelain").stdout.strip(),
+            "",
+            "a read-only command modified the tracked manifest",
+        )
+
+    def test_init_still_writes_configuration(self):
+        """The guard must not stop a real configuration change landing."""
+        manifest = yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        self.assertEqual(manifest["bucket_name"], TEST_BUCKET)
+        self.assertEqual(manifest["repo_prefix"], "test-prefix")
+
+
 class TestSyncCommand(GitRepoTestCase):
     """s3lfs sync: manifest-diff-based branch switching."""
 
@@ -370,10 +443,52 @@ class TestSyncCommand(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "data/a.bin"])
         self._commit_all("track v2")
 
-        self._write("data/a.bin", "stale")
+        # Put the previous revision's content back on disk. That is the
+        # clean state -- it matches what the old manifest recorded -- so
+        # updating it to v2 loses nothing.
+        self._write("data/a.bin", "v1")
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertEqual(Path("data/a.bin").read_text(), "v2")
+
+    def test_sync_keeps_locally_modified_file(self):
+        """Tracked files are gitignored, so git never warns that one is
+        dirty. sync running from a hook must not be what destroys it."""
+        self._track_and_commit("data/a.bin", "v1", "track v1")
+        self._write("data/a.bin", "v2")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track v2")
+
+        self._write("data/a.bin", "PRECIOUS UNSAVED WORK")
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(Path("data/a.bin").read_text(), "PRECIOUS UNSAVED WORK")
+        self.assertIn("locally modified", result.output)
+
+    def test_sync_force_overwrites_locally_modified_file(self):
+        self._track_and_commit("data/a.bin", "v1", "track v1")
+        self._write("data/a.bin", "v2")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track v2")
+
+        self._write("data/a.bin", "discard me")
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1", "--force"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(Path("data/a.bin").read_text(), "v2")
+
+    def test_full_checkout_fallback_keeps_locally_modified_file(self):
+        """The no-baseline path cannot tell clean from edited, so it must
+        take the conservative option."""
+        self._track_and_commit("data/a.bin", "v1", "track v1")
+        self._write("data/a.bin", "PRECIOUS UNSAVED WORK")
+
+        result = self.runner.invoke(cli, ["sync"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(Path("data/a.bin").read_text(), "PRECIOUS UNSAVED WORK")
+        self.assertIn("locally modified", result.output)
 
     def test_sync_reports_when_already_in_sync(self):
         self._track_and_commit("data/a.bin", "a", "track a")
