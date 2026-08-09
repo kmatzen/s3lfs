@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -2355,6 +2356,175 @@ def sparse(porcelain):
         "materialized here."
     )
     click.echo("Run 's3lfs sync' after changing the patterns.")
+
+
+@cli.command()
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+def doctor(no_sign_request, endpoint_url):
+    """Check that every part of the integration is actually wired up.
+
+    s3lfs depends on parts that fail quietly: hooks that never fire, a
+    merge driver nobody registered, credentials that allow some operations
+    and not others, a sparse checkout hiding the manifest. This checks each
+    one and says what to run to fix it.
+    """
+    failures = 0
+    warnings = 0
+
+    def ok(msg):
+        click.echo(f"  ok       {msg}")
+
+    def warn(msg, fix=None):
+        nonlocal warnings
+        warnings += 1
+        click.echo(f"  WARN     {msg}")
+        if fix:
+            click.echo(f"           fix: {fix}")
+
+    def fail(msg, fix=None):
+        nonlocal failures
+        failures += 1
+        click.echo(f"  FAIL     {msg}")
+        if fix:
+            click.echo(f"           fix: {fix}")
+
+    # --- git ------------------------------------------------------------
+    git_root = find_git_root()
+    if not git_root:
+        fail("not inside a git repository", "run from a repo, or git init")
+        raise SystemExit(1)
+    ok(f"git repository at {git_root}")
+
+    # --- manifest -------------------------------------------------------
+    manifest_path = get_manifest_path(git_root)
+    if not manifest_path.exists():
+        fail("s3lfs is not initialized", "s3lfs init <bucket> <prefix>")
+        raise SystemExit(1)
+    try:
+        s3lfs = _make_s3lfs(
+            git_root,
+            manifest_path,
+            no_sign_request=no_sign_request,
+            endpoint_url=endpoint_url,
+        )
+    except Exception as e:
+        fail(f"manifest cannot be read: {e}")
+        raise SystemExit(1)
+    entries = len(s3lfs.manifest.get("files", {}))
+    sharded = " (sharded)" if s3lfs.is_sharded else ""
+    ok(f"manifest {manifest_path.name}{sharded}: {entries} tracked file(s)")
+
+    if s3lfs.is_sharded and _shards_are_hidden(git_root):
+        fail(
+            "manifest shards are hidden by the sparse checkout",
+            f"git sparse-checkout add {MANIFEST_SHARD_DIR}",
+        )
+
+    from s3lfs.core import USING_LIBYAML
+
+    if USING_LIBYAML:
+        ok("libyaml-backed YAML parser (fast)")
+    else:
+        warn(
+            "pure-Python YAML parser: manifest operations are ~8x slower",
+            "install a PyYAML wheel built with libyaml",
+        )
+
+    # --- hooks ----------------------------------------------------------
+    hooks_dir = _get_hooks_dir(git_root)
+    for hook_name in HOOK_SCRIPTS:
+        hook_path = hooks_dir / hook_name
+        if not hook_path.exists() or S3LFS_HOOK_START not in _read_text_or_empty(
+            hook_path
+        ):
+            warn(f"{hook_name} hook not installed", "s3lfs install")
+        else:
+            ok(f"{hook_name} hook installed")
+
+    driver = subprocess.run(
+        ["git", "config", "merge.s3lfs.driver"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if driver.returncode == 0 and driver.stdout.strip():
+        ok("manifest merge driver registered")
+    else:
+        warn(
+            "manifest merge driver not registered: concurrent manifest "
+            "changes will conflict",
+            "s3lfs install",
+        )
+
+    if shutil.which("s3lfs"):
+        ok("s3lfs is on PATH (hooks can find it)")
+    else:
+        warn(
+            "s3lfs is not on PATH: hooks invoked by git will do nothing",
+            "install s3lfs where git's environment can see it",
+        )
+
+    # --- sparse ---------------------------------------------------------
+    profile = SparseProfile.detect(git_root)
+    if profile.degraded_reason:
+        warn(profile.degraded_reason)
+    elif profile.active:
+        ok("sparse checkout active; s3lfs applies its rules")
+
+    # --- S3 -------------------------------------------------------------
+    probe_key = f"{s3lfs.repo_prefix}/.s3lfs-doctor-probe"
+    client = s3lfs._get_s3_client()
+
+    def s3_probe(name, fn, fix=None):
+        try:
+            fn()
+            ok(f"S3 {name}")
+            return True
+        except Exception as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            fail(f"S3 {name}: {code or e}", fix)
+            return False
+
+    s3_probe(
+        f"list s3://{s3lfs.bucket_name}",
+        lambda: client.list_objects_v2(
+            Bucket=s3lfs.bucket_name, Prefix=s3lfs.repo_prefix, MaxKeys=1
+        ),
+        "check credentials and s3:ListBucket permission",
+    )
+    wrote = s3_probe(
+        "write",
+        lambda: client.put_object(
+            Bucket=s3lfs.bucket_name, Key=probe_key, Body=b"doctor"
+        ),
+        "uploads need s3:PutObject",
+    )
+    if wrote:
+        s3_probe(
+            "read",
+            lambda: client.get_object(Bucket=s3lfs.bucket_name, Key=probe_key),
+            "downloads need s3:GetObject; uploads still work without it",
+        )
+        s3_probe(
+            "delete",
+            lambda: client.delete_object(Bucket=s3lfs.bucket_name, Key=probe_key),
+            "cleanup needs s3:DeleteObject",
+        )
+
+    # --- summary --------------------------------------------------------
+    click.echo()
+    if failures:
+        click.echo(f"{failures} problem(s), {warnings} warning(s).")
+        raise SystemExit(1)
+    if warnings:
+        click.echo(f"No blocking problems; {warnings} warning(s).")
+    else:
+        click.echo("Everything is wired up.")
 
 
 @click.command("merge-driver")

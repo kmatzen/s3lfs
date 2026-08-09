@@ -169,6 +169,12 @@ Reachability is computed on path *and* content hash, matching the storage layout
 s3lfs cleanup --force                    # Clean up without confirmation
 ```
 
+### Diagnose the Setup
+```sh
+s3lfs doctor
+```
+**Description**: Checks that every part of the integration is actually wired up -- git repo, manifest (and shard visibility under a sparse checkout), each git hook, the merge driver, whether hooks can find `s3lfs` on PATH, and live S3 permissions (list/write/read/delete probed individually, so a write-only CI key is diagnosed precisely). Exits non-zero on blocking problems and prints the command that fixes each finding.
+
 ### Verify Uploaded Content
 ```sh
 s3lfs verify
