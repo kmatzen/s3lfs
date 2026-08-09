@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **The CLI can now disable server-side encryption**, via `encryption: false`
+  in `.s3lfsconfig`. s3lfs always sent the AES256 SSE header, and MinIO
+  (and other S3-compatibles without KMS) rejects it, failing every upload
+  with `NotImplemented` -- the Python API had an `encryption=False` escape
+  hatch, the CLI had none. Found when the new benchmark CI job ran the CLI
+  against MinIO for the first time.
+
+### Added
+
+- **Benchmarks run in CI.** Every pull request runs `manifest_scaling.py
+  --check`, which fails the build if sharded manifest reads stop beating a
+  flat manifest by a wide ratio -- a machine-speed-independent guard against
+  performance regressions in the lazy-loading machinery. The
+  s5cmd transfer comparison also runs (against MinIO, informational only)
+  and publishes its table to the CI job summary. README benchmark tables
+  now state when they were measured.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
