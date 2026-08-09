@@ -3633,7 +3633,7 @@ class TestChunkListingPagination(unittest.TestCase):
             },
             {"Contents": [{"Key": "k1000"}], "IsTruncated": False},
         ]
-        s3lfs._get_s3_client = lambda: client
+        s3lfs._get_s3_client = lambda: client  # type: ignore[method-assign]
 
         keys = s3lfs._list_keys("prefix")
 
@@ -3655,7 +3655,7 @@ class TestChunkListingPagination(unittest.TestCase):
         s3lfs = S3LFS.__new__(S3LFS)
         s3lfs.bucket_name = "b"
         client = MagicMock()
-        s3lfs._get_s3_client = lambda: client
+        s3lfs._get_s3_client = lambda: client  # type: ignore[method-assign]
 
         self.assertEqual(s3lfs._list_keys("prefix"), [])
         self.assertEqual(client.list_objects_v2.call_count, 1)
