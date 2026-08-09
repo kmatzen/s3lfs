@@ -30,8 +30,8 @@ def timed(fn):
 def build(root, entries, shards, sharded):
     """Write a manifest of *entries* keys spread over *shards* directories."""
     per = entries // shards
-    files = {}
-    grouped = {}
+    files: dict = {}
+    grouped: dict = {}
     for s in range(shards):
         name = f"dir{s:03d}"
         group = {
@@ -43,7 +43,7 @@ def build(root, entries, shards, sharded):
         grouped[name] = group
         files.update(group)
 
-    config = {"bucket_name": "b", "repo_prefix": "p"}
+    config: dict = {"bucket_name": "b", "repo_prefix": "p"}
     if sharded:
         config["manifest_format"] = "sharded"
         shard_dir = root / ".s3lfs_manifest"
