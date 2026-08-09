@@ -85,6 +85,11 @@ def main():
     ap.add_argument("--compressible", action="store_true")
     ap.add_argument("--s5cmd", default="s5cmd")
     ap.add_argument("--prefix", default="bench")
+    ap.add_argument(
+        "--upload-only",
+        action="store_true",
+        help="Skip download scenarios (for write-only credentials)",
+    )
     args = ap.parse_args()
 
     env = dict(os.environ)
@@ -170,41 +175,44 @@ def main():
         )
 
         # --- download ---------------------------------------------------
-        shutil.rmtree(data_dir)
-        results.append(
-            timed(
-                "s3lfs   cold download",
-                lambda: run(s3lfs + ["checkout", "--all"], cwd=root, env=env),
+        if not args.upload_only:
+            shutil.rmtree(data_dir)
+            results.append(
+                timed(
+                    "s3lfs   cold download",
+                    lambda: run(s3lfs + ["checkout", "--all"], cwd=root, env=env),
+                )
             )
-        )
-        results.append(
-            timed(
-                "s3lfs   no-op download",
-                lambda: run(s3lfs + ["checkout", "--all"], cwd=root, env=env),
+            results.append(
+                timed(
+                    "s3lfs   no-op download",
+                    lambda: run(s3lfs + ["checkout", "--all"], cwd=root, env=env),
+                )
             )
-        )
-        out = root / "s5out"
-        out.mkdir(exist_ok=True)
-        results.append(
-            timed(
-                "s5cmd   cold download",
-                lambda: run(
-                    [args.s5cmd] + s5_endpoint + ["cp", dest + "*", str(out)],
-                    cwd=root,
-                    env=env,
-                ),
+            out = root / "s5out"
+            out.mkdir(exist_ok=True)
+            results.append(
+                timed(
+                    "s5cmd   cold download",
+                    lambda: run(
+                        [args.s5cmd] + s5_endpoint + ["cp", dest + "*", str(out)],
+                        cwd=root,
+                        env=env,
+                    ),
+                )
             )
-        )
-        results.append(
-            timed(
-                "s5cmd   no-op download (sync)",
-                lambda: run(
-                    [args.s5cmd] + s5_endpoint + ["sync", dest + "*", str(out) + "/"],
-                    cwd=root,
-                    env=env,
-                ),
+            results.append(
+                timed(
+                    "s5cmd   no-op download (sync)",
+                    lambda: run(
+                        [args.s5cmd]
+                        + s5_endpoint
+                        + ["sync", dest + "*", str(out) + "/"],
+                        cwd=root,
+                        env=env,
+                    ),
+                )
             )
-        )
 
         print(f"{'scenario':38} {'wall clock':>10}   status")
         for label, elapsed, proc in results:

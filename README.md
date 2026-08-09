@@ -687,7 +687,29 @@ Two related effects worth knowing:
   transfer client (CRT). s3lfs requests it in "auto" mode: it is used where
   it applies (standard AWS S3 endpoints) and boto3 falls back to the classic
   client elsewhere -- MinIO, R2 and other S3-compatibles behave exactly as
-  before.
+  before. Measured against real AWS S3, CRT made no difference for this
+  workload; the remaining gap to raw copy tools is s3lfs's own per-file
+  work, not the HTTP engine.
+
+### Against a raw copy tool, on real S3
+
+Uploading 24 files (201 MB) to AWS S3 us-west-2, versus s5cmd v2.3.0
+(`benchmarks/transfer_comparison.py --upload-only`):
+
+| scenario | s3lfs | s5cmd |
+|---|---|---|
+| cold upload, incompressible data | 3.1s | 2.1s |
+| cold upload, compressible data | **1.0s** | 2.2s |
+| re-run, nothing changed | 0.2s | 0.1s |
+| one file of 24 changed | 0.9s | 0.4s |
+
+On incompressible data s5cmd is ~1.5x faster: it moves bytes and does
+nothing else, while s3lfs also hashes every file (0.5ms/MB -- the price of
+content addressing) and stages a snapshot copy. On compressible data s3lfs
+is ~2x faster, because it sends ~1% of the bytes. Repeat operations are
+sub-second for both. The localhost numbers earlier in this section
+overstate the difference: with a real network under the transfer, the
+fixed per-file costs mostly disappear into it.
 
 If your manifest is small, none of this matters and a single file is simpler.
 Sharding earns its keep somewhere in the tens of thousands of entries, or
