@@ -343,24 +343,40 @@ class S3LFS:
             from botocore import UNSIGNED
             from botocore.config import Config
 
+            # Transport-level (CRC) checksums only where S3 demands them.
+            # boto3 >= 1.36 attaches and validates them by default, which
+            # breaks ranged downloads against S3-compatible backends that
+            # return whole-object checksums for a range (moto, and the same
+            # class of breakage reported for MinIO and R2). s3lfs already
+            # verifies the complete file's SHA-256 against the manifest,
+            # which is end-to-end and strictly stronger than per-request
+            # CRCs. Older botocore without these options lands in except.
+            try:
+                base = Config(
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
+                )
+            except TypeError:
+                base = Config()
+
             kwargs = {}
             if self.endpoint_url:
                 kwargs["endpoint_url"] = self.endpoint_url
             if no_sign_request:
                 if self.use_acceleration:
                     raise RuntimeError(ERROR_MESSAGES["acceleration_not_supported"])
-                config = Config(signature_version=UNSIGNED)
+                config = base.merge(Config(signature_version=UNSIGNED))
                 return boto3.client("s3", config=config, **kwargs)
             else:
                 if self.use_acceleration:
                     # Use transfer acceleration endpoint
                     return boto3.client(
                         "s3",
-                        config=Config(s3={"use_accelerate_endpoint": True}),
+                        config=base.merge(Config(s3={"use_accelerate_endpoint": True})),
                         **kwargs,
                     )
                 else:
-                    return boto3.client("s3", **kwargs)
+                    return boto3.client("s3", config=base, **kwargs)
 
         self.s3_factory = s3_factory if s3_factory is not None else default_s3_factory
 
@@ -2619,9 +2635,9 @@ class S3LFS:
 
         if not files_to_download:
             print("All files are up-to-date.")
-            return
+            return 0
 
-        self.parallel_download_chunked(files_to_download, silence=silence)
+        return self.parallel_download_chunked(files_to_download, silence=silence)
 
     @retry(3, _transient_network_errors)
     def _discover_chunks_for_file(self, manifest_key, file_hash):
@@ -2760,6 +2776,7 @@ class S3LFS:
                             chunks = disc_future.result()
                         except Exception as e:
                             print(f"Error discovering chunks: {e}")
+                            files_failed += 1
                             continue
 
                         mk = chunks[0]["manifest_key"]
@@ -2862,6 +2879,9 @@ class S3LFS:
                     )
                 if len(incomplete) > 10:
                     print(f"  ... and {len(incomplete) - 10} more")
+
+        # Incomplete files were never written; that is a failure too.
+        return files_failed + len(incomplete)
 
     def remove_subtree(self, directory, keep_in_s3=True):
         """
@@ -3938,6 +3958,21 @@ class S3LFS:
             raise
         # The raw path moves the temp file into place, so it is already gone.
         Path(compressed_path).unlink(missing_ok=True)
+
+        # End-to-end verification, same as the parallel path: transport
+        # checksums are off, so this is the check that the bytes on disk
+        # are the bytes the manifest promised.
+        actual_hash = self.hash_file(filesystem_path)
+        if actual_hash != expected_hash:
+            try:
+                os.remove(filesystem_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Checksum mismatch for {manifest_key}: expected "
+                f"{expected_hash}, got {actual_hash}. The stored object is "
+                "incomplete or corrupt."
+            )
         if not silence:
             print(
                 f"Downloaded {filesystem_path} from "

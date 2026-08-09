@@ -82,18 +82,12 @@ class TestTransferAcceleration(unittest.TestCase):
 
             # Check that the config does not include use_accelerate_endpoint
             # When no config is passed, boto3.client is called without config parameter
-            if "config" in call_args[1]:
-                config = call_args[1]["config"]
-                self.assertFalse(
-                    hasattr(config, "s3")
-                    or (
-                        hasattr(config, "s3")
-                        and "use_accelerate_endpoint" not in config.s3
-                    )
-                )
-            else:
-                # No config passed, which is correct for disabled acceleration
-                pass
+            # A config is always passed now (it carries the transport
+            # checksum settings); what matters is that it does not enable
+            # the accelerate endpoint.
+            config = call_args[1]["config"]
+            s3_options = getattr(config, "s3", None) or {}
+            self.assertFalse(s3_options.get("use_accelerate_endpoint"))
 
     def test_transfer_acceleration_with_unsigned_requests_fails(self):
         """Test that transfer acceleration fails with unsigned requests."""

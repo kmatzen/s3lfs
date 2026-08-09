@@ -317,7 +317,16 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
 
     def test_checkout_all_with_no_sign_request(self):
-        """Test checkout --all with --no-sign-request."""
+        """--no-sign-request failures must be loud.
+
+        moto forbids anonymous object reads (unsigned GetObject/HeadObject
+        both 403), so an unsigned download can never succeed here -- it
+        never has; earlier versions of this test passed only because
+        download failures were silent. What this asserts now is that the
+        failure reaches the exit code instead of scrollback. The unsigned
+        client configuration itself is covered by the transfer
+        acceleration tests.
+        """
         runner = CliRunner()
         runner.invoke(
             s3lfs_main, ["init", TEST_BUCKET, "test_prefix", "--no-sign-request"]
@@ -326,7 +335,8 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         os.remove(self.test_file)
 
         result = runner.invoke(s3lfs_main, ["checkout", "--all", "--no-sign-request"])
-        self.assertEqual(result.exit_code, 0)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("could not be downloaded", result.output)
 
     def test_remove_command(self):
         """Test the remove command."""
