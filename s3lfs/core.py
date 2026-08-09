@@ -22,24 +22,19 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 from uuid import uuid4
 
-import boto3
 import portalocker
 import yaml
-from boto3.s3.transfer import TransferConfig
-from botocore import UNSIGNED
-from botocore.config import Config
-from botocore.exceptions import (
-    BotoCoreError,
-    ClientError,
-    NoCredentialsError,
-    PartialCredentialsError,
-)
 from tqdm import tqdm
-from urllib3.exceptions import SSLError
 
 from s3lfs import metrics
 from s3lfs.path_resolver import PathResolver
 from s3lfs.utils import find_git_root
+
+# boto3 and botocore are imported lazily: they cost ~140ms to import, which
+# would be paid by every invocation including --help, --version, and the
+# git hooks that usually have nothing to do. Anything needing an exception
+# class or client resolves it at call time via the helpers below.
+
 
 # Constants
 DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -226,8 +221,22 @@ NON_RETRYABLE_S3_CODES = frozenset(
 )
 
 
+def _transient_network_errors():
+    """The exception classes retried on, resolved lazily.
+
+    Referencing these at class-definition time would force the boto3
+    import back onto the startup path that lazy loading just removed.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+    from urllib3.exceptions import SSLError
+
+    return (BotoCoreError, ClientError, SSLError)
+
+
 def _is_retryable(exc):
     """Is this exception worth another attempt?"""
+    from botocore.exceptions import ClientError
+
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
         if code in NON_RETRYABLE_S3_CODES:
@@ -248,7 +257,9 @@ def retry(times, exceptions, max_delay=30):
     """Retry decorator with exponential backoff and full jitter.
 
     :param times: Maximum number of retry attempts.
-    :param exceptions: Tuple of exception types that trigger a retry.
+    :param exceptions: Exception types that trigger a retry -- a tuple, or
+        a zero-arg callable returning one so decorators need not import
+        the classes eagerly.
     :param max_delay: Cap on the backoff delay in seconds.
     """
 
@@ -258,7 +269,7 @@ def retry(times, exceptions, max_delay=30):
             for attempt in range(times):
                 try:
                     return func(*args, **kwargs)
-                except exceptions as exc:
+                except exceptions() if callable(exceptions) else exceptions as exc:
                     if attempt >= times - 1 or not _is_retryable(exc):
                         raise
                     # Full jitter. Without it, every worker that failed at the
@@ -328,6 +339,10 @@ class S3LFS:
 
         def default_s3_factory(no_sign_request):
             """Default S3 client factory with proper boto3 usage."""
+            import boto3
+            from botocore import UNSIGNED
+            from botocore.config import Config
+
             kwargs = {}
             if self.endpoint_url:
                 kwargs["endpoint_url"] = self.endpoint_url
@@ -358,15 +373,25 @@ class S3LFS:
         # multiply. That is deliberate: a single large asset is one transfer,
         # and dividing the budget across the pool would leave it with no
         # multipart parallelism at all, which is the case s3lfs exists for.
+        from boto3.s3.transfer import TransferConfig
+
         max_concurrency = max(self.workers, DEFAULT_MAX_CONCURRENCY)
+        transfer_kwargs = {"max_concurrency": max_concurrency}
         if no_sign_request:
             # If we're not signing, we can't use multipart. Set the threshold to the max.
+            transfer_kwargs["multipart_threshold"] = DEFAULT_MULTIPART_THRESHOLD
+        try:
+            # Prefer AWS's C-based transfer client (CRT) when the awscrt
+            # package is installed -- install with `pip install s3lfs[crt]`.
+            # "auto" uses it only where it applies (standard AWS S3
+            # endpoints) and falls back to the classic client elsewhere,
+            # e.g. MinIO or R2, so behaviour is unchanged when it cannot
+            # help. Older boto3 without the kwarg lands in the except.
             self.config = TransferConfig(
-                multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
-                max_concurrency=max_concurrency,
+                preferred_transfer_client="auto", **transfer_kwargs
             )
-        else:
-            self.config = TransferConfig(max_concurrency=max_concurrency)
+        except TypeError:
+            self.config = TransferConfig(**transfer_kwargs)
         self.thread_local = threading.local()
         self.manifest_file = Path(manifest_file)
 
@@ -706,7 +731,7 @@ class S3LFS:
         ever uploaded", which is what push-time verification needs.
         """
 
-        @retry(3, (BotoCoreError, ClientError, SSLError))
+        @retry(3, _transient_network_errors)
         def check(item):
             manifest_key, file_hash = item
             base_key = self._asset_base_key(manifest_key, file_hash)
@@ -734,6 +759,12 @@ class S3LFS:
     def _get_s3_client(self):
         """Ensures each thread gets its own instance of the S3 client with appropriate authentication handling."""
         if not hasattr(self.thread_local, "s3"):
+            from botocore.exceptions import (
+                ClientError,
+                NoCredentialsError,
+                PartialCredentialsError,
+            )
+
             try:
                 self.thread_local.s3 = self.s3_factory(self.no_sign_request)
             except NoCredentialsError:
@@ -2001,7 +2032,7 @@ class S3LFS:
 
         return output_path
 
-    @retry(3, (BotoCoreError, ClientError, SSLError))
+    @retry(3, _transient_network_errors)
     def upload(
         self,
         file_path: Union[str, Path],
@@ -2016,6 +2047,8 @@ class S3LFS:
         if not file_path.exists():
             print(f"Error: {file_path} does not exist.")
             return
+
+        from botocore.exceptions import ClientError
 
         file_hash = self.hash_file(file_path)
         # Use manifest key (relative to git root) for S3 key
@@ -2360,7 +2393,7 @@ class S3LFS:
 
         return (manifest_key, file_hash, chunks)
 
-    @retry(3, (BotoCoreError, ClientError, SSLError))
+    @retry(3, _transient_network_errors)
     def _put_chunk(self, path, s3_key, extra_args):
         """PUT one chunk. Retried, so it must not consume its input."""
         with open(path, "rb") as f:
@@ -2590,7 +2623,7 @@ class S3LFS:
 
         self.parallel_download_chunked(files_to_download, silence=silence)
 
-    @retry(3, (BotoCoreError, ClientError, SSLError))
+    @retry(3, _transient_network_errors)
     def _discover_chunks_for_file(self, manifest_key, file_hash):
         """Discover the stored object(s) for a file, raw or compressed."""
         keys, _sizes, is_chunked, compressed = self._locate_asset(
@@ -2609,7 +2642,7 @@ class S3LFS:
             for i, key in enumerate(keys)
         ]
 
-    @retry(3, (BotoCoreError, ClientError, SSLError))
+    @retry(3, _transient_network_errors)
     def _download_chunk(self, chunk_info, target_path):
         """Download a single S3 chunk to a target path."""
         # See _upload_chunk: queued work must not start after an interrupt.
@@ -2895,6 +2928,12 @@ class S3LFS:
 
         :param silence: If True, suppress success messages.
         """
+        from botocore.exceptions import (
+            ClientError,
+            NoCredentialsError,
+            PartialCredentialsError,
+        )
+
         try:
             # Attempt to list objects in the target bucket with a minimal prefix
             self._get_s3_client().list_objects_v2(
@@ -3769,7 +3808,7 @@ class S3LFS:
                 tracker.end_pipeline()
                 tracker.print_summary(verbose=not silence)
 
-    @retry(3, (BotoCoreError, ClientError, SSLError))
+    @retry(3, _transient_network_errors)
     def download(
         self,
         file_path: Union[str, Path],
