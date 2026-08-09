@@ -2477,6 +2477,40 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         click.echo(result.stderr.strip())
         raise SystemExit(1)
 
+    _warn_if_commit_will_look_empty(git_root, to_stage)
+
+
+def _warn_if_commit_will_look_empty(git_root, staged_paths):
+    """Explain git's "nothing to commit" when only tracked files changed.
+
+    `git commit -a` builds the commit from a temporary index prepared
+    before hooks run, so it decides whether there is anything to commit
+    without seeing the manifest this hook just updated. When the only
+    edits are to s3lfs-tracked files -- which are gitignored, so git sees
+    nothing else -- git aborts with "nothing to commit, working tree
+    clean". That is misleading: the content is uploaded and the manifest
+    has changed, and running the same command again commits it.
+    """
+    index_file = os.environ.get("GIT_INDEX_FILE")
+    if not index_file or Path(index_file).name == "index":
+        return  # the ordinary index; staging from here lands normally
+
+    changed = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", *staged_paths],
+        cwd=str(git_root),
+    )
+    if changed.returncode == 0:
+        return  # manifest unchanged, so nothing to explain
+
+    click.echo(
+        "s3lfs: the manifest changed, but this commit was prepared before "
+        "that happened."
+    )
+    click.echo(
+        "s3lfs: if git says 'nothing to commit', run the same command again "
+        "-- the upload is done and the manifest is ready to commit."
+    )
+
 
 cli.add_command(init)
 cli.add_command(track)

@@ -1326,3 +1326,48 @@ class TestBulkDeletionGuard(GitRepoTestCase):
         files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
         self.assertNotIn("data/f0.bin", files)
         self.assertEqual(len(files), 7)
+
+
+class TestCommitDashAMessage(GitRepoTestCase):
+    """`git commit -a` prepares its commit before hooks run, so when the
+    only edits are to tracked (gitignored) files git decides there is
+    nothing to commit without seeing the manifest the hook just updated.
+    The bare "nothing to commit, working tree clean" is misleading."""
+
+    def test_explains_why_the_commit_looks_empty(self):
+        self._write("data/a.bin", "v1")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        self._write("data/a.bin", "v2")
+        result = self.runner.invoke(
+            cli, ["pre-commit"], env={"GIT_INDEX_FILE": ".git/index.lock"}
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("run the same command again", result.output)
+
+    def test_silent_for_an_ordinary_commit(self):
+        self._write("data/a.bin", "v1")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        self._write("data/a.bin", "v2")
+        result = self.runner.invoke(
+            cli, ["pre-commit"], env={"GIT_INDEX_FILE": ".git/index"}
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("run the same command again", result.output)
+
+    def test_silent_when_the_manifest_did_not_change(self):
+        self._write("data/a.bin", "v1")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        result = self.runner.invoke(
+            cli, ["pre-commit"], env={"GIT_INDEX_FILE": ".git/index.lock"}
+        )
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertNotIn("run the same command again", result.output)
