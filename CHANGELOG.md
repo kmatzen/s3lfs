@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `benchmarks/manifest_scaling.py`, which generates a synthetic manifest of a given size and times the operations every command depends on. The README's performance figures come from it, so they can be re-derived rather than taken on faith.
+
+### Changed
+- README gained a Performance section with measured numbers for manifest size, sharding and sparse reads, replacing a single inline claim.
+
 ## [0.5.0] - 2026-08-09
 
 ### Changed
