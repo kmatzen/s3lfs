@@ -152,7 +152,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           uv run python benchmarks/transfer_comparison.py \
             --bucket bench --endpoint-url http://localhost:9000 \
-            --files 50 --size-kb 512 --s5cmd /tmp/s5cmd \
+            --files 50 --size-kb 512 --s5cmd /tmp/s5cmd --no-encryption \
             | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 

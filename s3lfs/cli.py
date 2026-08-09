@@ -31,7 +31,9 @@ def _make_s3lfs(
 
     # For non-boolean settings an unset CLI option arrives as None, so the
     # config supplies the value only when the flag was not given.
-    for key in ("endpoint_url", "workers", "compression"):
+    # encryption is boolean but defaults to on, so it works the same way:
+    # only an explicit value in the config (or from a caller) changes it.
+    for key in ("endpoint_url", "workers", "compression", "encryption"):
         if extra.get(key) is None and config.get(key) is not None:
             extra[key] = config[key]
 

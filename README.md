@@ -536,6 +536,7 @@ endpoint_url: https://minio.internal:9000
 workers: 16
 no_sign_request: true
 use_acceleration: false
+encryption: false  # MinIO without KMS rejects the SSE header
 ```
 
 When `.s3lfsconfig` exists, its values are used as defaults for all commands. CLI flags still override config values - for example, `s3lfs track --no-sign-request` always uses unsigned requests regardless of the config.
@@ -546,6 +547,7 @@ When `.s3lfsconfig` exists, its values are used as defaults for all commands. CL
 - `endpoint_url`: S3-compatible endpoint for the whole team (default: none, i.e. AWS)
 - `workers`: Parallel worker count (default: auto-detected from CPU count)
 - `compression`: `auto` (sample each file; store incompressible ones raw), `always`, or `never`
+- `encryption`: AES256 server-side encryption on uploads (default: `true`). Set to `false` for MinIO and other S3-compatibles without KMS, which reject the SSE header and fail every upload with `NotImplemented`
 
 Unrecognised keys are reported rather than ignored -- a misspelled setting that changes where your data goes should not fail silently.
 

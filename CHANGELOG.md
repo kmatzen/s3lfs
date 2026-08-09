@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **The CLI can now disable server-side encryption**, via `encryption: false`
+  in `.s3lfsconfig`. s3lfs always sent the AES256 SSE header, and MinIO
+  (and other S3-compatibles without KMS) rejects it, failing every upload
+  with `NotImplemented` -- the Python API had an `encryption=False` escape
+  hatch, the CLI had none. Found when the new benchmark CI job ran the CLI
+  against MinIO for the first time.
+
 ### Added
 
 - **Benchmarks run in CI.** Every pull request runs `manifest_scaling.py
