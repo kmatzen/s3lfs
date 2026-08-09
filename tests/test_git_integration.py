@@ -1510,3 +1510,40 @@ class TestHiddenFileScanCost(GitRepoTestCase):
             Path(self.temp_dir), s3lfs, set(s3lfs.manifest["files"])
         )
         self.assertEqual(found, ["data/notes.md"])
+
+
+class TestGitignoreUpgrade(GitRepoTestCase):
+    """0.3.0-0.5.0 wrote one .gitignore entry per tracked file, which made
+    git status quadratic. Adding the directory pattern without removing
+    those would leave the slow block in place, so upgrading would fix
+    nothing for the repositories that need it most."""
+
+    def test_per_file_entries_are_replaced_by_the_directory(self):
+        for i in range(5):
+            self._write(f"data/f{i}.bin", str(i))
+        Path(".gitignore").write_text(
+            f"{S3LFS_GITIGNORE_START}\n"
+            + "".join(f"/data/f{i}.bin\n" for i in range(5))
+            + f"{S3LFS_GITIGNORE_END}\n"
+        )
+
+        result = self.runner.invoke(cli, ["track", "data"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertEqual(entries, ["/data/"])
+        self.assertIn("Replaced 5", result.output)
+        self.assertEqual(self._git("check-ignore", "data/f0.bin").returncode, 0)
+
+    def test_unrelated_entries_are_left_alone(self):
+        self._write("data/a.bin", "a")
+        self._write("other/b.bin", "b")
+        Path(".gitignore").write_text(
+            f"{S3LFS_GITIGNORE_START}\n/other/b.bin\n{S3LFS_GITIGNORE_END}\n"
+        )
+
+        self.runner.invoke(cli, ["track", "data"])
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/other/b.bin", entries)
+        self.assertIn("/data/", entries)

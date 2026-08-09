@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`s3lfs track <dir>` made `git status` quadratic.** Since 0.3.0 it wrote one `.gitignore` entry per tracked file, and git matches every candidate path against every pattern with no pruning: at 100,000 tracked files `git status` took **69.6 seconds**, against 17 ms for a single directory pattern. A directory now becomes one `/dir/` pattern again -- 37 ms at the same scale.
+- Re-tracking a directory replaces the old per-file entries rather than adding the directory pattern alongside them. Without that, upgrading fixed nothing for the repositories that needed it most: the slow block stayed in place.
 - The precision that bought is recovered without the cost: `s3lfs status` and the pre-commit hook now report files under a tracked directory that s3lfs is not tracking, which would otherwise be invisible to git *and* absent from the manifest. On every commit the scan is bounded by directory mtime -- adding a file updates its directory -- so it costs ~70 ms over 100,000 files instead of ~1 s for a full walk.
 
 ## [0.5.0] - 2026-08-09
