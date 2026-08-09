@@ -80,6 +80,99 @@ def _setup_s3lfs_command(cli_path=None, require_manifest=True):
     return git_root, manifest_path, path_resolver
 
 
+def _shards_are_hidden(git_root):
+    """Is a sharded manifest missing from disk but present in git?
+
+    Manifest shards are git-tracked files under a directory, so enabling a
+    sparse checkout removes them from the working copy unless that
+    directory is in the cone -- and s3lfs then sees an empty manifest and
+    reports that nothing is tracked, which is badly wrong.
+    """
+    if (git_root / MANIFEST_SHARD_DIR).is_dir():
+        return False
+    listed = subprocess.run(
+        ["git", "ls-files", "--", MANIFEST_SHARD_DIR],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    return listed.returncode == 0 and bool(listed.stdout.strip())
+
+
+def _shards_outside_sparse_cone(git_root):
+    """Is the shard directory excluded by the sparse-checkout rules?
+
+    Checked with git's own matcher rather than by looking at the disk: the
+    files may still be present from before the rules changed, and git will
+    remove them the next time it applies them.
+    """
+    active = subprocess.run(
+        ["git", "config", "--bool", "core.sparseCheckout"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if active.returncode != 0 or active.stdout.strip() != "true":
+        return False
+    probe = subprocess.run(
+        ["git", "sparse-checkout", "check-rules", "-z"],
+        input=f"{MANIFEST_SHARD_DIR}/probe.yaml\0".encode(),
+        capture_output=True,
+        cwd=str(git_root),
+    )
+    if probe.returncode != 0:
+        return False  # cannot tell; leave the user's configuration alone
+    return not probe.stdout.strip()
+
+
+def _ensure_shards_visible(git_root):
+    """Keep the shard directory inside the sparse cone.
+
+    The manifest is not optional: a working copy that cannot read it does
+    not know what is tracked. Adding the directory to the cone costs
+    nothing -- the shards are small text files -- and without it every
+    s3lfs command in a sparse checkout reports an empty repository.
+    """
+    if not (_shards_are_hidden(git_root) or _shards_outside_sparse_cone(git_root)):
+        return False
+    result = subprocess.run(
+        ["git", "sparse-checkout", "add", MANIFEST_SHARD_DIR],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode == 0:
+        click.echo(
+            f"Added {MANIFEST_SHARD_DIR}/ to the sparse-checkout cone; the "
+            "manifest itself must always be present."
+        )
+        return True
+    click.echo(
+        f"Warning: the manifest shards in {MANIFEST_SHARD_DIR}/ are hidden by "
+        "your sparse checkout, so s3lfs cannot see what is tracked. Run: "
+        f"git sparse-checkout add {MANIFEST_SHARD_DIR}"
+    )
+    return False
+
+
+def _manifest_files(s3lfs, profile):
+    """The manifest entries this working copy needs, reading no more.
+
+    With a sharded manifest and a cone-mode sparse profile, only the shards
+    the profile can reach are parsed -- the rest of the repository is never
+    touched. Everything else falls back to the whole mapping.
+    """
+    if _shards_are_hidden(s3lfs.path_resolver.git_root):
+        _ensure_shards_visible(s3lfs.path_resolver.git_root)
+        s3lfs.load_manifest()
+    files = s3lfs.manifest.get("files", {})
+    wanted = profile.shards() if profile is not None else None
+    if wanted is not None and hasattr(files, "preload"):
+        available = set(s3lfs.shard_names())
+        files.preload(sorted(available & wanted))
+    return files
+
+
 def _sparse_profile(git_root):
     """The working copy's sparse profile, warning once if it can't apply."""
     profile = SparseProfile.detect(git_root)
@@ -235,7 +328,7 @@ def track(
         # the size of the whole repository and risk reading a deliberate
         # absence as a deletion.
         profile = _sparse_profile(git_root)
-        tracked = s3lfs.manifest.get("files", {})
+        tracked = _manifest_files(s3lfs, profile)
         s3lfs.track_modified_files_cached(
             silence=not verbose,
             keys=profile.select(tracked) if profile.active else None,
@@ -319,7 +412,7 @@ def checkout(
         # "All" means everything this working copy materializes, which is
         # the whole manifest unless a sparse profile narrows it.
         profile = _sparse_profile(git_root)
-        wanted, skipped = profile.partition(dict(s3lfs.manifest.get("files", {})))
+        wanted, skipped = profile.partition(dict(_manifest_files(s3lfs, profile)))
         if skipped:
             click.echo(f"Skipping {len(skipped)} file(s) outside your sparse profile.")
         s3lfs.parallel_download_all(silence=not verbose, only=set(wanted))
@@ -447,7 +540,7 @@ def sync(
     )
 
     profile = _sparse_profile(git_root)
-    current = dict(s3lfs.manifest.get("files", {}))
+    current = dict(_manifest_files(s3lfs, profile))
     wanted, out_of_profile = profile.partition(current)
 
     previous = (
@@ -689,7 +782,8 @@ def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoin
     if manifest_key:
         expected = s3lfs._resolve_manifest_paths(manifest_key)
     else:
-        expected = dict(s3lfs.manifest.get("files", {}))
+        profile = _sparse_profile(git_root)
+        expected = dict(_manifest_files(s3lfs, profile))
 
     if not expected:
         if not porcelain:
@@ -698,7 +792,8 @@ def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoin
 
     # Files outside the sparse profile are absent on purpose. Reporting
     # them as missing would bury the real signal.
-    profile = _sparse_profile(git_root)
+    if manifest_key:
+        profile = _sparse_profile(git_root)
     expected, outside_profile = profile.partition(expected)
 
     if not expected:
@@ -908,6 +1003,7 @@ def shard(force, undo):
 
     s3lfs.manifest["manifest_format"] = "sharded"
     s3lfs.save_manifest()
+    _ensure_shards_visible(git_root)
     click.echo(f"Sharded into {len(shards)} file(s). Commit them along with")
     click.echo(f"{manifest_path.name}, which now holds configuration only.")
 
@@ -1827,6 +1923,7 @@ def install():
 
     _install_merge_driver(git_root)
     click.echo("  Registered manifest merge driver (.gitattributes, git config)")
+    _ensure_shards_visible(git_root)
 
     click.echo()
     click.echo("s3lfs hooks installed. Your git workflow now automatically:")
@@ -2099,7 +2196,7 @@ def sparse(porcelain):
     s3lfs = _make_s3lfs(git_root, manifest_path)
 
     profile = _sparse_profile(git_root)
-    inside, outside = profile.partition(dict(s3lfs.manifest.get("files", {})))
+    inside, outside = profile.partition(dict(_manifest_files(s3lfs, None)))
     # partition() can discover mid-flight that it cannot apply the rules,
     # after _sparse_profile already had its chance to warn.
     if profile.degraded_reason:
@@ -2360,7 +2457,7 @@ def verify(revision, base, no_sign_request, use_acceleration, endpoint_url, work
             for line in mismatch:
                 click.echo(f"  {line}")
     else:
-        files = dict(s3lfs.manifest.get("files", {}))
+        files = dict(_manifest_files(s3lfs, None))
 
     if base:
         base_files = _manifest_files_at_revision(git_root, base) or {}
@@ -2424,7 +2521,7 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         use_acceleration=use_acceleration,
         endpoint_url=endpoint_url,
     )
-    tracked = set(s3lfs.manifest.get("files", {}))
+    tracked = set(_manifest_files(s3lfs, _sparse_profile(git_root)))
 
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "--diff-filter=d", "-z"],

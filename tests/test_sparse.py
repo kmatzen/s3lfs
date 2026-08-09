@@ -398,3 +398,41 @@ class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertEqual(self._tracked(), ["drop/out.bin"])
+
+
+class TestShardsStayVisible(SparseRepoTestCase):
+    """Manifest shards are git-tracked files under a directory, so enabling
+    a sparse checkout removes them from the working copy unless that
+    directory is in the cone -- and s3lfs then reports that nothing is
+    tracked at all."""
+
+    def _shard_count(self):
+        return len(list(Path(".s3lfs_manifest").glob("*.yaml")))
+
+    def test_sparse_checkout_does_not_hide_the_manifest(self):
+        self._track_both_dirs()
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("shard the manifest")
+        self.assertEqual(self._shard_count(), 2)
+
+        # Narrow to keep/: git removes .s3lfs_manifest/ from the worktree
+        self._enable_sparse("keep")
+
+        # Any command must notice and restore it rather than reporting
+        # an empty repository.
+        result = self.runner.invoke(cli, ["sparse"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(self._shard_count(), 2, "the manifest stayed hidden")
+        self.assertIn("2 tracked file(s)", result.output)
+
+    def test_shard_command_adds_the_directory_to_the_cone(self):
+        self._track_both_dirs()
+        self._commit_all("track both")
+        self._enable_sparse("keep")
+
+        result = self.runner.invoke(cli, ["shard", "--force"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        cone = self._git("sparse-checkout", "list").stdout
+        self.assertIn(".s3lfs_manifest", cone)
+        self.assertEqual(self._shard_count(), 2)
