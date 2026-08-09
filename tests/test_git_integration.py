@@ -1583,3 +1583,40 @@ class TestHookQuietness(GitRepoTestCase):
 
         result = self.runner.invoke(cli, ["track", "--modified", "--verbose"])
         self.assertIn("Checking", result.output)
+
+
+class TestDoctor(GitRepoTestCase):
+    """doctor exists because this project's failure mode is components
+    that fail quietly: hooks that never fire, drivers nobody registered,
+    credentials that allow some operations and not others."""
+
+    def test_healthy_repo_reports_wired_up(self):
+        self.runner.invoke(cli, ["install"])
+        result = self.runner.invoke(cli, ["doctor"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("manifest merge driver registered", result.output)
+        self.assertIn("S3 list", result.output)
+        self.assertIn("S3 write", result.output)
+
+    def test_missing_hooks_are_warnings_not_failures(self):
+        result = self.runner.invoke(cli, ["doctor"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("hook not installed", result.output)
+        self.assertIn("s3lfs install", result.output)
+
+    def test_unreachable_bucket_is_a_failure(self):
+        import yaml as _yaml
+
+        m = _yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        m["bucket_name"] = "no-such-bucket-doctor-test"
+        Path(".s3_manifest.yaml").write_text(_yaml.safe_dump(m))
+
+        result = self.runner.invoke(cli, ["doctor"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("FAIL", result.output)
+
+    def test_uninitialized_repo_says_how_to_start(self):
+        Path(".s3_manifest.yaml").unlink()
+        result = self.runner.invoke(cli, ["doctor"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("s3lfs init", result.output)
