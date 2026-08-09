@@ -7,17 +7,29 @@ with support for file tracking, parallel operations, encryption, and
 automatic cleanup of unused assets.
 """
 
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as _installed_version
-
-from . import metrics
-from .core import S3LFS
-
-try:
-    # Read the version from installed package metadata so it cannot drift
-    # from pyproject.toml -- there is only one place to bump.
-    __version__ = _installed_version("s3lfs")
-except PackageNotFoundError:  # pragma: no cover - running from a source tree
-    __version__ = "0.0.0+unknown"
-
 __all__ = ["S3LFS", "metrics", "__version__"]
+
+
+def __getattr__(name):
+    # Resolved lazily (PEP 562): importing the package must stay cheap.
+    # Eagerly importing core pulls hashlib/yaml/tqdm, and reading package
+    # metadata costs ~37ms -- costs every `s3lfs --help` would pay.
+    if name == "S3LFS":
+        from .core import S3LFS
+
+        return S3LFS
+    if name == "metrics":
+        # importlib, not `from . import`: the from-import form consults
+        # this very __getattr__ while the submodule is mid-import and
+        # recurses forever.
+        import importlib
+
+        return importlib.import_module("s3lfs.metrics")
+    if name == "__version__":
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            return version("s3lfs")
+        except PackageNotFoundError:  # running from a source tree
+            return "0.0.0+unknown"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

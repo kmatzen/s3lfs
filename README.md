@@ -679,6 +679,15 @@ Two related effects worth knowing:
   provides it, which is roughly 8x faster than the pure-Python one (4.31s vs
   0.50s to parse a 100,000-entry manifest). Nothing to configure; installing
   a PyYAML wheel built with libyaml is enough.
+- **Startup.** boto3 and package metadata load only when a command actually
+  touches S3, cutting the fixed cost of `--help`, `--version` and hooks with
+  nothing to do from ~200ms to ~135ms; what remains is mostly the
+  interpreter itself.
+- **The transfer engine.** `pip install s3lfs[crt]` installs AWS's C-based
+  transfer client (CRT). s3lfs requests it in "auto" mode: it is used where
+  it applies (standard AWS S3 endpoints) and boto3 falls back to the classic
+  client elsewhere -- MinIO, R2 and other S3-compatibles behave exactly as
+  before.
 
 If your manifest is small, none of this matters and a single file is simpler.
 Sharding earns its keep somewhere in the tens of thousands of entries, or

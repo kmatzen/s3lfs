@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `benchmarks/transfer_comparison.py`: measures s3lfs against a raw transfer tool (s5cmd) across cold/no-op/incremental upload and download, per scenario rather than as one misleading number.
 
 ### Changed
+- boto3 and package metadata are imported lazily, cutting CLI startup from ~200ms to ~135ms for anything that does not touch S3 -- `--help`, `--version`, and hooks with nothing to do. A test asserts importing the CLI does not pull in boto3, so the cost cannot creep back silently.
+- The S3 transfer configuration requests boto3's CRT client in "auto" mode. With `pip install s3lfs[crt]`, transfers to standard AWS S3 endpoints use AWS's C-based engine; everything else (MinIO, R2, older boto3) falls back to the classic client unchanged.
 - A missing stored object is now a loud error at download time instead of a fabricated key that 404s downstream. Non-contiguous chunk sets are also rejected with an explanation rather than reassembled short.
 - Unchunked downloads no longer issue a `head_object` per file; sizes come from the discovery listing.
 

@@ -5,6 +5,8 @@ Tests various error paths, edge cases, and the migrate command.
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -564,3 +566,31 @@ class TestCLICoverage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStartupStaysLight(unittest.TestCase):
+    """boto3 costs ~140ms to import and package metadata another ~37ms.
+    Neither belongs on the startup path: --help, --version, and hooks with
+    nothing to do would all pay it."""
+
+    def test_importing_the_cli_does_not_import_boto3(self):
+        code = (
+            "import sys; import s3lfs, s3lfs.cli; "
+            "sys.exit(1 if 'boto3' in sys.modules else 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, "importing s3lfs.cli pulled in boto3")
+
+    def test_lazy_package_attributes_still_resolve(self):
+        code = (
+            "import s3lfs; "
+            "assert s3lfs.S3LFS.__name__ == 'S3LFS'; "
+            "assert isinstance(s3lfs.__version__, str); "
+            "import s3lfs.metrics"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
