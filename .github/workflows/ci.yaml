@@ -26,9 +26,22 @@ jobs:
         run: uv run pre-commit run --all-files
 
   test:
-    name: Run Tests
-    runs-on: ubuntu-latest
+    name: Tests (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: lint
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling of the supported range on Linux, plus a
+        # macOS run: s3lfs shells out to git constantly and writes /bin/sh
+        # hooks, so a second platform is worth more than a third minor
+        # version.
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
       - name: Checkout repository
@@ -38,18 +51,45 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Show versions
+        run: |
+          uv run python -V
+          git --version
 
       - name: Run Tests
         run: uv run pytest --cov=s3lfs --cov-report=xml
 
       - name: Upload coverage reports to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           slug: kmatzen/s3lfs
           fail_ci_if_error: false
+
+  verify:
+    name: Model checking (TLA+)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Checks both directions: properties that must hold, and models of
+      # known defects that must still violate their invariant -- otherwise
+      # the property is vacuous and proves nothing.
+      - name: Check TLA+ models
+        run: ./specs/check.sh
 
   integration:
     name: Integration Tests (MinIO)
