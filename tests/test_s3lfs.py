@@ -3666,3 +3666,35 @@ class TestChunkListingPagination(unittest.TestCase):
 
         self.assertEqual(s3lfs._list_keys("prefix"), [])
         self.assertEqual(client.list_objects_v2.call_count, 1)
+
+
+class TestCoreutilsEscapedHashOutput(unittest.TestCase):
+    """GNU coreutils prefixes sha256sum output with a backslash when the
+    filename needed escaping -- which every Windows path does. Taking that
+    byte as part of the hash produced 65-character hashes that became S3
+    keys and failed every downstream checksum comparison."""
+
+    def _s3lfs(self):
+        return S3LFS.__new__(S3LFS)
+
+    def test_backslash_prefixed_output_is_parsed(self):
+        from unittest.mock import MagicMock, patch
+
+        s3lfs = self._s3lfs()
+        digest = "a" * 64
+        fake = MagicMock()
+        fake.stdout = f"\\{digest}  C:\\\\repo\\\\file.bin\n"
+        with patch("s3lfs.core.subprocess.run", return_value=fake):
+            self.assertEqual(s3lfs._hash_file_cli("file.bin"), digest)
+
+    def test_garbage_output_falls_back_to_python_hashing(self):
+        from unittest.mock import MagicMock, patch
+
+        s3lfs = self._s3lfs()
+        fake = MagicMock()
+        fake.stdout = "not-a-hash file.bin\n"
+        with (
+            patch("s3lfs.core.subprocess.run", return_value=fake),
+            patch.object(S3LFS, "_hash_file_mmap", return_value="b" * 64),
+        ):
+            self.assertEqual(s3lfs._hash_file_cli("file.bin"), "b" * 64)

@@ -154,10 +154,15 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
         mock_which.return_value = "/usr/bin/sha256sum"
 
         with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = "abc123def456 /path/to/file\n"
+            # A real-shaped digest: output that does not parse as one now
+            # falls back to Python hashing rather than becoming an S3 key.
+            mock_run.return_value.stdout = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa /path/to/file\n"
 
             result = self.versioner.hash_file(self.test_file, method="cli")
-            self.assertEqual(result, "abc123def456")
+            self.assertEqual(
+                result,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
 
             mock_run.assert_called_once()
             args = mock_run.call_args[0][0]
@@ -852,11 +857,16 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             patch("shutil.which", return_value="/usr/bin/sha256sum"),
             patch("subprocess.run") as mock_run,
         ):
-            mock_run.return_value.stdout = "abc123def456 /path/to/file\n"
+            # A real-shaped digest: output that does not parse as one now
+            # falls back to Python hashing rather than becoming an S3 key.
+            mock_run.return_value.stdout = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa /path/to/file\n"
 
             # Should select CLI method for non-empty files on Linux
             result = self.versioner.hash_file(self.test_file, method="auto")
-            self.assertEqual(result, "abc123def456")
+            self.assertEqual(
+                result,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
 
     def test_md5_file_auto_selection_linux(self):
         """Test MD5 auto selection on Linux."""

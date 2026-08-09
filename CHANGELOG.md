@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `sha256sum`/`md5sum` output is now validated before use. GNU coreutils prefixes the whole line with a backslash when the filename needed escaping -- which every Windows path does, and any POSIX path containing a backslash or newline would too. That byte became part of the hash, the corrupt hash became an S3 key, and every downstream checksum comparison failed. Output that does not parse as a digest now falls back to Python hashing. Found by running the suite on Windows for the first time, where this one bug accounted for 53 of 71 failures.
+
 ### Added
 - `s3lfs doctor`: one command that checks the whole integration -- manifest health, shard visibility under sparse checkouts, every hook, the merge driver, PATH visibility for hooks, and live S3 permissions probed operation-by-operation -- and prints the fix for each finding. This project's characteristic failure mode is a component that fails quietly; doctor makes those loud on demand.
 
