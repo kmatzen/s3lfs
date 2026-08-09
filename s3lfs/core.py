@@ -1902,9 +1902,7 @@ class S3LFS:
             )
             # Same coreutils backslash-escape prefix as sha256sum.
             digest = result.stdout.split()[0].lstrip("\\").lower()
-            if len(digest) != 32 or any(
-                c not in "0123456789abcdef" for c in digest
-            ):
+            if len(digest) != 32 or any(c not in "0123456789abcdef" for c in digest):
                 return self._md5_file_mmap(file_path)
             return digest
         elif sys.platform.startswith("darwin") and shutil.which("md5"):

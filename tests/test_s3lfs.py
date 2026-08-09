@@ -3675,10 +3675,7 @@ class TestCoreutilsEscapedHashOutput(unittest.TestCase):
     keys and failed every downstream checksum comparison."""
 
     def _s3lfs(self):
-        from unittest.mock import MagicMock
-
-        s3lfs = S3LFS.__new__(S3LFS)
-        return s3lfs
+        return S3LFS.__new__(S3LFS)
 
     def test_backslash_prefixed_output_is_parsed(self):
         from unittest.mock import MagicMock, patch
@@ -3696,7 +3693,8 @@ class TestCoreutilsEscapedHashOutput(unittest.TestCase):
         s3lfs = self._s3lfs()
         fake = MagicMock()
         fake.stdout = "not-a-hash file.bin\n"
-        with patch("s3lfs.core.subprocess.run", return_value=fake), patch.object(
-            S3LFS, "_hash_file_mmap", return_value="b" * 64
+        with (
+            patch("s3lfs.core.subprocess.run", return_value=fake),
+            patch.object(S3LFS, "_hash_file_mmap", return_value="b" * 64),
         ):
             self.assertEqual(s3lfs._hash_file_cli("file.bin"), "b" * 64)
