@@ -356,3 +356,45 @@ class TestSparseCommand(SparseRepoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
+    """s3lfs pruning a file is not the user deleting it.
+
+    sync hashes a file just before pruning it, which put the file in the
+    hash cache -- the very record used to tell a user deletion from a file
+    that was never materialized. A later `track --modified` then untracked
+    every out-of-profile file, removing it from the manifest for everyone.
+    """
+
+    def _tracked(self):
+        import yaml as _yaml
+
+        return sorted(_yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"])
+
+    def test_narrowing_then_tracking_keeps_out_of_profile_entries(self):
+        self._track_both_dirs()
+        self.assertEqual(self._tracked(), ["drop/out.bin", "keep/in.bin"])
+
+        self._enable_sparse("keep")
+        self.runner.invoke(cli, ["sync", "--from", "HEAD"])
+        self.assertFalse(Path("drop/out.bin").exists())
+
+        result = self.runner.invoke(cli, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(
+            self._tracked(),
+            ["drop/out.bin", "keep/in.bin"],
+            "pruning a file out of the sparse profile untracked it",
+        )
+
+    def test_a_real_deletion_inside_the_profile_still_propagates(self):
+        self._track_both_dirs()
+        self._enable_sparse("keep")
+        self.runner.invoke(cli, ["sync", "--from", "HEAD"])
+
+        Path("keep/in.bin").unlink()
+        result = self.runner.invoke(cli, ["track", "--modified"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertEqual(self._tracked(), ["drop/out.bin"])

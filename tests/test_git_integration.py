@@ -1266,3 +1266,63 @@ class TestShardedManifest(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "."])
         listed = self.runner.invoke(cli, ["ls"]).output
         self.assertNotIn(".s3lfs_manifest", listed)
+
+
+class TestBulkDeletionGuard(GitRepoTestCase):
+    """A wiped working copy is not a set of deletions.
+
+    `git clean -xfd` removes every gitignored file, which is every tracked
+    file. Untracking in bulk takes the entries away from everyone.
+    """
+
+    def test_wiping_the_working_copy_does_not_untrack_everything(self):
+        """rm -rf of a tracked tree, with the hash cache still in place."""
+        for i in range(8):
+            self._write(f"data/f{i}.bin", str(i))
+        self.runner.invoke(cli, ["track", "data"])
+        self._commit_all("track all")
+
+        shutil.rmtree("data")
+        self.assertTrue(
+            Path(".s3_manifest_cache.yaml").exists(),
+            "this test is only meaningful while the cache survives",
+        )
+
+        result = self.runner.invoke(cli, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertEqual(len(files), 8, "a wiped working copy untracked everything")
+        self.assertIn("wiped working copy", result.output)
+
+    def test_git_clean_does_not_untrack_everything(self):
+        """`git clean -xfd` removes every gitignored file -- every tracked
+        file, and the hash cache with them, so nothing reads as deleted."""
+        for i in range(8):
+            self._write(f"data/f{i}.bin", str(i))
+        self.runner.invoke(cli, ["track", "data"])
+        self._commit_all("track all")
+
+        clean = self._git("clean", "-xfd")
+        self.assertEqual(clean.returncode, 0, msg=clean.stdout + clean.stderr)
+        self.assertFalse(Path("data/f0.bin").exists())
+
+        result = self.runner.invoke(cli, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertEqual(len(files), 8, "git clean untracked everything")
+
+    def test_a_few_deletions_still_propagate(self):
+        for i in range(8):
+            self._write(f"data/f{i}.bin", str(i))
+        self.runner.invoke(cli, ["track", "data"])
+        self._commit_all("track all")
+
+        Path("data/f0.bin").unlink()
+        result = self.runner.invoke(cli, ["track", "--modified"])
+
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertNotIn("data/f0.bin", files)
+        self.assertEqual(len(files), 7)
