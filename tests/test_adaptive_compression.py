@@ -302,3 +302,81 @@ class TestWriteOnlyCredentials(AdaptiveRepoTestCase):
             "Body"
         ].read()
         self.assertEqual(body, self.raw_bytes)
+
+
+class TestDirectSourceUpload(AdaptiveRepoTestCase):
+    """Raw files upload straight from the source (no staging copy), which
+    makes two properties safety-critical: the pipeline must never delete
+    the user's file, and a file modified mid-upload must not be published."""
+
+    def test_source_file_survives_upload(self):
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        result = self.runner.invoke(cli, ["track", "photo.jpg"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertTrue(Path("photo.jpg").exists(), "upload deleted the source file")
+        self.assertEqual(Path("photo.jpg").read_bytes(), self.raw_bytes)
+
+    def test_modification_during_upload_is_refused(self):
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        s3lfs = S3LFS(bucket_name=TEST_BUCKET, manifest_file=".s3_manifest.yaml")
+
+        real_put = s3lfs._put_chunk
+
+        def mutate_then_put(path, s3_key, extra_args):
+            n = real_put(path, s3_key, extra_args)
+            # Simulate an edit landing while bytes streamed out
+            Path("photo.jpg").write_bytes(b"edited mid-flight")
+            return n
+
+        from unittest.mock import patch
+
+        with patch.object(s3lfs, "_put_chunk", side_effect=mutate_then_put):
+            s3lfs.parallel_upload(["photo.jpg"])
+
+        manifest = yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        self.assertNotIn(
+            "photo.jpg",
+            manifest.get("files") or {},
+            "a torn upload was recorded in the manifest",
+        )
+
+
+class TestHashingWriterOrdering(unittest.TestCase):
+    """boto3 downloads objects above its multipart threshold as parallel
+    ranges, seeking and writing out of order. Hashing those writes in
+    arrival order produces garbage, so the digest must invalidate itself
+    rather than reject a perfectly good file -- which is exactly what
+    happened against real S3 with 9MB objects."""
+
+    def test_sequential_writes_produce_the_digest(self):
+        import io
+
+        from s3lfs.core import _HashingWriter
+
+        w = _HashingWriter(io.BytesIO())
+        w.write(b"hello ")
+        w.write(b"world")
+        self.assertEqual(w.hexdigest(), hashlib.sha256(b"hello world").hexdigest())
+
+    def test_out_of_order_seek_invalidates_the_digest(self):
+        import io
+
+        from s3lfs.core import _HashingWriter
+
+        w = _HashingWriter(io.BytesIO())
+        w.seek(4096)  # ranged download writes a later part first
+        w.write(b"tail")
+        w.seek(0)
+        w.write(b"head")
+        self.assertIsNone(w.hexdigest())
+
+    def test_seek_to_current_position_is_still_sequential(self):
+        import io
+
+        from s3lfs.core import _HashingWriter
+
+        w = _HashingWriter(io.BytesIO())
+        w.write(b"abc")
+        w.seek(3)  # no-op seek, some writers do this
+        w.write(b"def")
+        self.assertEqual(w.hexdigest(), hashlib.sha256(b"abcdef").hexdigest())

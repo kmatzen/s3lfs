@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `s3lfs track` crashed under write-only credentials: the upload path's ETag skip-check uses HeadObject, which requires `s3:GetObject`, and a 403 there aborted the upload. Upload-only policies are a legitimate CI shape; the check now degrades to uploading, whose worst case is re-sending bytes that already exist.
 
+### Changed
+- Raw files at or below the chunk size upload straight from the source instead of staging a temp copy first, halving the disk traffic of a raw upload. A stat snapshot taken before the transfer is compared after it; a file modified mid-upload is refused rather than published torn, and the pipeline never deletes the user's file.
+- Downloads hash the bytes as they stream in, so a sequentially-written file is verified without being read back. boto3 downloads objects above its multipart threshold as out-of-order parallel ranges, where a streaming digest would be garbage -- the writer detects the seeks and falls back to hashing the finished file. Measured on real S3: incompressible cold download 3.7s to 3.2s, upload 3.1s to 3.0s.
+
 ### Compatibility
 - Objects stored raw by this version are invisible to older s3lfs clients (they only look for `.gz` keys and will fail loudly at checkout). Teams with mixed versions can set `compression: always` until everyone upgrades. Buckets written by older versions are fully readable -- discovery handles both forms.
 

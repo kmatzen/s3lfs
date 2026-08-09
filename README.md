@@ -698,14 +698,14 @@ v2.3.0 (`benchmarks/transfer_comparison.py`):
 
 | scenario | s3lfs | s5cmd |
 |---|---|---|
-| cold upload, incompressible | 3.1s | 2.1s |
+| cold upload, incompressible | 3.0s | 2.2s |
 | cold upload, compressible | **0.9s** | 2.0s |
-| cold download, incompressible | 3.7s | 2.1s |
+| cold download, incompressible | 3.2s | 2.2s |
 | cold download, compressible | **1.1s** | 2.3s |
 | re-run, nothing changed (up or down) | 0.2--0.4s | ~0.1s |
 | one file of 24 changed | 0.9s | 0.4s |
 
-On incompressible data s5cmd is 1.5--1.8x faster: it moves bytes and does
+On incompressible data s5cmd is 1.4--1.5x faster: it moves bytes and does
 nothing else, while s3lfs also hashes every file end-to-end (0.5ms/MB --
 the price of content addressing and the reason a checkout can prove it
 gave you the right bytes) and stages a snapshot copy. On compressible
