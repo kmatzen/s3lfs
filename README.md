@@ -205,6 +205,19 @@ s3lfs sync --from HEAD~1
 - `--force`: Overwrite and delete locally modified files instead of keeping them
 - `--verbose`, `--no-sign-request`, `--endpoint-url`, `--workers`: As in other commands
 
+### Shard the Manifest
+```sh
+s3lfs shard
+s3lfs shard --undo
+```
+**Description**: Splits the manifest into one file per top-level directory under `.s3lfs_manifest/`, leaving `.s3_manifest.yaml` holding configuration only. Every command parses the manifest in full and every `track` rewrites it in full, which also lands a fresh copy of the whole thing in git history each time. Sharding means a change under `data/` rewrites only `data`'s shard.
+
+Commit the shards -- they *are* the manifest. `s3lfs install` registers the merge driver for them, and the pre-commit hook stages them alongside the root file.
+
+**Options**:
+- `--undo`: Merge the shards back into a single manifest file
+- `--force`: Skip the confirmation prompt
+
 ### Show Sparse Profile
 ```sh
 s3lfs sparse

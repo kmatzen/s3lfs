@@ -10,7 +10,7 @@ import yaml
 
 from s3lfs import metrics
 from s3lfs.config import load_config
-from s3lfs.core import S3LFS, yaml_dump, yaml_load
+from s3lfs.core import MANIFEST_SHARD_DIR, S3LFS, yaml_dump, yaml_load
 from s3lfs.path_resolver import PathResolver
 from s3lfs.sparse import SparseProfile
 from s3lfs.utils import find_git_root
@@ -179,6 +179,11 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
     "--modified", is_flag=True, help="Track only modified files from manifest"
 )
 @click.option(
+    "--prune-deleted/--no-prune-deleted",
+    default=True,
+    help="Drop manifest entries for tracked files deleted from this working copy",
+)
+@click.option(
     "--metrics",
     "enable_metrics_flag",
     is_flag=True,
@@ -197,6 +202,7 @@ def track(
     endpoint_url,
     verbose,
     modified,
+    prune_deleted,
     enable_metrics_flag,
     workers,
 ):
@@ -225,7 +231,9 @@ def track(
 
     if modified:
         # Track only modified files using cached version for better performance
-        s3lfs.track_modified_files_cached(silence=not verbose)
+        s3lfs.track_modified_files_cached(
+            silence=not verbose, prune_deleted=prune_deleted
+        )
     elif manifest_key:
         # FILESYSTEM GLOB: Find files on disk and upload them
         # The manifest_key is converted to a filesystem path, then glob is applied
@@ -839,6 +847,59 @@ def cleanup(force, no_sign_request, use_acceleration, endpoint_url, workers):
     versioner.cleanup_s3(force=force)
 
 
+@cli.command()
+@click.option("--force", is_flag=True, help="Skip confirmation")
+@click.option(
+    "--undo", is_flag=True, help="Merge shards back into a single manifest file"
+)
+def shard(force, undo):
+    """Split the manifest into per-directory files, or merge it back.
+
+    One flat manifest is parsed in full by every command and rewritten in
+    full by every `track`, which also puts a fresh copy of the whole thing
+    into git history each time. Sharding by top-level directory means a
+    change under `data/` rewrites only `data`'s shard.
+
+    Commit the result: the shards are the manifest.
+    """
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+    s3lfs = _make_s3lfs(git_root, manifest_path)
+
+    if undo:
+        if not s3lfs.is_sharded:
+            click.echo("This manifest is not sharded; nothing to do.")
+            return
+        files = dict(s3lfs.manifest.get("files", {}))
+        shard_dir = s3lfs.shard_dir
+        s3lfs.manifest.pop("manifest_format", None)
+        s3lfs.manifest["files"] = files
+        s3lfs.save_manifest()
+        for path in sorted(shard_dir.glob("*.yaml")):
+            path.unlink()
+        shard_dir.rmdir() if not any(shard_dir.iterdir()) else None
+        click.echo(f"Merged {len(files)} entr(y/ies) back into {manifest_path.name}")
+        return
+
+    if s3lfs.is_sharded:
+        click.echo("This manifest is already sharded.")
+        return
+
+    files = dict(s3lfs.manifest.get("files", {}))
+    shards = sorted({s3lfs.shard_for(key) for key in files})
+    click.echo(
+        f"{len(files)} entr(y/ies) will move into {len(shards)} shard(s) under "
+        f"{manifest_path.parent.name}/{s3lfs.shard_dir.name}/"
+    )
+    if not force and not click.confirm("Proceed?"):
+        click.echo("Cancelled.")
+        return
+
+    s3lfs.manifest["manifest_format"] = "sharded"
+    s3lfs.save_manifest()
+    click.echo(f"Sharded into {len(shards)} file(s). Commit them along with")
+    click.echo(f"{manifest_path.name}, which now holds configuration only.")
+
+
 @click.command()
 @click.option("--force", is_flag=True, help="Skip confirmation and migrate immediately")
 def migrate(force):
@@ -1374,6 +1435,10 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         more = f" and {len(added) - 3} more" if len(added) > 3 else ""
         click.echo(f"Added {shown}{more} to .gitignore (s3lfs block)")
 
+    # The hashes were just computed from these files; keeping them makes
+    # the next scan cheap and lets a later deletion be recognised as one.
+    s3lfs.record_hashes(matched)
+
     removed = _deindex_tracked_files(git_root, matched.keys())
     if removed:
         click.echo(
@@ -1385,6 +1450,23 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         if len(removed) > 10:
             click.echo(f"  ... and {len(removed) - 10} more")
         click.echo("Commit to finalize their removal from git.")
+
+
+def _commits_between(git_root, base, revision):
+    """Commits reachable from *revision* but not *base*, oldest first.
+
+    Empty when either revision is unavailable locally, which is the normal
+    case for a first push to a new remote.
+    """
+    result = subprocess.run(
+        ["git", "rev-list", "--reverse", f"{base}..{revision}"],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def _manifest_document_at_revision(git_root, revision):
@@ -1469,10 +1551,22 @@ _POST_REWRITE_BODY = """\
 #
 # `git pull --rebase` fires neither post-merge nor a branch post-checkout,
 # so without this hook the most common pull configuration leaves tracked
-# files stale. Amends ($1 = amend) rarely touch the manifest and leave
-# ORIG_HEAD stale, so they are skipped.
+# files stale. Amends ($1 = amend) rarely touch the manifest, so they are
+# skipped.
+#
+# git feeds "<old-sha> <new-sha>" per rewritten commit on stdin. The first
+# old-sha is a commit that existed before the rewrite, which makes a sound
+# baseline. ORIG_HEAD would be simpler but is rewritten by any reset,
+# checkout or merge the user runs while resolving an interactive rebase,
+# and a wrong baseline makes changed entries look unchanged -- leaving
+# files stale with no warning.
 if [ "$1" = "rebase" ] && command -v s3lfs >/dev/null 2>&1; then
-    if ! s3lfs sync --from ORIG_HEAD 2>&1; then
+    base=""
+    while read -r old new; do
+        [ -n "$base" ] || base="$old"
+    done
+    [ -n "$base" ] || base=ORIG_HEAD
+    if ! s3lfs sync --from "$base" 2>&1; then
         echo "s3lfs: ERROR: post-rewrite sync failed" >&2
         echo "s3lfs: large files may be missing or stale; run 's3lfs checkout --all'" >&2
     fi
@@ -1492,6 +1586,13 @@ if command -v s3lfs >/dev/null 2>&1; then
         echo "s3lfs: commit anyway with --no-verify if you are sure" >&2
         exit 1
     fi
+elif [ -f .s3_manifest.yaml ] || [ -f .s3_manifest.json ]; then
+    # This repository uses s3lfs but the command is not on PATH -- common
+    # when git is driven from an IDE or GUI that does not see a virtualenv.
+    # Staying silent here means the commit records stale hashes and nobody
+    # finds out until a collaborator's checkout 404s.
+    echo "s3lfs: WARNING: this repository uses s3lfs but 's3lfs' is not on PATH" >&2
+    echo "s3lfs: modified large files were NOT uploaded for this commit" >&2
 fi"""
 
 _PRE_PUSH_BODY = """\
@@ -1517,6 +1618,9 @@ if command -v s3lfs >/dev/null 2>&1; then
             exit 1
         fi
     done
+elif [ -f .s3_manifest.yaml ] || [ -f .s3_manifest.json ]; then
+    echo "s3lfs: WARNING: this repository uses s3lfs but 's3lfs' is not on PATH" >&2
+    echo "s3lfs: this push was NOT verified against S3" >&2
 fi"""
 
 HOOK_SCRIPTS = {
@@ -1842,7 +1946,10 @@ MERGE_DRIVER_COMMAND = "s3lfs merge-driver %O %A %B %P"
 MANIFEST_NAMES = (".s3_manifest.yaml", ".s3_manifest.json")
 # Both files are rewritten by every `s3lfs track`, so both conflict when
 # two branches track different files.
-MERGE_DRIVER_PATHS = MANIFEST_NAMES + (".gitignore",)
+MERGE_DRIVER_PATHS = MANIFEST_NAMES + (
+    ".gitignore",
+    f"{MANIFEST_SHARD_DIR}/*.yaml",
+)
 
 
 _ABSENT = object()
@@ -2066,6 +2173,33 @@ def merge_driver(base, ours, theirs, target):
         )
         raise SystemExit(1)
 
+    # A manifest shard is a flat map of entries with no wrapper, so the
+    # whole document is what needs merging. Detect it by path, falling back
+    # to shape when git does not pass one.
+    is_shard = (
+        MANIFEST_SHARD_DIR in Path(target).parts
+        if target
+        else not any("files" in d for d in (base_data, our_data, their_data))
+    )
+    if is_shard:
+        merged_shard, conflicts = _merge_maps(base_data, our_data, their_data)
+        with open(ours, "w") as f:
+            yaml_dump(merged_shard, f, default_flow_style=False, sort_keys=True)
+        if conflicts:
+            click.echo(
+                "s3lfs: manifest conflict -- both sides changed these entries:",
+                err=True,
+            )
+            for key in conflicts:
+                click.echo(f"  {key}", err=True)
+            click.echo(
+                "s3lfs: our version was kept for each; edit the shard and "
+                "'git add' it to resolve.",
+                err=True,
+            )
+            raise SystemExit(1)
+        return
+
     files, file_conflicts = _merge_maps(
         base_data.get("files") or {},
         our_data.get("files") or {},
@@ -2218,7 +2352,21 @@ def verify(revision, base, no_sign_request, use_acceleration, endpoint_url, work
 
     if base:
         base_files = _manifest_files_at_revision(git_root, base) or {}
-        files = {k: h for k, h in files.items() if base_files.get(k) != h}
+        pairs = set(files.items())
+
+        if revision:
+            # Union every manifest in base..revision, not just the tip's.
+            # Content introduced by an intermediate commit and superseded
+            # before the tip is still reachable -- anyone who checks out
+            # that commit needs it -- so checking only the endpoints would
+            # call the push safe when it is not. A path can legitimately
+            # appear with several hashes across the range; each one is a
+            # separate object that has to exist.
+            for sha in _commits_between(git_root, base, revision):
+                pairs |= set((_manifest_files_at_revision(git_root, sha) or {}).items())
+
+        pairs = {(k, h) for k, h in pairs if base_files.get(k) != h}
+        files = sorted(pairs)
 
     if not files:
         click.echo("No manifest entries to verify.")
@@ -2298,6 +2446,10 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
     to_stage = [manifest_path.name]
     if (git_root / ".gitignore").exists():
         to_stage.append(".gitignore")
+    # A sharded manifest lives in these files; staging only the root would
+    # commit configuration without the entries it describes.
+    if (git_root / MANIFEST_SHARD_DIR).is_dir():
+        to_stage.append(MANIFEST_SHARD_DIR)
 
     result = subprocess.run(
         ["git", "add", "--", *to_stage],

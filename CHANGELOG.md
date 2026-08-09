@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `s3lfs shard` splits the manifest into one file per top-level directory under `.s3lfs_manifest/`, leaving the root manifest holding configuration only. A flat manifest is parsed in full by every command and rewritten in full by every `track`, which also lands a fresh copy of the whole thing in git history each time; sharding confines a change under `data/` to `data`'s shard. `--undo` merges it back. The merge driver covers shards and the pre-commit hook stages them.
+- `s3lfs track` now records the hashes it computed into the hash cache, so the next modified-file scan is a cache hit rather than a re-read.
+- `specs/check.sh` now covers **every** model in `specs/`, not just the two newest: chunked upload, garbage collection, manifest locking, namespace exclusion, working-copy safety and ownership. For each protocol it names the configuration matching the shipped design and asserts it holds, and asserts that the configurations modelling known defects still fail on their stated invariant. Which configuration is "current" now lives in the script, so a stale label fails the build instead of misleading a reader.
+
+### Changed
+- Deleting a tracked file now removes its manifest entry on the next `track --modified`, so the deletion reaches collaborators instead of their sync re-downloading the file forever. A file that was never downloaded here is left alone -- the hash cache distinguishes "this working copy had it" from "never materialized", so a fresh clone cannot wipe the manifest. `--no-prune-deleted` opts out.
+- The `post-rewrite` hook takes its baseline from the first rewritten commit on stdin instead of `ORIG_HEAD`, which any reset, checkout or merge during an interactive rebase silently rewrites -- and a wrong baseline leaves files stale with no warning.
+- `verify --base` now unions the manifests of every commit in the range, not just the endpoints. Content introduced by an intermediate commit and superseded before the tip is still needed by anyone who checks that commit out.
+- The pre-commit and pre-push hooks warn when the repository uses s3lfs but `s3lfs` is not on `PATH` -- common when git is driven from an IDE. They previously did nothing at all, silently.
+
+### Fixed
+- `specs/README.md` described the chunked-upload defect as present in current code. It was fixed some releases ago; the code implements the verified `CommitAfter` design, and `check.sh` now enforces that.
+- `specs/check.sh` gives each model check its own TLC metadata directory. TLC names it from the wall clock to the second, so back-to-back runs of one module collided and the second died before checking anything -- which looked exactly like a property having changed. Failures now also print TLC's output, so "did not run" is distinguishable from "no longer holds".
+
 ## [0.3.0] - 2026-08-08
 
 ### Added

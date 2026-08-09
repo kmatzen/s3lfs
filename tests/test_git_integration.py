@@ -1140,3 +1140,129 @@ class TestSyncNeverRemovesUnrecoverableContent(GitRepoTestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertFalse(Path("data/a.bin").exists())
+
+
+class TestDeletionsPropagate(GitRepoTestCase):
+    """A tracked file the user deletes must stop being tracked.
+
+    Otherwise the deletion never reaches collaborators: their next sync
+    downloads the file again, and keeps doing so forever.
+    """
+
+    def test_deleting_a_tracked_file_untracks_it(self):
+        self._write("data/a.bin", "a")
+        self._write("data/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self._commit_all("track both")
+
+        Path("data/a.bin").unlink()
+        result = self.runner.invoke(cli, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertNotIn("data/a.bin", files)
+        self.assertIn("data/b.bin", files)
+        self.assertIn("data/a.bin", result.output)
+
+    def test_never_downloaded_files_are_not_untracked(self):
+        """The dangerous case: a fresh clone has every tracked file absent.
+
+        Untracking on absence alone would wipe the manifest and delete
+        everyone else's data. Only files this working copy has actually
+        hashed count as deleted.
+        """
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        # Simulate a clone: file absent, and no local hash cache
+        Path("data/a.bin").unlink()
+        for cache in Path(".").glob(".s3_manifest_cache.*"):
+            cache.unlink()
+
+        result = self.runner.invoke(cli, ["track", "--modified"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertIn("data/a.bin", files)
+
+    def test_no_prune_deleted_keeps_the_entry(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self._commit_all("track a")
+
+        Path("data/a.bin").unlink()
+        result = self.runner.invoke(cli, ["track", "--modified", "--no-prune-deleted"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        self.assertIn("data/a.bin", files)
+
+
+class TestShardedManifest(GitRepoTestCase):
+    """One flat manifest is parsed and rewritten in full by every command,
+    and lands a fresh copy in git history on every track."""
+
+    def _shard_files(self):
+        return sorted(p.name for p in Path(".s3lfs_manifest").glob("*.yaml"))
+
+    def test_shard_splits_by_top_level_directory(self):
+        self._write("data/a.bin", "a")
+        self._write("models/b.bin", "b")
+        self._write("root.bin", "c")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "models"])
+        self.runner.invoke(cli, ["track", "root.bin"])
+
+        result = self.runner.invoke(cli, ["shard", "--force"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        self.assertEqual(
+            self._shard_files(), ["_root.yaml", "data.yaml", "models.yaml"]
+        )
+        root = yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        self.assertEqual(root.get("manifest_format"), "sharded")
+        self.assertNotIn("files", root)
+
+    def test_entries_survive_the_round_trip(self):
+        self._write("data/a.bin", "a")
+        self._write("models/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "models"])
+        before = self.runner.invoke(cli, ["ls"]).output
+
+        self.runner.invoke(cli, ["shard", "--force"])
+        self.assertEqual(self.runner.invoke(cli, ["ls"]).output, before)
+
+        self.runner.invoke(cli, ["shard", "--undo", "--force"])
+        self.assertEqual(self.runner.invoke(cli, ["ls"]).output, before)
+        self.assertFalse(Path(".s3lfs_manifest").exists())
+
+    def test_tracking_rewrites_only_the_affected_shard(self):
+        """The point of sharding: a change under one directory does not
+        produce a new copy of the whole manifest in git history."""
+        self._write("data/a.bin", "a")
+        self._write("models/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "models"])
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        untouched = Path(".s3lfs_manifest/models.yaml")
+        before = untouched.read_bytes()
+        stamp = untouched.stat().st_mtime_ns
+
+        self._write("data/c.bin", "c")
+        self.runner.invoke(cli, ["track", "data/c.bin"])
+
+        self.assertIn("data/c.bin", Path(".s3lfs_manifest/data.yaml").read_text())
+        self.assertEqual(untouched.read_bytes(), before)
+        self.assertEqual(untouched.stat().st_mtime_ns, stamp)
+
+    def test_shards_are_not_themselves_tracked(self):
+        self._write("data/a.bin", "a")
+        self.runner.invoke(cli, ["track", "data/a.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        self.runner.invoke(cli, ["track", "."])
+        listed = self.runner.invoke(cli, ["ls"]).output
+        self.assertNotIn(".s3lfs_manifest", listed)
