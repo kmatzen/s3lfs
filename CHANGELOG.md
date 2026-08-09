@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Benchmarks run in CI.** Every pull request runs `manifest_scaling.py
+  --check`, which fails the build if sharded manifest reads stop beating a
+  flat manifest by a wide ratio -- a machine-speed-independent guard against
+  performance regressions in the lazy-loading machinery. The
+  s5cmd transfer comparison also runs (against MinIO, informational only)
+  and publishes its table to the CI job summary. README benchmark tables
+  now state when they were measured.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
