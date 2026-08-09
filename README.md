@@ -149,12 +149,12 @@ s3lfs remove data/ --purge-from-s3       # Remove and delete from S3
 
 ### Cleanup Unreferenced Files
 
-> ⚠️ **Work in Progress**: The cleanup command is experimental and untested. Use with caution.
-
 ```sh
 s3lfs cleanup
 ```
 **Description**: Removes files from S3 that are no longer referenced in the current manifest.
+
+Reachability is computed on path *and* content hash, matching the storage layout, and uploads in flight are protected by a registry so a concurrent `track` cannot have its objects collected. Both properties are modelled in TLA+ under [`specs/`](specs/) and checked with TLC. Deletion is irreversible, so review what it reports before using `--force`.
 
 **Options**:
 - `--force`: Skip confirmation prompt
@@ -507,6 +507,8 @@ The endpoint URL is stored in the manifest, so subsequent commands pick it up au
 Create a `.s3lfsconfig` file at the git root to set defaults for the whole team:
 ```yaml
 # .s3lfsconfig - commit this to version control
+endpoint_url: https://minio.internal:9000
+workers: 16
 no_sign_request: true
 use_acceleration: false
 ```
@@ -516,6 +518,10 @@ When `.s3lfsconfig` exists, its values are used as defaults for all commands. CL
 **Supported keys**:
 - `no_sign_request`: Use unsigned S3 requests (default: `false`)
 - `use_acceleration`: Enable S3 Transfer Acceleration (default: `false`)
+- `endpoint_url`: S3-compatible endpoint for the whole team (default: none, i.e. AWS)
+- `workers`: Parallel worker count (default: auto-detected from CPU count)
+
+Unrecognised keys are reported rather than ignored -- a misspelled setting that changes where your data goes should not fail silently.
 
 ### Public Buckets
 For public S3 buckets, use the `--no-sign-request` flag or set it in `.s3lfsconfig`:
@@ -567,6 +573,37 @@ Files with identical content (same hash) are stored only once in S3, regardless 
 S3LFS supports both SHA-256 (default) and MD5 hashing:
 - SHA-256: More secure, used for file integrity
 - MD5: Available for compatibility with legacy systems
+
+## Correctness
+
+The parts of s3lfs that can lose data are modelled in TLA+ and checked with TLC
+on every pull request. The models live in [`specs/`](specs/); `specs/check.sh`
+runs them.
+
+What is checked:
+
+| Property | Meaning |
+|---|---|
+| `NoDataLoss` | No automatic operation destroys content that exists only on disk |
+| `NoDanglingReference` | Every manifest entry has an object behind it, so a checkout cannot 404 |
+| `NoCollateralDeletion` | Distinct paths never share a storage key, so untracking one never destroys another's bytes |
+| `NoDualOwnership` | No path is versioned by git and s3lfs at the same time |
+| `NoOrphanedFile` | No file on disk is hidden from git while absent from the manifest |
+| `NoSilentCorruption` | A checkout that reports success produced the whole file |
+| `NoLostUpdate` | Concurrent manifest writers do not overwrite each other |
+
+Each property is paired with a configuration that *disables* the design decision
+it depends on, and CI asserts those still fail. A property that holds no matter
+what the code does proves nothing, so both directions are checked.
+
+This is model checking, not a proof about the Python. The models are hand-written
+abstractions of the implementation over small bounded domains -- a few paths, a
+few content values -- so they establish that the *design* is sound and that
+specific defects are excluded, not that the code is free of bugs. Their practical
+value is concrete: checking the working-copy model produced a counterexample
+(`track` → commit → `remove` → `cleanup` → `sync`) that revealed `sync` would
+delete the last copy of content whose object had been garbage-collected. That
+trace is now a regression test.
 
 ## Troubleshooting
 

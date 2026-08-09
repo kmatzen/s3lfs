@@ -7,8 +7,17 @@ with support for file tracking, parallel operations, encryption, and
 automatic cleanup of unused assets.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _installed_version
+
 from . import metrics
 from .core import S3LFS
 
-__version__ = "0.2.0"
+try:
+    # Read the version from installed package metadata so it cannot drift
+    # from pyproject.toml -- there is only one place to bump.
+    __version__ = _installed_version("s3lfs")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    __version__ = "0.0.0+unknown"
+
 __all__ = ["S3LFS", "metrics", "__version__"]

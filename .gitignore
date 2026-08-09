@@ -21,3 +21,11 @@ build/
 
 # Virtual environments
 .venv/
+
+# TLA+ model checker, downloaded on demand (see specs/README.md)
+specs/tla2tools.jar
+specs/states/
+
+# >>> s3lfs tracked files >>>
+/test_cli_file.txt
+# <<< s3lfs tracked files <<<

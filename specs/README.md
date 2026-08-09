@@ -2,6 +2,9 @@
 
 Formal models of s3lfs's concurrency-sensitive protocols, checked with TLC.
 
+References below name functions rather than line numbers, which go stale as
+the code moves.
+
 ## Setup
 
 ```sh
@@ -11,10 +14,81 @@ curl -sSL -o tla2tools.jar \
 
 `tla2tools.jar` is not committed — add it to `.gitignore` if you keep it here.
 
+## S3lfsWorkingCopy — clobbering, aliasing, and dangling references
+
+Models the working-copy lifecycle -- `track`, `remove`, commit, branch switch,
+`sync` (download and prune), and `cleanup` -- against a user who edits tracked
+files without uploading them. The other specs model the storage layer; this one
+models the layer that decides which bytes on disk get replaced or deleted.
+
+Three invariants:
+
+- `NoDataLoss` — no automatic operation destroys content that exists only on
+  disk. A history variable records any content removed while stored nowhere.
+- `NoDanglingReference` — every manifest entry has an object behind it, so a
+  checkout cannot 404.
+- `NoCollateralDeletion` — distinct live paths occupy distinct storage keys, so
+  untracking or collecting one path never destroys bytes another path refers to.
+
+Two constants isolate the design decisions those properties rest on:
+
+```sh
+java -jar tla2tools.jar -config S3lfsWorkingCopy_Fixed.cfg            S3lfsWorkingCopy.tla  # current code
+java -jar tla2tools.jar -config S3lfsWorkingCopy_NoGuard.cfg          S3lfsWorkingCopy.tla  # violates NoDataLoss
+java -jar tla2tools.jar -config S3lfsWorkingCopy_ContentAddressed.cfg S3lfsWorkingCopy.tla  # violates NoCollateralDeletion
+java -jar tla2tools.jar -config S3lfsWorkingCopy_Large.cfg            S3lfsWorkingCopy.tla  # three content values
+```
+
+`CLOBBER_GUARD = FALSE` reproduces the defect fixed in #108: `sync` chose what to
+download from manifest hashes alone, so a file edited but not uploaded was
+replaced silently.
+
+`PATH_AWARE_KEYS = FALSE` reproduces content-only addressing, where two paths
+holding identical bytes share one object and untracking either destroys both.
+The real key function (`_asset_base_key`) includes the path, which is what makes
+the invariant hold.
+
+**This spec changed the code.** Checking the first version -- where the guard
+asked only whether a file still matched the hash the manifest recorded -- TLC
+produced this trace:
+
+```
+track p2  ->  commit  ->  remove p2  ->  cleanup  ->  sync
+```
+
+`remove` drops the manifest entry, `cleanup` collects the now-unreferenced
+object, and `sync` then prunes the local file because it still matches the
+recorded hash -- deleting the last copy. The guard was strengthened to the
+condition the model actually requires: **only take bytes off disk when those
+bytes can be fetched back from S3**. That is `_recoverable()` in `cli.py`, and
+`TestSyncNeverRemovesUnrecoverableContent` pins the trace as a regression test.
+
+## S3lfsOwnership — which system owns each file
+
+s3lfs keeps its files out of git by writing entries into a marked `.gitignore`
+block and removing them from the index, which makes ownership a shared, mutable
+thing between two systems. Two ways to get it wrong:
+
+- `NoDualOwnership` — a path is never tracked by git and s3lfs at once, which
+  would put the large file into git history anyway.
+- `NoOrphanedFile` — a file on disk that git ignores is tracked by s3lfs.
+  Otherwise it is invisible to both: git will not stage it, s3lfs will not
+  upload it, and it survives only on the machine that created it.
+
+```sh
+java -jar tla2tools.jar -config S3lfsOwnership_PerFile.cfg   S3lfsOwnership.tla  # current code
+java -jar tla2tools.jar -config S3lfsOwnership_Directory.cfg S3lfsOwnership.tla  # violates NoOrphanedFile
+```
+
+`IGNORE_SCOPE = "directory"` reproduces the defect fixed in #108, where tracking
+a directory wrote a single `/dir/` pattern: a source file added under that
+directory afterwards is hidden from git and absent from the manifest. The
+per-file expansion (`_gitignore_entries_for`) ignores exactly what s3lfs stores
+and nothing else.
+
 ## S3lfsGC — garbage collection vs. concurrent upload
 
-Models `cleanup_s3` (`s3lfs/core.py:1298-1346`) racing `parallel_upload_chunked`
-(`s3lfs/core.py:1456-1535`).
+Models `S3LFS.cleanup_s3` racing `S3LFS.parallel_upload_chunked`.
 
 The invariant `NoDanglingReference` states that every hash referenced by the
 manifest has a corresponding S3 object. Violating it means a `checkout` 404s on
@@ -92,9 +166,9 @@ independent knobs:
   saving. TRUE models `parallel_upload_chunked:1525`, `upload:1258`,
   `track_interleaved:2480`; FALSE models `remove_file:1284`,
   `remove_subtree:1776`, `track_modified_files_cached:830`,
-  `track_modified_files:1381`.
+  `S3LFS.track_modified_files`.
 - `SHARED_LOCK` — whether all processes agree on one lock file. FALSE models the
-  CWD-relative `temp_dir` defect at `core.py:158`.
+  CWD-relative `temp_dir` defect in `S3LFS.__init__`.
 
 `NoLostUpdate` compares the manifest against a ghost variable holding the result
 of an equivalent serial execution. A violation is one process erasing another's
@@ -137,20 +211,19 @@ system.
 
 ## S3lfsChunks — partial chunked upload and silent truncation
 
-Models `parallel_upload_chunked` (`s3lfs/core.py:1456-1535`) followed by the
-checkout that reassembles the file (`_discover_chunks_for_file:1565-1584`,
-`_finalize_file:1615-1637`).
+Models `S3LFS.parallel_upload_chunked` followed by the checkout that
+reassembles the file (`S3LFS._discover_chunks_for_file`,
+`S3LFS._finalize_file`).
 
 Three defects interact:
 
-1. The manifest entry is recorded at *prep* time (`core.py:1498`), before any
-   chunk is PUT.
-2. Per-chunk upload failures are caught, printed, and skipped
-   (`core.py:1513-1516`); the `finally` at `core.py:1524` writes the manifest
-   anyway.
-3. Checkout infers the chunk count from `len(chunk_keys)` and reads indices
-   `0..n-1` (`core.py:1584`), assuming the surviving chunks form a contiguous
-   prefix.
+1. The manifest entry is recorded at *prep* time, in `_prepare_file_for_upload`,
+   before any chunk is PUT.
+2. Per-chunk upload failures are caught, printed, and skipped; the `finally`
+   in `parallel_upload_chunked` writes the manifest anyway.
+3. Checkout infers the chunk count from `len(chunk_keys)` in
+   `_discover_chunks_for_file` and reads indices `0..n-1`, assuming the
+   surviving chunks form a contiguous prefix.
 
 `NoSilentCorruption` states that a checkout reporting success produced the whole
 file. `ManifestImpliesChunks` is the stronger upload-side property: a manifest
@@ -220,7 +293,7 @@ the same file.
 
 The model also carries the directory tree, because s3lfs's own metadata lives in
 the tree s3lfs enumerates. `_resolve_filesystem_paths` uses `rglob("*")` with no
-exclusion list (`core.py:1878`).
+exclusion list.
 
 ```
 R                 repository root, holds .s3_manifest.yaml
@@ -402,7 +475,7 @@ dimension. It therefore cannot see the mismatch between GC's reachability unit
 It also assumes manifest reads and writes are mutually exclusive — that the
 `portalocker` lock actually works. `S3lfsManifest` discharges exactly that
 assumption, and shows it does not currently hold: the lock is only real when
-`SHARED_LOCK` is TRUE, which the CWD-relative `temp_dir` at `s3lfs/core.py:158`
+`SHARED_LOCK` is TRUE, which the CWD-relative `temp_dir` in `S3LFS.__init__`
 does not guarantee. **The `INFLIGHT` result therefore depends on fixing the lock
 path first.** Resolve the lock file relative to the git root, as the manifest
 path already is.

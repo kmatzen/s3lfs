@@ -5,10 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-08
 
 ### Added
 - Sparse checkout support: s3lfs now applies the working copy's `git sparse-checkout` rules to tracked files, so a large repository can be checked out one slice at a time. Rules are matched by `git sparse-checkout check-rules` (git's own matcher, cone and non-cone), because tracked files are gitignored and therefore invisible to git's own sparse machinery. `sync` downloads only in-profile files and prunes ones that leave the profile, `checkout --all` means "everything this working copy materializes", `status` hides out-of-profile files behind a count, and the pre-commit hook walks only the slice so commit cost tracks the working copy rather than the repository. Requires git 2.42+; degrades to treating everything as in-profile (with a warning) otherwise, so it can only ever over-download.
+- `specs/S3lfsOwnership.tla`: a TLA+ model of git/s3lfs file ownership, checking that no path is versioned by both systems at once and that no file on disk is hidden from git while absent from the manifest. `IGNORE_SCOPE = "directory"` reproduces the over-broad ignore defect.
+- `specs/S3lfsWorkingCopy.tla`: a TLA+ model of the working-copy lifecycle (track, remove, commit, branch switch, sync, cleanup) checking that content existing only on disk is never destroyed, that every manifest entry has an object behind it, and that distinct paths never share a storage key. Constants isolate the two design decisions those properties depend on; TLC confirms each is load-bearing by violating an invariant when it is disabled.
 - `s3lfs sparse` command: shows whether sparse checkout is active, the patterns in effect, and how many tracked files are materialized here
 - `s3lfs sync [--from REV]` command: brings tracked files in line with the manifest by diffing against a revision's manifest, transferring only what changed and removing files the manifest no longer lists (only when their content still matches what it recorded). Replaces the blanket `checkout --all` in the post-checkout and post-merge hooks, which re-hashed every tracked file on every branch switch.
 - `post-rewrite` git hook, so `git pull --rebase` -- which fires neither post-merge nor a branch post-checkout -- no longer leaves tracked files stale
@@ -23,17 +25,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Manifest and cache YAML now use the libyaml-backed loader and dumper when available, which parses roughly 8x faster (4.31s to 0.50s for a 100,000-entry manifest) and emits byte-identical output. Every command reads the whole manifest, so this is felt everywhere.
 - The pre-push hook now verifies that pushed manifests reference uploaded content (`s3lfs verify`) instead of uploading at push time. Uploading during pre-push updated only the working-tree manifest, so the commits being pushed still referenced the old hashes; uploads now happen in the pre-commit hook where the manifest change lands in the commit itself.
+- CI now tests Python 3.9 through 3.13 on Linux plus a macOS run. It previously tested whatever single interpreter the runner happened to provide, so the declared 3.9 floor was never exercised -- and a Python 3.14 pathlib change had already broken a test here.
+- README no longer calls `cleanup` "experimental and untested": it has substantial test coverage and is the only subsystem with TLA+ models behind it. The warning was steering people away from the most rigorously verified code in the project.
+- The TLA+ spec notes now cite functions instead of line numbers, which had drifted far enough to point at the wrong code.
 
 ### Fixed
+- **`sync` no longer deletes the last copy of content that is no longer in S3.** The clobber guard added earlier asked only whether a file still matched the hash the manifest recorded -- but that object may since have been garbage-collected, in which case the copy on disk is the only one. TLC found the trace (`track`, commit, `remove`, `cleanup`, `sync`) against the new `S3lfsWorkingCopy` model, and the rule was strengthened to what the model requires: only take bytes off disk when those bytes can be fetched back.
 - **`sync` no longer overwrites locally modified tracked files.** It compared disk content only against the *target* hash, so a file edited but not yet uploaded counted as "needs downloading" and was silently replaced -- no warning, no backup, from an automatic post-checkout hook. Tracked files are gitignored, so git could not warn either. It now also compares against the previous revision's hash: a file holding the content the old manifest recorded is safe to update, anything else is reported and kept. `--force` restores the old behaviour, and the no-baseline path (which cannot tell the two apart) keeps modified files too.
 - **`s3lfs install` no longer installs dead code.** A block appended to an existing hook ending in `exit 0` -- git's own samples, husky, and many CI scaffolds do -- was never reached while install reported success, so nothing uploaded at commit and nothing verified at push. The block is now placed where it runs, and a hook whose interpreter is not a POSIX shell is refused with an explanation rather than corrupted.
 - **Read-only commands no longer rewrite the manifest.** `S3LFS.__init__` saved unconditionally, so `status`, `sparse`, `ls`, `verify` and every sync hook dirtied the git-tracked manifest, breaking clean-tree checks and able to overwrite an unresolved merge. It now writes only when construction actually changed the stored configuration.
 - **`s3lfs track <dir>` no longer hides later files from git.** It wrote `/<dir>/`, ignoring everything under that directory forever, so a source file added there afterwards was invisible to git (ignored) *and* to s3lfs (not in the manifest) -- present on one machine only. Literal specs now expand to one entry per tracked file, globs are kept as-is, and gitignore metacharacters are escaped so a directory like `runs[2024]` matches literally instead of as a character class.
 - **`s3lfs track` reports when it tracks nothing.** A path outside the repository -- including a symlink pointing outside it -- was skipped with no output and exit 0, leaving the user believing a large file was safely in S3.
+- `s3lfs install` no longer crashes in a linked worktree or submodule, where `.git` is a file rather than a directory. It asks git where the hooks live (`git rev-parse --git-path hooks`) instead of assuming.
+- `s3lfs sync` on a branch from before s3lfs existed now says there is nothing to sync instead of erroring, so the post-checkout hook stops reporting a failure for an ordinary checkout.
+- A manifest that cannot be parsed now produces an explanation rather than a bare YAML traceback, and names merge conflict markers when it finds them -- the state a teammate who has not run `s3lfs install` will hit.
+- A revision whose manifest is unparseable or is not a manifest at all (a directory at that path, a commit with conflict markers) is treated as "no baseline" rather than raising out of a hook.
+- The merge driver keeps keys whose value is legitimately null instead of reading them as deleted, detects `.gitignore` by content when git does not pass the path, and no longer claims git will "fall back" on failure -- git does not, so the message now says the file needs resolving by hand.
+- `verify --revision` warns when that revision recorded a different bucket or prefix, which would otherwise make it check the wrong location and report false missing content.
+- `pre-commit` stages `.gitignore` alongside the manifest and fails loudly if staging fails, instead of letting a commit record old hashes while the new content is already in S3.
+- S3 listings used to derive chunk counts now follow continuation tokens; a truncated listing at 1000 keys would have silently rebuilt a short file. The loop continues only on a genuine continuation token, so an unexpected response shape cannot spin it forever.
+- `git ls-files -z` output and `git rm` pathspecs are handled as bytes, so paths containing a carriage return are not mangled.
+- `s3lfs sparse` reports a profile it could not apply even when the failure happens mid-listing.
 - `sync --prune` keeps going and reports failures when a file cannot be removed, instead of aborting mid-loop with no summary.
 - `test_load_cache_stat_oserror` assumed `Path.exists()` is implemented in terms of `Path.stat`, which is no longer true on Python 3.14; the test now patches both explicitly
 
-## [0.2.0] - 2026-04-11
+## [0.2.0] - 2026-04-11 (never published)
+
+This version was tagged in the changelog but no release was ever cut, so it
+never reached PyPI. Everything below shipped in 0.3.0 instead.
 
 ### Added
 - `--endpoint-url` flag for S3-compatible storage (MinIO, Cloudflare R2, Backblaze B2, Wasabi)

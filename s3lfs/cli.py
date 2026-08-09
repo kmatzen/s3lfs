@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import click
+import yaml
 
 from s3lfs import metrics
 from s3lfs.config import load_config
@@ -26,6 +27,13 @@ def _make_s3lfs(
     # CLI True overrides config; CLI False falls back to config
     effective_no_sign = no_sign_request or config.get("no_sign_request", False)
     effective_accel = use_acceleration or config.get("use_acceleration", False)
+
+    # For non-boolean settings an unset CLI option arrives as None, so the
+    # config supplies the value only when the flag was not given.
+    for key in ("endpoint_url", "workers"):
+        if extra.get(key) is None and config.get(key) is not None:
+            extra[key] = config[key]
+
     return S3LFS(
         no_sign_request=effective_no_sign,
         manifest_file=str(manifest_path),
@@ -106,6 +114,7 @@ def get_manifest_path(git_root):
 
 
 @click.group()
+@click.version_option(package_name="s3lfs", prog_name="s3lfs")
 def cli():
     """S3-based asset versioning CLI tool."""
     pass
@@ -320,6 +329,23 @@ def checkout(
         raise click.Abort()
 
 
+def _recoverable(s3lfs, on_disk):
+    """Which of these paths hold content that can be fetched back from S3.
+
+    This is the condition under which taking bytes off disk loses nothing,
+    and it is deliberately stronger than "matches the hash the manifest
+    recorded". A file can match a recorded hash whose object has since been
+    garbage-collected, in which case the copy on disk is the last one.
+    TLC found exactly that trace against the weaker rule -- track, commit,
+    remove, cleanup, sync -- see specs/S3lfsWorkingCopy.tla.
+    """
+    present = {key: h for key, h in on_disk.items() if h is not None}
+    if not present:
+        return set()
+    missing = {key for key, _ in s3lfs.find_missing_assets(present)}
+    return set(present) - missing
+
+
 def _prune_empty_parents(git_root, path):
     """Remove directories left empty by a deleted file, up to the git root."""
     parent = path.parent
@@ -382,8 +408,20 @@ def sync(
     actually changed. Used by the post-checkout, post-merge, and
     post-rewrite hooks.
     """
-    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+    git_root = find_git_root()
+    if not git_root:
+        click.echo("Error: Not in a git repository")
+        raise click.Abort()
 
+    manifest_path = get_manifest_path(git_root)
+    if not manifest_path.exists():
+        # Checking out a branch from before s3lfs was introduced is a normal
+        # thing to do; the post-checkout hook must not report an error for
+        # it. There is nothing to sync to, so say so and stop.
+        click.echo("No s3lfs manifest here; nothing to sync.")
+        return
+
+    path_resolver = PathResolver(git_root)
     s3lfs = _make_s3lfs(
         git_root,
         manifest_path,
@@ -426,35 +464,35 @@ def sync(
             click.echo("Tracked files are already in sync.")
             return
         if changed:
-            # Two questions, two comparisons. Against the *new* hash: does
-            # this file already hold the target content, so no transfer is
-            # needed? Against the *old* hash: is what is on disk the content
-            # the previous manifest recorded, so overwriting it loses
-            # nothing? A file matching neither has been edited locally, and
-            # since tracked files are gitignored, git never warned about it
-            # and this is the only thing standing between that work and a
-            # silent overwrite.
-            at_target = s3lfs.compare_to_hashes(changed, progress=verbose)
-            baseline = {k: previous[k] for k in changed if k in previous}
-            at_baseline = s3lfs.compare_to_hashes(baseline, progress=verbose)
+            on_disk = s3lfs.disk_hashes(changed, progress=verbose)
+            # Only files that exist and do not already hold the target
+            # content can lose anything, so only those are worth an S3
+            # round trip. Most of a branch switch is absent or already
+            # correct files.
+            at_risk = {
+                key: h
+                for key, h in on_disk.items()
+                if h is not None and h != changed[key]
+            }
+            recoverable = _recoverable(s3lfs, at_risk)
 
             to_download = []
             locally_modified = []
             for key in changed:
-                if at_target.get(key) == "up_to_date":
-                    continue
-                if at_target.get(key) == "missing":
-                    to_download.append((key, changed[key]))
-                elif force or at_baseline.get(key) == "up_to_date":
+                if on_disk.get(key) == changed[key]:
+                    continue  # already holds the target content
+                if on_disk.get(key) is None:
+                    to_download.append((key, changed[key]))  # nothing to lose
+                elif force or key in recoverable:
                     to_download.append((key, changed[key]))
                 else:
                     locally_modified.append(key)
 
             if locally_modified:
                 click.echo(
-                    f"Keeping {len(locally_modified)} locally modified file(s); "
-                    "upload with 's3lfs track --modified', or discard with "
-                    "'s3lfs sync --force':"
+                    f"Keeping {len(locally_modified)} file(s) whose content is "
+                    "not in S3; upload with 's3lfs track --modified', or "
+                    "discard with 's3lfs sync --force':"
                 )
                 for key in sorted(locally_modified):
                     click.echo(f"  {key}")
@@ -466,19 +504,17 @@ def sync(
                 click.echo(f"{len(changed)} changed entr(y/ies) already up-to-date.")
 
     if to_remove and prune:
-        # Only remove content that still matches the hash recorded for it.
-        # Anything else is local work, and deleting it would destroy the
-        # only copy.
-        states = s3lfs.compare_to_hashes(to_remove, progress=verbose)
+        on_disk = s3lfs.disk_hashes(to_remove, progress=verbose)
+        recoverable = _recoverable(s3lfs, on_disk)
         removed = 0
         failed = []
-        for key, state in sorted(states.items()):
-            if state == "missing":
+        for key in sorted(to_remove):
+            if on_disk.get(key) is None:
                 continue
-            if state == "modified" and not force:
+            if not force and key not in recoverable:
                 click.echo(
-                    f"Keeping {key}: it is no longer materialized here but has "
-                    "local modifications."
+                    f"Keeping {key}: it is no longer materialized here, and "
+                    "its content is not in S3 to fetch back."
                 )
                 continue
             filesystem_path = path_resolver.to_filesystem_path(key)
@@ -1166,14 +1202,30 @@ def _save_marked_block(path, start_marker, end_marker, before, entries, after):
     path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
-def _add_marked_entry(path, start_marker, end_marker, entry):
-    """Add an entry to a marked block. Returns True if it was added."""
+def _add_marked_entries(path, start_marker, end_marker, new_entries):
+    """Add entries to a marked block in one pass. Returns those added.
+
+    Adding them one at a time would re-read and rewrite the whole file per
+    entry, which is quadratic in the number of tracked files -- and
+    `track` on a large directory adds one entry per file.
+    """
     before, entries, after = _load_marked_block(path, start_marker, end_marker)
-    if entry in entries:
-        return False
-    entries.append(entry)
-    _save_marked_block(path, start_marker, end_marker, before, entries, after)
-    return True
+    have = set(entries)
+    added = []
+    for entry in new_entries:
+        if entry in have:
+            continue
+        have.add(entry)
+        entries.append(entry)
+        added.append(entry)
+    if added:
+        _save_marked_block(path, start_marker, end_marker, before, entries, after)
+    return added
+
+
+def _add_marked_entry(path, start_marker, end_marker, entry):
+    """Add a single entry to a marked block. Returns True if it was added."""
+    return bool(_add_marked_entries(path, start_marker, end_marker, [entry]))
 
 
 def _remove_marked_entries(path, start_marker, end_marker, entry_variants):
@@ -1197,6 +1249,13 @@ def _add_gitignore_entry(git_root, entry):
     """Add an entry to the s3lfs block in .gitignore. Returns True if added."""
     return _add_marked_entry(
         git_root / ".gitignore", S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END, entry
+    )
+
+
+def _add_gitignore_entries(git_root, entries):
+    """Add several entries to the s3lfs block in one read-modify-write."""
+    return _add_marked_entries(
+        git_root / ".gitignore", S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END, entries
     )
 
 
@@ -1254,15 +1313,16 @@ def _deindex_tracked_files(git_root, tracked_keys):
 
     Returns the list of paths that were removed.
     """
+    # Bytes, not text: universal-newline translation would mangle a path
+    # containing a carriage return in NUL-delimited output.
     result = subprocess.run(
         ["git", "ls-files", "-z"],
         capture_output=True,
-        text=True,
         cwd=str(git_root),
     )
     if result.returncode != 0:
         return []
-    indexed = {p for p in result.stdout.split("\0") if p}
+    indexed = {p for p in result.stdout.decode().split("\0") if p}
     offenders = sorted(indexed & set(tracked_keys))
     if not offenders:
         return []
@@ -1279,15 +1339,14 @@ def _deindex_tracked_files(git_root, tracked_keys):
             "--pathspec-from-file=-",
             "--pathspec-file-nul",
         ],
-        input="\0".join(f":(literal){p}" for p in offenders),
+        input="\0".join(f":(literal){p}" for p in offenders).encode(),
         capture_output=True,
-        text=True,
         cwd=str(git_root),
     )
     if result.returncode != 0:
         click.echo(
             "Warning: failed to remove tracked files from the git index:\n"
-            f"{result.stderr.strip()}"
+            f"{result.stderr.decode().strip()}"
         )
         return []
     return offenders
@@ -1307,11 +1366,9 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         )
         return
 
-    added = [
-        entry
-        for entry in _gitignore_entries_for(manifest_key, matched.keys())
-        if _add_gitignore_entry(git_root, entry)
-    ]
+    added = _add_gitignore_entries(
+        git_root, _gitignore_entries_for(manifest_key, matched.keys())
+    )
     if added:
         shown = ", ".join(f"'{e}'" for e in added[:3])
         more = f" and {len(added) - 3} more" if len(added) > 3 else ""
@@ -1330,12 +1387,8 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         click.echo("Commit to finalize their removal from git.")
 
 
-def _manifest_files_at_revision(git_root, revision):
-    """Load the manifest's files mapping as of a git revision.
-
-    Returns None when the revision has no manifest or is not available
-    locally (e.g. a remote sha that was never fetched).
-    """
+def _manifest_document_at_revision(git_root, revision):
+    """The manifest mapping as of a git revision, or None if unusable."""
     names = [get_manifest_path(git_root).name]
     for other in (".s3_manifest.yaml", ".s3_manifest.json"):
         if other not in names:
@@ -1348,10 +1401,37 @@ def _manifest_files_at_revision(git_root, revision):
             cwd=str(git_root),
         )
         if result.returncode == 0:
-            # yaml.safe_load handles both the YAML and JSON manifest formats
-            data = yaml_load(result.stdout) or {}
-            return data.get("files") or {}
+            # `git show` exits 0 for things that are not manifests too -- a
+            # directory at that path prints a tree listing, and a manifest
+            # committed with conflict markers is not valid YAML. Treat
+            # anything that is not a mapping as "no usable baseline" rather
+            # than raising out of a hook.
+            try:
+                data = yaml_load(result.stdout)
+            except yaml.YAMLError:
+                return None
+            return data if isinstance(data, dict) else None
     return None
+
+
+def _manifest_config_at_revision(git_root, revision):
+    """Bucket/prefix recorded in a revision's manifest (empty if unknown)."""
+    document = _manifest_document_at_revision(git_root, revision)
+    return document or {}
+
+
+def _manifest_files_at_revision(git_root, revision):
+    """Load the manifest's files mapping as of a git revision.
+
+    Returns None when the revision has no usable manifest -- absent, not
+    available locally (a remote sha never fetched), or not a manifest at
+    all.
+    """
+    document = _manifest_document_at_revision(git_root, revision)
+    if document is None:
+        return None
+    files = document.get("files")
+    return files if isinstance(files, dict) else {}
 
 
 S3LFS_HOOK_START = "# >>> s3lfs hook >>>"
@@ -1454,8 +1534,6 @@ HOOK_SCRIPTS = {
 
 def _get_hooks_dir(git_root):
     """Get the git hooks directory, respecting core.hooksPath config."""
-    import subprocess
-
     try:
         result = subprocess.run(
             ["git", "config", "core.hooksPath"],
@@ -1470,6 +1548,26 @@ def _get_hooks_dir(git_root):
             return hooks_path
     except Exception:
         pass
+
+    # Ask git where the hooks live rather than assuming .git is a directory.
+    # In a linked worktree or a submodule it is a *file* pointing elsewhere,
+    # and guessing git_root/.git/hooks makes install fail with
+    # NotADirectoryError.
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "hooks"],
+            capture_output=True,
+            text=True,
+            cwd=str(git_root),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            hooks_path = Path(result.stdout.strip())
+            if not hooks_path.is_absolute():
+                hooks_path = git_root / hooks_path
+            return hooks_path
+    except Exception:
+        pass
+
     return git_root / ".git" / "hooks"
 
 
@@ -1747,17 +1845,26 @@ MANIFEST_NAMES = (".s3_manifest.yaml", ".s3_manifest.json")
 MERGE_DRIVER_PATHS = MANIFEST_NAMES + (".gitignore",)
 
 
+_ABSENT = object()
+
+
 def _merge_maps(base, ours, theirs):
     """Three-way merge of two flat maps. Returns (merged, conflicting_keys).
 
     A key only conflicts when both sides changed it away from the base to
     different values; a change on one side alone (including a deletion)
     is taken as-is.
+
+    Absence is tracked with a sentinel rather than None, so a key whose
+    value is legitimately null (``endpoint_url`` on plain S3) is kept
+    rather than being read as "deleted" and silently dropped.
     """
     merged = {}
     conflicts = []
     for key in set(base) | set(ours) | set(theirs):
-        o, a, b = base.get(key), ours.get(key), theirs.get(key)
+        o = base.get(key, _ABSENT)
+        a = ours.get(key, _ABSENT)
+        b = theirs.get(key, _ABSENT)
         if a == b:
             value = a
         elif a == o:
@@ -1767,9 +1874,16 @@ def _merge_maps(base, ours, theirs):
         else:
             conflicts.append(key)
             value = a
-        if value is not None:
+        if value is not _ABSENT:
             merged[key] = value
     return merged, sorted(conflicts)
+
+
+def _read_text_or_empty(path):
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return ""
 
 
 def _read_manifest_for_merge(path):
@@ -1867,6 +1981,10 @@ def sparse(porcelain):
 
     profile = _sparse_profile(git_root)
     inside, outside = profile.partition(dict(s3lfs.manifest.get("files", {})))
+    # partition() can discover mid-flight that it cannot apply the rules,
+    # after _sparse_profile already had its chance to warn.
+    if profile.degraded_reason:
+        click.echo(f"Warning: {profile.degraded_reason}")
 
     if porcelain:
         for key in sorted(inside):
@@ -1912,7 +2030,15 @@ def merge_driver(base, ours, theirs, target):
     Writes the result over OURS, as git requires, and exits non-zero when
     a real conflict remains.
     """
-    if target and Path(target).name == ".gitignore":
+    # %P names the real path; without it (a stale driver config, or a
+    # hand-written .gitattributes) fall back to sniffing our side, so a
+    # .gitignore is never parsed as -- or overwritten by -- a manifest.
+    is_gitignore = (
+        Path(target).name == ".gitignore"
+        if target
+        else S3LFS_GITIGNORE_START in _read_text_or_empty(ours)
+    )
+    if is_gitignore:
         merged_text, conflict = _merge_gitignore(base, ours, theirs)
         Path(ours).write_text(merged_text)
         if conflict:
@@ -1929,7 +2055,15 @@ def merge_driver(base, ours, theirs, target):
         our_data = _read_manifest_for_merge(ours)
         their_data = _read_manifest_for_merge(theirs)
     except Exception as e:
-        click.echo(f"s3lfs: cannot merge manifest ({e}); falling back to git", err=True)
+        # Leave %A exactly as git supplied it (our side) and report a
+        # conflict. Git does not substitute its own merge for a failing
+        # driver, so saying it "falls back" would be a lie -- the user has
+        # to resolve this by hand.
+        click.echo(
+            f"s3lfs: cannot merge {target or 'manifest'} ({e}); "
+            "our version was left in place -- resolve it by hand.",
+            err=True,
+        )
         raise SystemExit(1)
 
     files, file_conflicts = _merge_maps(
@@ -2060,6 +2194,25 @@ def verify(revision, base, no_sign_request, use_acceleration, endpoint_url, work
         if files is None:
             click.echo(f"No manifest at revision {revision}; nothing to verify.")
             return
+        # Hashes come from that revision but the bucket and prefix come from
+        # the working tree. If the revision stored different ones, we would
+        # be looking in the wrong place and calling it missing.
+        stored = _manifest_config_at_revision(git_root, revision)
+        mismatch = [
+            f"{key}: {stored[key]!r} at {revision}, {current!r} here"
+            for key, current in (
+                ("bucket_name", s3lfs.bucket_name),
+                ("repo_prefix", s3lfs.repo_prefix),
+            )
+            if stored.get(key) is not None and stored.get(key) != current
+        ]
+        if mismatch:
+            click.echo(
+                f"Warning: {revision} was written against different S3 "
+                "settings, so this check may look in the wrong place:"
+            )
+            for line in mismatch:
+                click.echo(f"  {line}")
     else:
         files = dict(s3lfs.manifest.get("files", {}))
 
@@ -2139,10 +2292,26 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         profile = _sparse_profile(git_root)
         s3lfs.track_modified_files_cached(silence=True, keys=profile.select(tracked))
 
-    subprocess.run(
-        ["git", "add", "--", manifest_path.name],
+    # Stage the manifest, and .gitignore alongside it: `track` writes both,
+    # and committing one without the other leaves the ignore rules and the
+    # tracked set out of step.
+    to_stage = [manifest_path.name]
+    if (git_root / ".gitignore").exists():
+        to_stage.append(".gitignore")
+
+    result = subprocess.run(
+        ["git", "add", "--", *to_stage],
+        capture_output=True,
+        text=True,
         cwd=str(git_root),
     )
+    if result.returncode != 0:
+        # Letting the commit proceed here would record the old hashes while
+        # the new content is already in S3 -- and pre-push compares against
+        # the tip, so it would not catch it either.
+        click.echo("Error: could not stage the s3lfs manifest:")
+        click.echo(result.stderr.strip())
+        raise SystemExit(1)
 
 
 cli.add_command(init)
