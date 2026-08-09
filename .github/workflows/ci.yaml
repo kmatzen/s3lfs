@@ -30,6 +30,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     needs: lint
 
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +42,10 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         include:
           - os: macos-latest
+            python-version: "3.13"
+          # Probe: Windows has never been exercised. Failures here are
+          # data-gathering, not gate -- see continue-on-error below.
+          - os: windows-latest
             python-version: "3.13"
 
     steps:
