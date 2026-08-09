@@ -1371,3 +1371,59 @@ class TestCommitDashAMessage(GitRepoTestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertNotIn("run the same command again", result.output)
+
+
+class TestLazyShardLoading(GitRepoTestCase):
+    """A sharded manifest is read one shard at a time, so a working copy
+    that wants one directory never parses the rest of the repository."""
+
+    def _s3lfs(self):
+        from s3lfs.core import S3LFS
+
+        return S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+
+    def _setup(self):
+        for top in ("alpha", "beta", "gamma"):
+            self._write(f"{top}/f.bin", top)
+            self.runner.invoke(cli, ["track", f"{top}/f.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+
+    def test_construction_reads_no_shards(self):
+        self._setup()
+        files = self._s3lfs().manifest["files"]
+        self.assertEqual(files.loaded_shards, set())
+
+    def test_one_lookup_reads_one_shard(self):
+        self._setup()
+        files = self._s3lfs().manifest["files"]
+        self.assertIn("beta/f.bin", files)
+        self.assertEqual(files.loaded_shards, {"beta"})
+
+    def test_full_iteration_reads_everything(self):
+        self._setup()
+        files = self._s3lfs().manifest["files"]
+        self.assertEqual(len(files), 3)
+        self.assertEqual(files.loaded_shards, {"alpha", "beta", "gamma"})
+
+    def test_preload_limits_what_is_visible(self):
+        self._setup()
+        files = self._s3lfs().manifest["files"]
+        files.preload(["alpha"])
+        self.assertEqual(sorted(files), ["alpha/f.bin"])
+        self.assertEqual(files.loaded_shards, {"alpha"})
+
+    def test_writing_marks_only_that_shard_dirty(self):
+        self._setup()
+        s3lfs = self._s3lfs()
+        untouched = Path(".s3lfs_manifest/gamma.yaml")
+        stamp = untouched.stat().st_mtime_ns
+
+        s3lfs.manifest["files"]["alpha/new.bin"] = "deadbeef"
+        s3lfs.save_manifest()
+
+        self.assertIn("alpha/new.bin", Path(".s3lfs_manifest/alpha.yaml").read_text())
+        self.assertEqual(untouched.stat().st_mtime_ns, stamp)

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
@@ -80,6 +81,103 @@ def yaml_load(stream):
 def yaml_dump(data, stream=None, **kwargs):
     """Emit YAML with the fastest safe dumper available."""
     return yaml.dump(data, stream, Dumper=_YamlDumper, **kwargs)
+
+
+class ShardedFiles(MutableMapping):
+    """The manifest's files mapping, backed by per-directory shard files.
+
+    Behaves like a dict, but reads a shard only when something actually
+    touches a key in it. Looking up or writing one path parses one small
+    file; iterating the whole mapping still parses everything, because
+    that is what the caller asked for.
+
+    The point is the sparse case: a working copy that wants `assets/` need
+    never read the shards for the rest of the repository.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+        self._loaded: dict = {}  # shard -> {key: hash}
+        self._dirty: set = set()
+        self._all_loaded = False
+
+    # -- loading ---------------------------------------------------------
+    def _ensure(self, shard):
+        if shard not in self._loaded:
+            self._loaded[shard] = dict(self._owner._read_shard(shard))
+        return self._loaded[shard]
+
+    def _ensure_all(self):
+        if self._all_loaded:
+            return
+        for shard in self._owner.shard_names():
+            self._ensure(shard)
+        self._all_loaded = True
+
+    def preload(self, shards):
+        """Read these shards now and treat the rest as absent.
+
+        Used when the caller knows its slice -- a sparse profile -- so
+        iteration does not pull in the whole repository.
+        """
+        for shard in shards:
+            self._ensure(shard)
+        self._all_loaded = True
+
+    @property
+    def loaded_shards(self):
+        return set(self._loaded)
+
+    # -- mapping protocol ------------------------------------------------
+    def __getitem__(self, key):
+        return self._ensure(self._owner.shard_for(key))[key]
+
+    def __setitem__(self, key, value):
+        shard = self._owner.shard_for(key)
+        entries = self._ensure(shard)
+        if entries.get(key) != value:
+            entries[key] = value
+            self._dirty.add(shard)
+
+    def __delitem__(self, key):
+        shard = self._owner.shard_for(key)
+        entries = self._ensure(shard)
+        del entries[key]
+        self._dirty.add(shard)
+
+    def __iter__(self):
+        self._ensure_all()
+        for entries in self._loaded.values():
+            yield from entries
+
+    def __len__(self):
+        self._ensure_all()
+        return sum(len(e) for e in self._loaded.values())
+
+    def __contains__(self, key):
+        try:
+            return key in self._ensure(self._owner.shard_for(key))
+        except Exception:
+            return False
+
+    # -- persistence -----------------------------------------------------
+    def save(self):
+        """Write the shards that changed, and remove any left empty."""
+        for shard in sorted(self._dirty):
+            entries = self._loaded.get(shard, {})
+            path = self._owner._shard_path(shard)
+            if entries:
+                self._owner._write_atomic(path, entries)
+            else:
+                path.unlink(missing_ok=True)
+        self._dirty.clear()
+
+    def as_dict(self):
+        self._ensure_all()
+        merged: dict = {}
+        for entries in self._loaded.values():
+            merged.update(entries)
+        return merged
 
 
 def _default_workers():
@@ -697,45 +795,63 @@ class S3LFS:
         return self.shard_dir / f"{safe}.yaml"
 
     def _load_shards(self):
-        """Merge every shard into one files mapping."""
+        """Merge every shard into one files mapping (eager; tests use it)."""
         files: dict = {}
-        if not self.shard_dir.is_dir():
-            return files
-        for path in sorted(self.shard_dir.glob("*.yaml")):
-            try:
-                with open(path, "r") as f:
-                    data = yaml_load(f) or {}
-            except yaml.YAMLError as e:
-                hint = ""
-                if "<<<<<<<" in path.read_text(errors="replace"):
-                    hint = (
-                        " It contains merge conflict markers -- resolve the "
-                        "conflict, or run 's3lfs install' to register the "
-                        "merge driver that prevents it."
-                    )
-                raise RuntimeError(f"Cannot read manifest shard {path}: {e}.{hint}")
-            if isinstance(data, dict):
-                files.update(data)
+        for shard in self.shard_names():
+            files.update(self._read_shard(shard))
         return files
 
-    def _save_shards(self):
-        """Write only the shards whose contents actually changed."""
-        grouped: dict = {}
-        for key, file_hash in self.manifest.get("files", {}).items():
-            grouped.setdefault(self.shard_for(key), {})[key] = file_hash
+    def _read_shard(self, shard):
+        """Parse one shard file. Missing reads as empty."""
+        path = self._shard_path(shard)
+        if not path.is_file():
+            return {}
+        try:
+            with open(path, "r") as f:
+                data = yaml_load(f) or {}
+        except yaml.YAMLError as e:
+            hint = ""
+            if "<<<<<<<" in path.read_text(errors="replace"):
+                hint = (
+                    " It contains merge conflict markers -- resolve the "
+                    "conflict, or run 's3lfs install' to register the "
+                    "merge driver that prevents it."
+                )
+            raise RuntimeError(f"Cannot read manifest shard {path}: {e}.{hint}")
+        return data if isinstance(data, dict) else {}
 
-        self.shard_dir.mkdir(parents=True, exist_ok=True)
-        for shard, entries in grouped.items():
-            if self._loaded_shards.get(shard) == entries:
-                continue
-            self._write_atomic(self._shard_path(shard), entries)
+    def shard_names(self):
+        """Shard names present on disk, from the directory listing alone.
 
-        # A shard that lost its last entry is removed, so an empty file does
-        # not linger in the tree forever.
-        for shard in set(self._loaded_shards) - set(grouped):
-            self._shard_path(shard).unlink(missing_ok=True)
+        Cheap: no shard is parsed. This is what lets a working copy decide
+        which shards it needs before paying to read any of them.
+        """
+        if not self.shard_dir.is_dir():
+            return []
+        names = []
+        for path in sorted(self.shard_dir.glob("*.yaml")):
+            stem = path.stem
+            # Reverse the percent-encoding applied by _shard_path.
+            out, i = [], 0
+            while i < len(stem):
+                if stem[i] == "%" and i + 2 < len(stem) + 1:
+                    try:
+                        out.append(chr(int(stem[i + 1 : i + 3], 16)))
+                        i += 3
+                        continue
+                    except ValueError:
+                        pass
+                out.append(stem[i])
+                i += 1
+            names.append("".join(out))
+        return names
 
-        self._loaded_shards = {s: dict(e) for s, e in grouped.items()}
+    def files_in_shards(self, shards):
+        """Entries from just these shards, leaving the rest unread."""
+        files = {}
+        for shard in shards:
+            files.update(self._read_shard(shard))
+        return files
 
     def _write_atomic(self, path, data):
         temp_file = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
@@ -785,19 +901,26 @@ class S3LFS:
             self.manifest.setdefault("files", {})
             if self.is_sharded:
                 # The root file carries configuration only; entries live in
-                # per-directory shards beside it.
-                self.manifest["files"] = self._load_shards()
-                for key, file_hash in self.manifest["files"].items():
-                    self._loaded_shards.setdefault(self.shard_for(key), {})[
-                        key
-                    ] = file_hash
+                # per-directory shards beside it, read on demand.
+                self.manifest["files"] = ShardedFiles(self)
         else:
             self.manifest = {"files": {}}  # Use file paths as keys
 
     def save_manifest(self):
         """Save the manifest back to disk atomically (YAML or JSON format)."""
         if self.is_sharded:
-            self._save_shards()
+            files = self.manifest.get("files")
+            if isinstance(files, ShardedFiles):
+                files.save()
+            else:
+                # A plain dict here means the manifest was just converted to
+                # the sharded format; write every shard once.
+                grouped: dict = {}
+                for key, file_hash in (files or {}).items():
+                    grouped.setdefault(self.shard_for(key), {})[key] = file_hash
+                self.shard_dir.mkdir(parents=True, exist_ok=True)
+                for shard, entries in grouped.items():
+                    self._write_atomic(self._shard_path(shard), entries)
             root = {k: v for k, v in self.manifest.items() if k != "files"}
             self._write_atomic(self.manifest_file, root)
             return

@@ -20,6 +20,8 @@ much, never too little.
 import subprocess
 from pathlib import Path
 
+from s3lfs.core import MANIFEST_ROOT_SHARD
+
 # Paths are fed to check-rules in batches so a very large manifest does not
 # have to be held in a pipe buffer all at once.
 CHECK_RULES_BATCH = 5000
@@ -120,6 +122,32 @@ class SparseProfile:
     def contains(self, key):
         """Is a single path in the profile?"""
         return not self.active or key in self.select([key])
+
+    def shards(self):
+        """Top-level directories this profile can materialize, or None.
+
+        Manifest shards are named for the first path component, so this is
+        the set of shards a sparse working copy could possibly need. None
+        means "cannot tell" -- an inactive profile, or non-cone patterns
+        whose reach is not a simple prefix -- and the caller must then
+        consider every shard.
+        """
+        if not self.active:
+            return None
+        result = _git(self.git_root, "sparse-checkout", "list", text=True)
+        if result.returncode != 0:
+            return None
+        # Cone mode lists directories. Anything containing a glob or a
+        # negation is not a plain prefix, so bail out rather than guess.
+        shards = {MANIFEST_ROOT_SHARD}
+        for line in result.stdout.splitlines():
+            pattern = line.strip()
+            if not pattern:
+                continue
+            if any(ch in pattern for ch in "*?[!"):
+                return None
+            shards.add(pattern.strip("/").split("/", 1)[0])
+        return shards
 
     def patterns(self):
         """The configured sparse patterns, for display."""
