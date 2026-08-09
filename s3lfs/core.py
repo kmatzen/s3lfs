@@ -1495,12 +1495,19 @@ class S3LFS:
             )
             return
 
-        print(f"Checking {len(files_to_check)} tracked files for modifications...")
+        if not silence:
+            print(f"Checking {len(files_to_check)} tracked files for modifications...")
 
         cache_updates = {}
 
+        # Quiet when the caller asked for quiet. This runs from the
+        # pre-commit hook on every commit, where a progress bar for a scan
+        # that usually finds nothing is just noise across the terminal.
         with tqdm(
-            total=len(files_to_check), desc="Checking files", unit="file"
+            total=len(files_to_check),
+            desc="Checking files",
+            unit="file",
+            disable=silence,
         ) as pbar:
             for file_path in files_to_check:
                 try:
@@ -1622,7 +1629,7 @@ class S3LFS:
             # again here would write this process's older in-memory copy back
             # over anything another process committed in between.
             self.parallel_upload(files_to_upload, silence=silence)
-        else:
+        elif not silence:
             print("No modified files needing upload.")
 
     def _hash_file_mmap(self, file_path):
