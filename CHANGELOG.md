@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Downloads of files at or above the multipart threshold failed against S3-compatible backends** (moto, and the same breakage reported for MinIO and R2): boto3 >= 1.36 validates transport-level CRC checksums by default, and those backends return whole-object checksums for ranged GETs. Transport checksums are now requested only where S3 demands them; integrity is enforced end-to-end instead -- every download path now verifies the complete file's SHA-256 against the manifest, including the single-file path, which previously trusted the transport.
 - **A failed download now fails the command.** `checkout --all` and `sync` exited 0 even when files could not be downloaded, reporting the problem only in scrollback; discovery errors were not counted at all. Download failures and never-completed files propagate to a non-zero exit code with a summary.
 
+### Fixed
+- `s3lfs track` crashed under write-only credentials: the upload path's ETag skip-check uses HeadObject, which requires `s3:GetObject`, and a 403 there aborted the upload. Upload-only policies are a legitimate CI shape; the check now degrades to uploading, whose worst case is re-sending bytes that already exist.
+
 ### Compatibility
 - Objects stored raw by this version are invisible to older s3lfs clients (they only look for `.gz` keys and will fail loudly at checkout). Teams with mixed versions can set `compression: always` until everyone upgrades. Buckets written by older versions are fully readable -- discovery handles both forms.
 

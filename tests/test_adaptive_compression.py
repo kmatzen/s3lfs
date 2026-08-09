@@ -278,3 +278,27 @@ class TestDownloadIntegrity(AdaptiveRepoTestCase):
 
         result = self.runner.invoke(cli, ["sync"])
         self.assertNotEqual(result.exit_code, 0, msg=result.output)
+
+
+class TestWriteOnlyCredentials(AdaptiveRepoTestCase):
+    def test_upload_survives_denied_head_object(self):
+        """A write-only policy denies HeadObject (it needs s3:GetObject).
+        The ETag skip-check must degrade to uploading, not crash track."""
+        from unittest.mock import patch
+
+        from botocore.exceptions import ClientError
+
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        s3lfs = S3LFS(bucket_name=TEST_BUCKET, manifest_file=".s3_manifest.yaml")
+        client = s3lfs._get_s3_client()
+        denied = ClientError(
+            {"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject"
+        )
+        with patch.object(client, "head_object", side_effect=denied):
+            s3lfs.upload("photo.jpg")
+
+        h = self._manifest_hash("photo.jpg")
+        body = self.s3.get_object(Bucket=TEST_BUCKET, Key=f"pfx/assets/{h}/photo.jpg")[
+            "Body"
+        ].read()
+        self.assertEqual(body, self.raw_bytes)
