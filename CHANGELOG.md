@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] - 2026-08-09
 
 ### Fixed
 - `sha256sum`/`md5sum` output is now validated before use. GNU coreutils prefixes the whole line with a backslash when the filename needed escaping -- which every Windows path does, and any POSIX path containing a backslash or newline would too. That byte became part of the hash, the corrupt hash became an S3 key, and every downstream checksum comparison failed. Output that does not parse as a digest now falls back to Python hashing. Found by running the suite on Windows for the first time, where this one bug accounted for 53 of 71 failures.
