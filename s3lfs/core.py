@@ -53,14 +53,6 @@ MANIFEST_ROOT_SHARD = "_root"
 # working copy rather than a set of deliberate deletions.
 BULK_DELETION_FLOOR = 5
 
-# Objects up to this size download as a single sequential stream. Above it,
-# boto3 splits the download into parallel ranges, which is faster for one
-# huge object but writes out of order -- invalidating the streaming digest
-# and forcing a full re-read to verify. Concurrency across files comes from
-# s3lfs's own worker pool, so per-object ranging only pays off for objects
-# large enough that one stream cannot keep a pipe busy.
-DOWNLOAD_SINGLE_STREAM_LIMIT = 256 * 1024 * 1024
-
 # Adaptive compression: gzip a sample from the head of each file and store
 # the object raw unless compressing saves at least this fraction.
 COMPRESSION_SAMPLE_BYTES = 256 * 1024
@@ -2779,17 +2771,12 @@ class S3LFS:
         if self._shutdown_requested:
             raise ShutdownRequested(f"Download cancelled: {chunk_info['s3_key']}")
 
-        from boto3.s3.transfer import TransferConfig
-
         with open(target_path, "wb") as f:
             writer = _HashingWriter(f)
             self._get_s3_client().download_fileobj(
                 Bucket=self.bucket_name,
                 Key=chunk_info["s3_key"],
                 Fileobj=writer,
-                Config=TransferConfig(
-                    multipart_threshold=DOWNLOAD_SINGLE_STREAM_LIMIT
-                ),
             )
         return (
             chunk_info["manifest_key"],
