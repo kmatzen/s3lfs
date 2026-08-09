@@ -861,6 +861,21 @@ def status(path, show_all, porcelain, no_sign_request, use_acceleration, endpoin
         for key in up_to_date:
             click.echo(f"  {display(key)}")
 
+    hidden = _hidden_untracked_files(
+        git_root, s3lfs, set(expected) | set(outside_profile)
+    )
+    if hidden:
+        click.echo()
+        click.echo(
+            f"Hidden from git but not tracked by s3lfs ({len(hidden)}) -- these "
+            "exist only here:"
+        )
+        for key in hidden[:20]:
+            click.echo(f"  {display(key)}")
+        if len(hidden) > 20:
+            click.echo(f"  ... and {len(hidden) - 20} more")
+        click.echo("Track them with 's3lfs track <path>', or ignore them yourself.")
+
 
 @click.command()
 @click.argument("path", required=True)
@@ -1455,22 +1470,84 @@ def _has_glob(spec):
     return any(ch in spec for ch in "*?[")
 
 
-def _gitignore_entries_for(spec, matched_keys):
-    """Root-anchored .gitignore patterns covering what a spec actually tracked.
+def _gitignore_entries_for(git_root, spec, matched_keys):
+    """Root-anchored .gitignore patterns covering what a spec tracked.
 
     A glob spec is used verbatim: it is already precise, and gitignore
     gives an unanchored '*' the same single-level meaning glob.glob does.
+    A directory becomes one directory pattern, and a single file one entry.
 
-    Anything else expands to one entry per tracked file rather than a
-    directory pattern. `/data/` would ignore everything under data/ for
-    all time, so a source file added there later is invisible to git
-    (ignored) *and* to s3lfs (not in the manifest) -- it exists only on
-    one machine. Listing the tracked files ignores exactly what s3lfs
-    stores and nothing else.
+    One entry per tracked file would be more precise, but git matches every
+    candidate path against every pattern with no pruning, so the cost is
+    quadratic: at 100,000 tracked files a per-file block took `git status`
+    from 17ms to 70s. What precision bought -- noticing a file added under
+    a tracked directory that s3lfs is not tracking -- is recovered by
+    `_hidden_untracked_files`, which looks at the directory itself.
     """
+    key = spec.rstrip("/")
+    literal = git_root / key
+    # Decide the same way path resolution does: an existing path is taken
+    # literally even when it contains glob characters, so `runs[2024]/a.bin`
+    # must be escaped rather than left to read as a character class.
+    if literal.is_dir():
+        return [f"/{_escape_gitignore(key)}/"]
+    if literal.is_file():
+        return [f"/{_escape_gitignore(key)}"]
     if _has_glob(spec):
         return [f"/{spec}"]
-    return [f"/{_escape_gitignore(key)}" for key in sorted(matched_keys)]
+    return [f"/{_escape_gitignore(key)}"]
+
+
+# Editor and OS droppings, skipped when reporting what is hidden under a
+# tracked directory. A directory pattern prunes the whole tree, so git
+# never evaluates the user's own rules for anything inside it and cannot
+# tell us whether they would have ignored these.
+def _hidden_untracked_files(git_root, s3lfs, tracked, limit=200, since=None):
+    """Files hidden by an s3lfs directory pattern that s3lfs is not tracking.
+
+    A directory pattern keeps `git add .` from swallowing large files, but
+    it also hides anything else put there later. Such a file would be
+    invisible to git and absent from the manifest -- present on one machine
+    and gone on the next clone -- so s3lfs reports it rather than letting
+    it disappear quietly.
+
+    :param since: only descend into directories modified after this time.
+        Adding a file updates its directory's mtime, so this checks the
+        directories rather than every file, which is what makes the scan
+        affordable on every commit. Pass None for an exhaustive scan.
+    """
+    _, entries, _ = _load_gitignore_block(git_root)
+    directories = [e.rstrip("/").lstrip("/") for e in entries if e.endswith("/")]
+    if not directories:
+        return []
+
+    skip_dirs = {".git", ".s3lfs_temp", MANIFEST_SHARD_DIR}
+    skip_names = {".DS_Store", "Thumbs.db"}
+    skip_suffixes = (".tmp", ".swp", ".swo", ".pyc", "~")
+
+    found = []
+    for directory in directories:
+        root = git_root / directory
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            if since is not None:
+                try:
+                    if os.stat(dirpath).st_mtime <= since:
+                        continue
+                except OSError:
+                    continue
+            base = Path(dirpath)
+            for name in filenames:
+                if name in skip_names or name.endswith(skip_suffixes):
+                    continue
+                key = str((base / name).relative_to(git_root).as_posix())
+                if key not in tracked:
+                    found.append(key)
+                    if len(found) >= limit:
+                        return sorted(found)
+    return sorted(found)
 
 
 def _deindex_tracked_files(git_root, tracked_keys):
@@ -1536,7 +1613,7 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         return
 
     added = _add_gitignore_entries(
-        git_root, _gitignore_entries_for(manifest_key, matched.keys())
+        git_root, _gitignore_entries_for(git_root, manifest_key, matched.keys())
     )
     if added:
         shown = ", ".join(f"'{e}'" for e in added[:3])
@@ -2575,6 +2652,23 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         raise SystemExit(1)
 
     _warn_if_commit_will_look_empty(git_root, to_stage)
+
+    try:
+        since = manifest_path.stat().st_mtime
+    except OSError:
+        since = None
+    hidden = _hidden_untracked_files(git_root, s3lfs, tracked, limit=20, since=since)
+    if hidden:
+        click.echo(
+            f"Warning: {len(hidden)} file(s) under a tracked directory are "
+            "hidden from git and not tracked by s3lfs, so they exist only on "
+            "this machine:"
+        )
+        for key in hidden[:5]:
+            click.echo(f"  {key}")
+        if len(hidden) > 5:
+            click.echo(f"  ... and {len(hidden) - 5} more")
+        click.echo("Track them with 's3lfs track <path>', or ignore them yourself.")
 
 
 def _warn_if_commit_will_look_empty(git_root, staged_paths):
