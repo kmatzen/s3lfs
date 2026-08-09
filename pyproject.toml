@@ -1,6 +1,6 @@
 [project]
 name = "s3lfs"
-version = "0.4.0"
+version = "0.4.1"
 description = "A Python-based version control system for large assets using Amazon S3."
 authors = [{name = "Kevin Blackburn-Matzen", email = "kmatzen@gmail.com"}]
 license = {text = "MIT"}
