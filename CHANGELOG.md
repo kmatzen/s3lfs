@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-09
 
 ### Changed
 - A sharded manifest is now read one shard at a time. Constructing `S3LFS` parses no shards at all; looking up or writing a path parses that path's shard only; iterating still parses everything, because that is what the caller asked for. On a 200,000-entry manifest across 100 shards (18.4 MB): construction went from parsing all of it to 0 shards, a single lookup reads 1 shard in 10 ms, and a three-shard slice costs 24 ms against 861 ms for the whole manifest.
