@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 import shutil
 import tempfile
@@ -38,10 +39,11 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             mock_boto3.return_value = mock_client
 
             full_data = b"chunked file content here"
+            digest = hashlib.sha256(full_data).hexdigest()
             compressed = gzip.compress(full_data)
             mid = len(compressed) // 2
 
-            s3_key = "pfx/assets/hash1/data.bin.gz"
+            s3_key = f"pfx/assets/{digest}/data.bin.gz"
             mock_client.list_objects_v2.return_value = {
                 "Contents": [
                     {"Key": f"{s3_key}.chunk0", "Size": mid},
@@ -61,7 +63,7 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             mock_client.download_fileobj.side_effect = fake_download
 
             s3lfs = S3LFS(bucket_name="test-bucket")
-            s3lfs.download("data.bin", silence=True, expected_hash="hash1")
+            s3lfs.download("data.bin", silence=True, expected_hash=digest)
 
             # head_object should NOT have been called for chunked files
             mock_client.head_object.assert_not_called()
@@ -87,7 +89,11 @@ class TestDownloadUsesListSizes(unittest.TestCase):
             mock_client.download_fileobj.side_effect = fake_download
 
             s3lfs = S3LFS(bucket_name="test-bucket")
-            s3lfs.download("data.bin", silence=True, expected_hash="hash1")
+            s3lfs.download(
+                "data.bin",
+                silence=True,
+                expected_hash=hashlib.sha256(data).hexdigest(),
+            )
 
             self.assertEqual(mock_client.head_object.call_count, 0)
 

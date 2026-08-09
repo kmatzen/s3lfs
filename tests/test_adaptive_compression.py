@@ -222,3 +222,59 @@ class TestLifecycleWithRawObjects(AdaptiveRepoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDownloadIntegrity(AdaptiveRepoTestCase):
+    """Transport-level checksums are off (they break ranged downloads on
+    S3-compatible backends); the SHA-256 in the manifest is the integrity
+    check, so it must actually run on every download path -- and a failed
+    download must fail the command."""
+
+    def test_client_requests_checksums_only_when_required(self):
+        s3lfs = S3LFS(bucket_name=TEST_BUCKET, manifest_file=".s3_manifest.yaml")
+        config = s3lfs._get_s3_client().meta.config
+        self.assertEqual(config.response_checksum_validation, "when_required")
+        self.assertEqual(config.request_checksum_calculation, "when_required")
+
+    def test_single_download_rejects_corrupt_object(self):
+        """download() must verify the manifest hash, not trust transport."""
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        self.runner.invoke(cli, ["track", "photo.jpg"])
+        h = self._manifest_hash("photo.jpg")
+
+        # Corrupt the stored object in place
+        self.s3.put_object(
+            Bucket=TEST_BUCKET, Key=f"pfx/assets/{h}/photo.jpg", Body=b"tampered"
+        )
+        os.remove("photo.jpg")
+
+        s3lfs = S3LFS(bucket_name=TEST_BUCKET, manifest_file=".s3_manifest.yaml")
+        with self.assertRaises(RuntimeError) as caught:
+            s3lfs.download("photo.jpg", silence=True)
+        self.assertIn("Checksum mismatch", str(caught.exception))
+        self.assertFalse(
+            Path("photo.jpg").exists(), "a corrupt file was left looking valid"
+        )
+
+    def test_checkout_all_exits_nonzero_when_content_is_missing(self):
+        """A checkout that could not materialize the working copy must say
+        so in its exit code, not just in scrollback."""
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        self.runner.invoke(cli, ["track", "photo.jpg"])
+        h = self._manifest_hash("photo.jpg")
+        self.s3.delete_object(Bucket=TEST_BUCKET, Key=f"pfx/assets/{h}/photo.jpg")
+        os.remove("photo.jpg")
+
+        result = self.runner.invoke(cli, ["checkout", "--all"])
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("could not be downloaded", result.output)
+
+    def test_sync_exits_nonzero_when_content_is_missing(self):
+        Path("photo.jpg").write_bytes(self.raw_bytes)
+        self.runner.invoke(cli, ["track", "photo.jpg"])
+        h = self._manifest_hash("photo.jpg")
+        self.s3.delete_object(Bucket=TEST_BUCKET, Key=f"pfx/assets/{h}/photo.jpg")
+        os.remove("photo.jpg")
+
+        result = self.runner.invoke(cli, ["sync"])
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
