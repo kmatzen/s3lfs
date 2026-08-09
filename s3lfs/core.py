@@ -181,6 +181,44 @@ class ShardedFiles(MutableMapping):
         return merged
 
 
+class _HashingWriter:
+    """File-object wrapper that folds every written byte into a SHA-256.
+
+    Hashing during the write means a downloaded file never has to be read
+    back just to verify it -- on a 200MB download that second read was
+    pure overhead.
+
+    Only valid for sequential writes. boto3 downloads objects above its
+    multipart threshold as parallel ranges, seeking and writing out of
+    order; hashing those writes in arrival order produces garbage. Any
+    out-of-order seek therefore invalidates the digest, and hexdigest()
+    returns None so the caller falls back to hashing the finished file.
+    """
+
+    def __init__(self, fileobj):
+        self._file = fileobj
+        self._hasher = hashlib.sha256()
+        self._pos = 0
+        self._sequential = True
+
+    def write(self, data):
+        if self._sequential:
+            self._hasher.update(data)
+            self._pos += len(data)
+        return self._file.write(data)
+
+    def seek(self, offset, whence=0):
+        if not (whence == 0 and offset == self._pos):
+            self._sequential = False
+        return self._file.seek(offset, whence)
+
+    def hexdigest(self):
+        return self._hasher.hexdigest() if self._sequential else None
+
+    def __getattr__(self, name):
+        return getattr(self._file, name)
+
+
 def _default_workers():
     """Compute a sensible default worker count based on available CPUs.
 
@@ -2072,16 +2110,24 @@ class S3LFS:
         stem = self._asset_base_key(manifest_key, file_hash)
 
         extra_args = {"ServerSideEncryption": "AES256"} if self.encryption else {}
+        source_is_user_file = False
+        snapshot = None
         if self._should_compress(file_path):
             s3_key = stem + ".gz"
             compressed_path = self.compress_file(file_path)
         else:
             # Raw storage: the object keeps the file's natural name and
-            # exact bytes. Stage a copy so a concurrent edit cannot change
-            # the content between hashing and upload.
+            # exact bytes. Small enough files upload straight from the
+            # source with a stat-snapshot guard against concurrent edits;
+            # larger ones stage through split_file's temps as before.
             s3_key = stem
-            compressed_path = self.temp_dir / f"{uuid4()}.raw"
-            shutil.copyfile(file_path, compressed_path)
+            if file_path.stat().st_size <= self.chunk_size:
+                snapshot = self._stat_snapshot(file_path)
+                compressed_path = file_path
+                source_is_user_file = True
+            else:
+                compressed_path = self.temp_dir / f"{uuid4()}.raw"
+                shutil.copyfile(file_path, compressed_path)
 
         chunked = False
         if compressed_path.stat().st_size > self.chunk_size:
@@ -2179,17 +2225,25 @@ class S3LFS:
                 if not silence:
                     print(f"{path} uploaded")
             finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                if not source_is_user_file:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
-        if not silence:
-            print(f"Compressed file removed: {compressed_path}")
-        try:
-            os.remove(compressed_path)  # Ensure temp file is deleted
-        except OSError:
-            pass
+        if not source_is_user_file:
+            try:
+                os.remove(compressed_path)  # Ensure temp file is deleted
+            except OSError:
+                pass
+
+        if snapshot is not None and self._stat_snapshot(file_path) != snapshot:
+            # The file changed while streaming out; the stored object may be
+            # torn. Refuse to record it so nothing ever references it.
+            raise RuntimeError(
+                f"{file_path} was modified during upload; run 's3lfs track' "
+                "again to upload the current content."
+            )
 
         # Store file path as key, hash as value
         if needs_immediate_update:
@@ -2341,6 +2395,12 @@ class S3LFS:
         """Upload multiple files with block-level parallelism."""
         self.parallel_upload_chunked(files, silence=silence)
 
+    @staticmethod
+    def _stat_snapshot(path):
+        """(size, mtime_ns, inode) -- cheap identity for change detection."""
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns, getattr(st, "st_ino", None))
+
     def _should_compress(self, file_path):
         """Decide whether compressing this file is worth anything.
 
@@ -2386,10 +2446,29 @@ class S3LFS:
             s3_key = stem + ".gz"
             compressed_path = self.compress_file(file_path)
         else:
-            # Stage a copy so a concurrent edit cannot change the bytes
-            # between hashing and upload -- the same snapshot property the
-            # compressed path gets from writing a temp file.
             s3_key = stem
+            if file_path.stat().st_size <= self.chunk_size:
+                # Upload straight from the source file. Copying 200MB to a
+                # temp file just to read it back doubles the disk traffic of
+                # every raw upload; instead, detect a concurrent edit by
+                # comparing a stat snapshot before and after the transfer
+                # and refuse to publish a torn object.
+                return (
+                    manifest_key,
+                    file_hash,
+                    [
+                        {
+                            "path": file_path,
+                            "s3_key": s3_key,
+                            "chunk_index": 0,
+                            "extra_args": extra_args,
+                            "ephemeral": False,
+                            "snapshot": self._stat_snapshot(file_path),
+                        }
+                    ],
+                )
+            # Chunked raw: split_file writes chunk temps anyway, which are
+            # themselves the snapshot.
             compressed_path = self.temp_dir / f"{uuid4()}.raw"
             shutil.copyfile(file_path, compressed_path)
 
@@ -2443,24 +2522,40 @@ class S3LFS:
         path = chunk_info["path"]
         s3_key = chunk_info["s3_key"]
         extra_args = chunk_info["extra_args"]
+        # Ephemeral paths are temp files this pipeline created and owns.
+        # A non-ephemeral path is the user's own file, uploaded in place --
+        # deleting it would destroy their data.
+        ephemeral = chunk_info.get("ephemeral", True)
 
         # Queued work should not start after an interrupt. Only the drain
         # loops checked this, so every task already submitted to the pool ran
         # to completion and Ctrl-C appeared to hang on large transfers.
         if self._shutdown_requested:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            if ephemeral:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             raise ShutdownRequested(f"Upload cancelled: {s3_key}")
 
         try:
             bytes_uploaded = self._put_chunk(path, s3_key, extra_args)
         finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            if ephemeral:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        snapshot = chunk_info.get("snapshot")
+        if snapshot is not None and self._stat_snapshot(path) != snapshot:
+            # The file changed while its bytes were streaming out: the
+            # object under this hash may be torn. Refusing here keeps the
+            # entry out of the manifest, so nothing ever references it.
+            raise RuntimeError(
+                f"{path} was modified during upload; run 's3lfs track' "
+                "again to upload the current content."
+            )
 
         return (s3_key, bytes_uploaded)
 
@@ -2677,10 +2772,11 @@ class S3LFS:
             raise ShutdownRequested(f"Download cancelled: {chunk_info['s3_key']}")
 
         with open(target_path, "wb") as f:
+            writer = _HashingWriter(f)
             self._get_s3_client().download_fileobj(
                 Bucket=self.bucket_name,
                 Key=chunk_info["s3_key"],
-                Fileobj=f,
+                Fileobj=writer,
             )
         return (
             chunk_info["manifest_key"],
@@ -2689,6 +2785,7 @@ class S3LFS:
             target_path.stat().st_size,
             chunk_info["is_chunked"],
             chunk_info["num_chunks"],
+            writer.hexdigest(),
         )
 
     def _finalize_file(
@@ -2699,6 +2796,7 @@ class S3LFS:
         expected_hash=None,
         silence=True,
         compressed=True,
+        stream_hash=None,
     ):
         """Merge chunks (if needed) and decompress to final location.
 
@@ -2734,7 +2832,13 @@ class S3LFS:
                 pass
 
         if expected_hash is not None:
-            actual_hash = self.hash_file(filesystem_path)
+            # stream_hash was computed while the bytes were written; a
+            # re-read of the finished file tells us nothing it does not.
+            actual_hash = (
+                stream_hash
+                if stream_hash is not None
+                else self.hash_file(filesystem_path)
+            )
             if actual_hash != expected_hash:
                 # Remove the bad output rather than leave it looking valid.
                 try:
@@ -2819,6 +2923,7 @@ class S3LFS:
                                 bytes_downloaded,
                                 is_chunked,
                                 num_chunks,
+                                stream_digest,
                             ) = dl_future.result()
                         except Exception as e:
                             chunk = dl_futures[dl_future]
@@ -2833,11 +2938,20 @@ class S3LFS:
                         entry = file_tracker.get(manifest_key)
                         if entry is None:
                             continue
-                        entry["received"].append((chunk_index, target_path))
+                        entry["received"].append(
+                            (chunk_index, target_path, stream_digest)
+                        )
 
                         if len(entry["received"]) == entry["expected"]:
                             entry["received"].sort(key=lambda x: x[0])
-                            chunk_paths = [p for _, p in entry["received"]]
+                            chunk_paths = [p for _, p, _ in entry["received"]]
+                            # Raw unchunked: the stream digest IS the file
+                            # hash, so finalize can verify without re-reading.
+                            stream_hash = (
+                                entry["received"][0][2]
+                                if not entry["compressed"] and not entry["is_chunked"]
+                                else None
+                            )
                             try:
                                 self._finalize_file(
                                     manifest_key,
@@ -2846,6 +2960,7 @@ class S3LFS:
                                     expected_hash=entry["file_hash"],
                                     silence=silence,
                                     compressed=entry["compressed"],
+                                    stream_hash=stream_hash,
                                 )
                                 files_finalized += 1
                             except Exception as e:
@@ -2871,7 +2986,7 @@ class S3LFS:
                 if len(e["received"]) != e["expected"]
             )
             for mk in incomplete:
-                for _, path in file_tracker[mk]["received"]:
+                for _, path, _ in file_tracker[mk]["received"]:
                     try:
                         os.remove(path)
                     except OSError:
@@ -3893,6 +4008,7 @@ class S3LFS:
         os.makedirs(base_directory, exist_ok=True)
 
         target_paths = []
+        stream_digests: list = []
         total_file_size = sum(key_sizes.values())
 
         if progress_callback:
@@ -3940,12 +4056,14 @@ class S3LFS:
                         print(f"Downloading {key} to {target_path}")
                     with metrics.track("s3_download", key):
                         with open(target_path, "wb") as f:
+                            writer = _HashingWriter(f)
                             self._get_s3_client().download_fileobj(
                                 Bucket=self.bucket_name,
                                 Key=key,
-                                Fileobj=f,
+                                Fileobj=writer,
                                 Callback=download_callback,
                             )
+                            stream_digests.append(writer.hexdigest())
             except Exception as e:
                 print(f"Error downloading {key}: {e}")
 
@@ -3972,8 +4090,18 @@ class S3LFS:
 
         # End-to-end verification, same as the parallel path: transport
         # checksums are off, so this is the check that the bytes on disk
-        # are the bytes the manifest promised.
-        actual_hash = self.hash_file(filesystem_path)
+        # are the bytes the manifest promised. For a raw single object the
+        # digest was computed as the bytes streamed in, so the file need
+        # not be read back.
+        if (
+            not compressed
+            and not is_chunked
+            and len(stream_digests) == 1
+            and stream_digests[0] is not None
+        ):
+            actual_hash = stream_digests[0]
+        else:
+            actual_hash = self.hash_file(filesystem_path)
         if actual_hash != expected_hash:
             try:
                 os.remove(filesystem_path)

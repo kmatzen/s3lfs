@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--compressible", action="store_true")
     ap.add_argument("--s5cmd", default="s5cmd")
     ap.add_argument("--prefix", default="bench")
+    ap.add_argument("--workers", type=int, default=None)
     ap.add_argument(
         "--upload-only",
         action="store_true",
@@ -115,6 +116,8 @@ def main():
         init = run(
             s3lfs + ["init", args.bucket, args.prefix] + endpoint, cwd=root, env=env
         )
+        if args.workers:
+            (root / ".s3lfsconfig").write_text(f"workers: {args.workers}\n")
         if init.returncode != 0:
             print("s3lfs init failed:\n" + init.stdout + init.stderr)
             return 1

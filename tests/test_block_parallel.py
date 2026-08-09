@@ -147,7 +147,7 @@ class TestDownloadChunk(unittest.TestCase):
                 "num_chunks": 1,
             }
 
-            mk, idx, path, size, is_chunked, num = s3lfs._download_chunk(
+            mk, idx, path, size, is_chunked, num, digest = s3lfs._download_chunk(
                 chunk_info, target
             )
 
@@ -181,7 +181,7 @@ class TestDownloadChunk(unittest.TestCase):
                 "num_chunks": 1,
             }
 
-            _, _, _, size, _, _ = s3lfs._download_chunk(chunk_info, target)
+            _, _, _, size, _, _, _ = s3lfs._download_chunk(chunk_info, target)
             self.assertEqual(size, 1024)
 
 
