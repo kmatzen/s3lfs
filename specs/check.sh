@@ -36,10 +36,16 @@ run() {
     # second by default, so back-to-back runs of the same module collide and
     # the second one dies before it checks anything -- which looks exactly
     # like the property having changed.
+    #
+    # $2 is the worker count. Exhaustive runs can use every core: the verdict
+    # does not depend on exploration order. Runs that expect a violation use
+    # one worker, because TLC stops at the first one it finds and a
+    # configuration modelling several defects would otherwise report
+    # whichever invariant a given machine happened to reach first.
     meta="${TMPDIR:-/tmp}/tlc-meta-$1"
     rm -rf "$meta"
     java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC \
-        -metadir "$meta" -config "$1.cfg" -workers auto \
+        -metadir "$meta" -config "$1.cfg" -workers "$2" \
         "$(module_for "$1").tla" > "${TMPDIR:-/tmp}/tlc_$1.out" 2>&1 || true
     rm -rf "$meta"
     cat "${TMPDIR:-/tmp}/tlc_$1.out"
@@ -84,7 +90,7 @@ for cfg in \
     S3lfsOwnership_PerFile
 do
     printf '%-38s ' "$cfg (holds)"
-    if run "$cfg" | grep -q "No error has been found"; then
+    if run "$cfg" auto | grep -q "No error has been found"; then
         echo "ok"
     else
         echo "FAILED -- an invariant the shipped design relies on does not hold"
@@ -100,7 +106,7 @@ for pair in \
     "S3lfsChunks_Baseline                NoSilentCorruption" \
     "S3lfsGC                             NoDanglingReference" \
     "S3lfsGCFixed                        NoDanglingReference" \
-    "S3lfsCombined_Broken                NoLostUpdate" \
+    "S3lfsCombined_Broken                NoLostUpdate|NoDanglingReference" \
     "S3lfsCombined_ReloadOnly            NoDanglingReference" \
     "S3lfsCombined_RevalOnly             NoDanglingReference" \
     "S3lfsManifest_NoReload_Lock         NoLostUpdate" \
@@ -117,7 +123,7 @@ do
     # shellcheck disable=SC2086
     set -- $pair
     printf '%-38s ' "$1 ($2 fails)"
-    if run "$1" | grep -q "Error: Invariant $2 is violated"; then
+    if run "$1" 1 | grep -qE "Error: Invariant ($2) is violated"; then
         echo "ok"
     else
         echo "FAILED -- the modelled defect no longer violates $2, so the"
