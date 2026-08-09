@@ -110,7 +110,7 @@ class TestS3LFS(unittest.TestCase):
         self.versioner.upload(self.test_file)
         manifest = self.versioner.manifest
         file_hash = self.versioner.hash_file(self.test_file)
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
 
         # Check that the manifest correctly tracks the file path
         self.assertIn(self.test_file, manifest["files"])
@@ -225,7 +225,7 @@ class TestS3LFS(unittest.TestCase):
         """
         self.versioner.upload(self.test_file)
         file_hash = self.versioner.hash_file(self.test_file)
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
 
         # Retrieve the object's metadata
         head_resp = self.s3.head_object(Bucket=self.bucket_name, Key=s3_key)
@@ -248,7 +248,7 @@ class TestS3LFS(unittest.TestCase):
         # Cleanup should remove it from S3
         self.versioner.cleanup_s3(force=True)
 
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
 
         # Ensure object was deleted (no contents in the response)
@@ -272,7 +272,7 @@ class TestS3LFS(unittest.TestCase):
             # Cleanup should remove it from S3
             self.versioner.cleanup_s3(force=True)
 
-            s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+            s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
             response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
 
             # Ensure object was deleted (no contents in the response)
@@ -292,7 +292,8 @@ class TestS3LFS(unittest.TestCase):
 
         for file in files:
             file_hash = self.versioner.hash_file(file)
-            s3_key = f"s3lfs/assets/{file_hash}/{file}.gz"
+            # Stem prefix matches whichever form adaptive compression chose.
+            s3_key = f"s3lfs/assets/{file_hash}/{file}"
             response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
             self.assertTrue("Contents" in response and len(response["Contents"]) == 1)
 
@@ -353,7 +354,7 @@ class TestS3LFS(unittest.TestCase):
         self.versioner.upload(self.test_file)
         file_hash = self.versioner.hash_file(self.test_file)
 
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
         # Confirm object is .gz by key
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertTrue("Contents" in response and len(response["Contents"]) == 1)
@@ -374,7 +375,7 @@ class TestS3LFS(unittest.TestCase):
         """
         self.versioner.upload(self.test_file)
         file_hash = self.versioner.hash_file(self.test_file)
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
 
         # Re-upload
         self.versioner.upload(self.test_file)
@@ -410,8 +411,10 @@ class TestS3LFS(unittest.TestCase):
         file_hash_3 = self.versioner.hash_file(third_file)
         file_hash_4 = self.versioner.hash_file(fourth_file)
 
-        s3_key_3 = f"s3lfs/assets/{file_hash_3}/{third_file}.gz"
-        s3_key_4 = f"s3lfs/assets/{file_hash_4}/{fourth_file}.gz"
+        # Adaptive compression stores small text raw (gzip would inflate
+        # it), so assert on the stem: either <stem> or <stem>.gz must exist.
+        s3_key_3 = f"s3lfs/assets/{file_hash_3}/{third_file}"
+        s3_key_4 = f"s3lfs/assets/{file_hash_4}/{fourth_file}"
 
         resp3 = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key_3)
         resp4 = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key_4)
@@ -431,7 +434,7 @@ class TestS3LFS(unittest.TestCase):
 
     def test_remove_file_deletes_from_s3(self):
         file_hash = self.versioner.hash_file(self.test_file)
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
         self.versioner.remove_file(self.test_file, keep_in_s3=False)
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertFalse("Contents" in response)
@@ -454,7 +457,7 @@ class TestS3LFS(unittest.TestCase):
             f.write("Nested content")
         self.versioner.upload(file_path)
         file_hash = self.versioner.hash_file(file_path)
-        s3_key = f"s3lfs/assets/{file_hash}/{file_path}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{file_path}"
         self.versioner.remove_subtree("test_dir", keep_in_s3=False)
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertFalse("Contents" in response)
@@ -466,7 +469,7 @@ class TestS3LFS(unittest.TestCase):
         self.versioner.upload(self.test_file)
         manifest = self.versioner.manifest
         file_hash = self.versioner.hash_file(self.test_file)
-        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}.gz"
+        s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
 
         # Check that the manifest correctly tracks the file path
         self.assertIn(self.test_file, manifest["files"])
@@ -1022,7 +1025,7 @@ class TestS3LFS(unittest.TestCase):
             # Verify files exist in S3
             for fname in files_created:
                 file_hash = self.versioner.hash_file(fname)
-                s3_key = f"s3lfs/assets/{file_hash}/{fname}.gz"
+                s3_key = f"s3lfs/assets/{file_hash}/{fname}"
                 response = self.s3.list_objects_v2(
                     Bucket=self.bucket_name, Prefix=s3_key
                 )
@@ -2233,7 +2236,7 @@ class TestS3LFS(unittest.TestCase):
         # Verify file exists in S3
         file_hash = versioner_no_encrypt.hash_file(self.test_file)
         s3_key = (
-            f"{versioner_no_encrypt.repo_prefix}/assets/{file_hash}/{self.test_file}.gz"
+            f"{versioner_no_encrypt.repo_prefix}/assets/{file_hash}/{self.test_file}"
         )
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertTrue("Contents" in response)
@@ -2717,13 +2720,17 @@ class TestS3LFS(unittest.TestCase):
         # Upload file first
         self.versioner.upload(self.test_file)
 
-        # Calculate actual MD5 of compressed file
-        compressed = self.versioner.compress_file(self.test_file)
-        try:
-            with open(compressed, "rb") as f:
-                actual_md5 = hashlib.md5(f.read()).hexdigest()
-        finally:
-            compressed.unlink()
+        # Calculate the MD5 of the form upload will actually stage:
+        # adaptive compression stores this tiny file raw.
+        if self.versioner._should_compress(self.test_file):
+            compressed = self.versioner.compress_file(self.test_file)
+            try:
+                staged_bytes = compressed.read_bytes()
+            finally:
+                compressed.unlink()
+        else:
+            staged_bytes = Path(self.test_file).read_bytes()
+        actual_md5 = hashlib.md5(staged_bytes).hexdigest()
 
         # Mock head_object to return same ETag
         with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:

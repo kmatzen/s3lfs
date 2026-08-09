@@ -12,6 +12,7 @@ A Python-based version control system for large assets using Amazon S3 and S3-co
 - **Accident-proof tracking**: `s3lfs track` gitignores tracked paths and removes them from the git index, so large files can't sneak into git history
 - **Sparse checkouts**: applies your `git sparse-checkout` rules to tracked files, so a working copy only materializes its slice of a large repository
 - **Sharded manifest**: `s3lfs shard` splits the manifest by directory and reads only the shards you touch -- opening a 200,000-entry manifest drops from 1.1s to 20ms ([details](#performance))
+- **Adaptive compression**: files that don't compress (images, video, model weights) are stored raw -- no gzip time wasted, and the stored object is directly usable by any S3 tool
 - **Cheap branch switches**: `s3lfs sync` diffs the manifest between revisions and transfers only what changed
 - **Conflict-free manifests**: a git merge driver unions concurrent changes to the manifest and `.gitignore`
 - **One-command setup**: `s3lfs clone` clones, installs hooks, and downloads tracked files
@@ -538,6 +539,7 @@ When `.s3lfsconfig` exists, its values are used as defaults for all commands. CL
 - `use_acceleration`: Enable S3 Transfer Acceleration (default: `false`)
 - `endpoint_url`: S3-compatible endpoint for the whole team (default: none, i.e. AWS)
 - `workers`: Parallel worker count (default: auto-detected from CPU count)
+- `compression`: `auto` (sample each file; store incompressible ones raw), `always`, or `never`
 
 Unrecognised keys are reported rather than ignored -- a misspelled setting that changes where your data goes should not fail silently.
 
@@ -591,6 +593,43 @@ Files with identical content (same hash) are stored only once in S3, regardless 
 S3LFS supports both SHA-256 (default) and MD5 hashing:
 - SHA-256: More secure, used for file integrity
 - MD5: Available for compatibility with legacy systems
+
+## Storage Format
+
+The bucket layout is a documented contract, not an implementation detail:
+
+```
+<repo_prefix>/assets/<sha256-of-content>/<path-in-repo>[.gz][.chunkN]
+```
+
+- **Incompressible files are stored raw** -- exact original bytes under their
+  natural name. A JPEG in the bucket is just a JPEG; fetch it with any S3
+  tool and use it directly.
+- Compressible files carry a `.gz` suffix and are standard gzip.
+- Files larger than the chunk size are split into `.chunk0..N` pieces;
+  concatenating them in order yields the (possibly gzipped) whole.
+
+Whether a file compresses is decided by sampling its content at upload
+(`compression: auto`). Set `compression: never` in `.s3lfsconfig` to store
+everything raw, or `always` for the pre-0.6 behaviour.
+
+### Getting your data out without s3lfs
+
+Choosing a versioning tool should not mean your data is hostage to it. The
+manifest is plain YAML mapping each path to its content hash, and the key
+scheme above is all you need to restore files with generic tools:
+
+```sh
+# for each <path>: <hash> in .s3_manifest.yaml (or .s3lfs_manifest/*.yaml):
+aws s3 cp "s3://BUCKET/PREFIX/assets/$hash/$path" "$path" \
+  || { aws s3 cp "s3://BUCKET/PREFIX/assets/$hash/$path.gz" - | gunzip > "$path"; }
+sha256sum "$path"   # must equal $hash
+```
+
+This recovery path is enforced by a test
+(`TestEscapeHatch::test_restore_with_plain_boto3_and_the_manifest_only`)
+that restores files using nothing but an S3 client and the manifest. If a
+future change breaks the recipe, the build fails.
 
 ## Performance
 

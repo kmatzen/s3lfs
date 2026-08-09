@@ -38,7 +38,10 @@ class TestDiscoverChunksForFile(unittest.TestCase):
         with patch("boto3.client") as mock_boto3:
             mock_client = Mock()
             mock_boto3.return_value = mock_client
-            mock_client.list_objects_v2.return_value = {}
+            key = "test-prefix/assets/abc123/data/file.bin.gz"
+            mock_client.list_objects_v2.return_value = {
+                "Contents": [{"Key": key, "Size": 10}]
+            }
 
             s3lfs = S3LFS(bucket_name="test-bucket")
             chunks = s3lfs._discover_chunks_for_file("data/file.bin", "abc123")
@@ -47,6 +50,35 @@ class TestDiscoverChunksForFile(unittest.TestCase):
             self.assertFalse(chunks[0]["is_chunked"])
             self.assertEqual(chunks[0]["chunk_index"], 0)
             self.assertEqual(chunks[0]["num_chunks"], 1)
+            self.assertTrue(chunks[0]["compressed"])
+
+    def test_single_raw_file(self):
+        """An uncompressed object is discovered and flagged as raw."""
+        with patch("boto3.client") as mock_boto3:
+            mock_client = Mock()
+            mock_boto3.return_value = mock_client
+            key = "test-prefix/assets/abc123/data/file.bin"
+            mock_client.list_objects_v2.return_value = {
+                "Contents": [{"Key": key, "Size": 10}]
+            }
+
+            s3lfs = S3LFS(bucket_name="test-bucket")
+            chunks = s3lfs._discover_chunks_for_file("data/file.bin", "abc123")
+
+            self.assertEqual(len(chunks), 1)
+            self.assertEqual(chunks[0]["s3_key"], key)
+            self.assertFalse(chunks[0]["compressed"])
+
+    def test_missing_object_is_loud(self):
+        """No stored object must raise, not fabricate a key that 404s."""
+        with patch("boto3.client") as mock_boto3:
+            mock_client = Mock()
+            mock_boto3.return_value = mock_client
+            mock_client.list_objects_v2.return_value = {}
+
+            s3lfs = S3LFS(bucket_name="test-bucket")
+            with self.assertRaises(RuntimeError):
+                s3lfs._discover_chunks_for_file("data/file.bin", "abc123")
 
     def test_chunked_file(self):
         """A file stored as multiple chunks produces one entry per chunk."""
@@ -263,14 +295,17 @@ class TestParallelDownloadChunked(unittest.TestCase):
             mock_client = Mock()
             mock_boto3.return_value = mock_client
 
-            mock_client.list_objects_v2.return_value = {}
-            mock_client.head_object.return_value = {"ContentLength": 100}
-
             content = b"test content"
             compressed = gzip.compress(content)
             # Finalization verifies the reassembled file against the manifest
             # hash, so the fixture must carry the real digest.
             digest = hashlib.sha256(content).hexdigest()
+
+            # Discovery lists the stem; serve each file's .gz object.
+            def fake_list(Bucket=None, Prefix=None, **kw):
+                return {"Contents": [{"Key": Prefix + ".gz", "Size": 100}]}
+
+            mock_client.list_objects_v2.side_effect = fake_list
 
             def fake_download(Bucket, Key, Fileobj):
                 Fileobj.write(compressed)

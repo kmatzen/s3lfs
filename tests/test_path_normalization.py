@@ -91,7 +91,7 @@ class TestRemoveFilePathNormalization(unittest.TestCase):
 
         s3lfs.remove_file("./data/asset.bin", keep_in_s3=False)
 
-        self.assertEqual(deleted, ["test-prefix/assets/abc123/data/asset.bin.gz"])
+        self.assertEqual(deleted, ["test-prefix/assets/abc123/data/asset.bin"])
 
 
 class TestConstructionOffMainThread(unittest.TestCase):

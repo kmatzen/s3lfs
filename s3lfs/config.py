@@ -23,6 +23,7 @@ DEFAULTS = {
     "use_acceleration": False,
     "endpoint_url": None,
     "workers": None,
+    "compression": None,
 }
 
 
