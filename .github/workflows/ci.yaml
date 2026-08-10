@@ -33,14 +33,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the ceiling of the supported range on Linux, plus a
-        # macOS run: s3lfs shells out to git constantly and writes /bin/sh
-        # hooks, so a second platform is worth more than a third minor
-        # version.
+        # The floor and the ceiling of the supported range on Linux, plus
+        # macOS and Windows runs: s3lfs shells out to git constantly and
+        # writes sh hooks, so more platforms are worth more than more
+        # minor versions. Windows exercises the drive-letter and
+        # path-separator edge cases POSIX cannot.
         os: [ubuntu-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         include:
           - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
             python-version: "3.13"
 
     steps:
