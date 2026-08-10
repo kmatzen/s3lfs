@@ -99,12 +99,13 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
 
         from s3lfs.path_resolver import PathResolver
 
-        # Mock git root and current directory
-        git_root = Path("/test/git/root")
+        # Mock git root and current directory; anchored so it is absolute
+        # on Windows too, where "/test/..." has no drive.
+        git_root = Path(Path.cwd().anchor, "test", "git", "root")
         path_resolver = PathResolver(git_root)
 
         # Test 1: When in a subdirectory, relative path should be resolved from CWD
-        cwd = Path("/test/git/root/subdir")
+        cwd = git_root / "subdir"
 
         # "file.txt" from subdir should resolve to "subdir/file.txt"
         result = path_resolver.from_cli_input("file.txt", cwd=cwd)
@@ -135,10 +136,11 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
 
         from s3lfs.path_resolver import PathResolver
 
-        # Mock git root and current directory (like being in GoProProcessed subdirectory)
-        git_root = Path("/test/git/root")
+        # Mock git root and current directory (like being in GoProProcessed
+        # subdirectory); anchored so it is absolute on Windows too.
+        git_root = Path(Path.cwd().anchor, "test", "git", "root")
         path_resolver = PathResolver(git_root)
-        cwd = Path("/test/git/root/GoProProcessed")
+        cwd = git_root / "GoProProcessed"
 
         # When in GoProProcessed and user types "capture157",
         # it should resolve to "GoProProcessed/capture157"
