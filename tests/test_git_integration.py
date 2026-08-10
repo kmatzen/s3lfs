@@ -1620,3 +1620,64 @@ class TestDoctor(GitRepoTestCase):
         result = self.runner.invoke(cli, ["doctor"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("s3lfs init", result.output)
+
+    def test_write_probe_sends_same_sse_header_as_real_uploads(self):
+        """A probe with different headers than track blesses setups where
+        every actual upload fails."""
+        from unittest.mock import MagicMock, patch
+
+        from s3lfs.core import S3LFS
+
+        client = MagicMock()
+        with patch.object(S3LFS, "_get_s3_client", return_value=client):
+            self.runner.invoke(cli, ["doctor"])
+        self.assertEqual(
+            client.put_object.call_args.kwargs.get("ServerSideEncryption"),
+            "AES256",
+        )
+
+    def test_write_probe_honours_encryption_false_from_config(self):
+        from unittest.mock import MagicMock, patch
+
+        from s3lfs.core import S3LFS
+
+        Path(".s3lfsconfig").write_text("encryption: false\n")
+        client = MagicMock()
+        with patch.object(S3LFS, "_get_s3_client", return_value=client):
+            self.runner.invoke(cli, ["doctor"])
+        self.assertNotIn("ServerSideEncryption", client.put_object.call_args.kwargs)
+
+    def test_sse_rejection_suggests_disabling_encryption(self):
+        """MinIO without KMS answers NotImplemented; the fix is a config
+        line, not an IAM change, and doctor should say which."""
+        from unittest.mock import MagicMock, patch
+
+        from botocore.exceptions import ClientError
+
+        from s3lfs.core import S3LFS
+
+        client = MagicMock()
+        client.put_object.side_effect = ClientError(
+            {"Error": {"Code": "NotImplemented", "Message": "SSE"}},
+            "PutObject",
+        )
+        with patch.object(S3LFS, "_get_s3_client", return_value=client):
+            result = self.runner.invoke(cli, ["doctor"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn('"encryption: false"', result.output)
+
+    def test_denied_write_still_points_at_iam(self):
+        from unittest.mock import MagicMock, patch
+
+        from botocore.exceptions import ClientError
+
+        from s3lfs.core import S3LFS
+
+        client = MagicMock()
+        client.put_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "PutObject"
+        )
+        with patch.object(S3LFS, "_get_s3_client", return_value=client):
+            result = self.runner.invoke(cli, ["doctor"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("s3:PutObject", result.output)
