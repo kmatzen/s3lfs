@@ -2489,7 +2489,7 @@ def doctor(no_sign_request, endpoint_url):
             return True
         except Exception as e:
             code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
-            fail(f"S3 {name}: {code or e}", fix)
+            fail(f"S3 {name}: {code or e}", fix(code) if callable(fix) else fix)
             return False
 
     s3_probe(
@@ -2499,12 +2499,22 @@ def doctor(no_sign_request, endpoint_url):
         ),
         "check credentials and s3:ListBucket permission",
     )
+    # The probe must send the same headers a real upload sends, or it
+    # blesses setups where every actual track fails: MinIO without KMS
+    # accepts a bare put_object but rejects the SSE header with
+    # NotImplemented.
+    sse = {"ServerSideEncryption": "AES256"} if s3lfs.encryption else {}
     wrote = s3_probe(
         "write",
         lambda: client.put_object(
-            Bucket=s3lfs.bucket_name, Key=probe_key, Body=b"doctor"
+            Bucket=s3lfs.bucket_name, Key=probe_key, Body=b"doctor", **sse
         ),
-        "uploads need s3:PutObject",
+        lambda code: (
+            "this endpoint rejects the AES256 SSE header s3lfs sends on "
+            'every upload; set "encryption: false" in .s3lfsconfig'
+            if code == "NotImplemented"
+            else "uploads need s3:PutObject"
+        ),
     )
     if wrote:
         s3_probe(
