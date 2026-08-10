@@ -10,6 +10,10 @@
   with `NotImplemented` -- the Python API had an `encryption=False` escape
   hatch, the CLI had none. Found when the new benchmark CI job ran the CLI
   against MinIO for the first time.
+- **`s3lfs doctor`'s write probe sends the same SSE header real uploads
+  send.** A bare probe blessed endpoints where every actual `track` failed;
+  now the probe fails the same way uploads would, and when the endpoint
+  rejects the SSE header it points at `encryption: false` instead of IAM.
 
 ### Added
 
