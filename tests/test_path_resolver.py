@@ -87,9 +87,25 @@ class TestPathResolver(unittest.TestCase):
 
     def test_to_filesystem_path_rejects_absolute(self):
         """Test that absolute paths are rejected as manifest keys."""
+        # Anchored so it is genuinely absolute on every platform; a bare
+        # "/absolute/path" has no drive on Windows.
+        absolute = str(Path(Path.cwd().anchor, "absolute", "path"))
         with self.assertRaises(ValueError) as ctx:
-            self.resolver.to_filesystem_path("/absolute/path")
+            self.resolver.to_filesystem_path(absolute)
         self.assertIn("must be relative", str(ctx.exception))
+
+    def test_to_filesystem_path_rejects_rooted_driveless_key(self):
+        """ "/foo" is not absolute on Windows since Python 3.13, but pathlib
+        join still replaces the base with it, escaping the repository. The
+        containment check must catch what isabs() misses."""
+        with self.assertRaises(ValueError):
+            self.resolver.to_filesystem_path("/outside/repo")
+
+    def test_to_filesystem_path_rejects_embedded_escape(self):
+        """A leading-prefix check misses "sub/../../outside"."""
+        with self.assertRaises(ValueError) as ctx:
+            self.resolver.to_filesystem_path("subdir/../../outside")
+        self.assertIn("cannot escape", str(ctx.exception))
 
     def test_to_filesystem_path_rejects_escape(self):
         """Test that paths escaping git root are rejected."""
@@ -265,7 +281,9 @@ class TestPathResolver(unittest.TestCase):
         """Test string representation."""
         repr_str = repr(self.resolver)
         self.assertIn("PathResolver", repr_str)
-        self.assertIn(str(self.git_root), repr_str)
+        # The resolver stores the resolved root (Windows expands 8.3 short
+        # names, macOS expands /tmp), so compare against the resolved form.
+        self.assertIn(str(self.git_root.resolve()), repr_str)
 
 
 class TestPathResolverRealWorldScenarios(unittest.TestCase):

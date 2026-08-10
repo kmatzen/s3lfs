@@ -96,8 +96,19 @@ class PathResolver:
         if manifest_key.startswith(".."):
             raise ValueError(f"Manifest key cannot escape git root: {manifest_key}")
 
-        # Convert POSIX path to platform-specific path and make absolute
-        return (self.git_root / manifest_key).resolve()
+        # Convert POSIX path to platform-specific path and make absolute.
+        # The containment check below is load-bearing, not belt-and-braces:
+        # manifest keys come from manifests, which arrive with a clone. On
+        # Windows a rooted key like "/foo" passes isabs() (False since
+        # Python 3.13) and then pathlib's join REPLACES the base, yielding
+        # C:/foo -- outside the repository. Embedded ".." segments get past
+        # the prefix check on every platform.
+        resolved = (self.git_root / manifest_key).resolve()
+        try:
+            resolved.relative_to(self.git_root)
+        except ValueError:
+            raise ValueError(f"Manifest key cannot escape git root: {manifest_key}")
+        return resolved
 
     def from_cli_input(
         self, cli_path: str, cwd: Optional[Path] = None, allow_absolute: bool = False
@@ -129,10 +140,10 @@ class PathResolver:
             >>> resolver.from_cli_input("subdir/file.txt", Path("/repo"))
             'subdir/file.txt'
         """
-        if cwd is None:
-            cwd = Path.cwd()
-        else:
-            cwd = Path(cwd).resolve()
+        # Resolve the default too: on Windows, Path.cwd() can be an 8.3
+        # short path (RUNNER~1) that never string-matches the resolved
+        # git_root, silently disabling subdirectory prefixing.
+        cwd = (Path(cwd) if cwd is not None else Path.cwd()).resolve()
 
         cli_path_obj = Path(cli_path)
 
@@ -221,10 +232,10 @@ class PathResolver:
         :param cwd: Current working directory (defaults to Path.cwd())
         :return: CWD relative to git root, or Path(".") if outside repo
         """
-        if cwd is None:
-            cwd = Path.cwd()
-        else:
-            cwd = Path(cwd).resolve()
+        # Resolved for the same reason as in from_cli_input: an unresolved
+        # default cwd (Windows short paths, macOS /tmp symlinks) falls into
+        # the except branch and reports git root for every subdirectory.
+        cwd = (Path(cwd) if cwd is not None else Path.cwd()).resolve()
 
         try:
             return cwd.relative_to(self.git_root)

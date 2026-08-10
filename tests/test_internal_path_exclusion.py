@@ -58,7 +58,7 @@ class TestInternalPathExclusion(unittest.TestCase):
             pass
 
         found = s3lfs._resolve_filesystem_paths(str(self.root))
-        names = sorted(str(Path(p).relative_to(self.root)) for p in found)
+        names = sorted(Path(p).relative_to(self.root).as_posix() for p in found)
 
         self.assertEqual(names, ["data/asset.bin"])
 

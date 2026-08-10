@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Manifest keys can no longer escape the repository root on Windows.**
+  `to_filesystem_path` trusted `os.path.isabs`, but since Python 3.13 a
+  rooted key like `/foo` is not "absolute" on Windows -- and pathlib's
+  join replaces the base with it, resolving to `C:/foo`, outside the
+  repo. Keys with embedded `..` segments got past the prefix check on
+  every platform. Resolved paths are now verified to stay inside the
+  repository.
+- **Subdirectory context works from Windows 8.3 short paths.**
+  `PathResolver` resolved an explicitly passed working directory but not
+  the `Path.cwd()` default, so a shell sitting in a short path
+  (`C:\Users\RUNNER~1\...`) never matched the resolved git root and
+  subdirectory prefixing silently turned off.
+
+### Added
+
+- **Windows is now tested in CI** (`windows-latest`, Python 3.13). The
+  remaining test-suite failures from #138 were POSIX assumptions in the
+  tests themselves -- hardcoded `/bin/sh`, `:` as the PATH separator,
+  exec-bit assertions, driveless absolute fixtures -- and are fixed or
+  skipped where the concept does not exist on Windows.
+
 ## [0.6.2] - 2026-08-09
 
 ### Fixed

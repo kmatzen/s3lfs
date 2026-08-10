@@ -8,6 +8,11 @@ from pathlib import Path
 
 from s3lfs.cli import HOOK_SCRIPTS, _install_hook, _uninstall_hook
 
+# Hooks are shell scripts, so they run under sh everywhere -- on Windows
+# that is Git Bash's sh.exe, the same interpreter git itself uses for
+# hooks there. /bin/sh only exists on POSIX.
+SH = shutil.which("sh") or "/bin/sh"
+
 
 class TestHookExitStatus(unittest.TestCase):
     """The blocking hooks must abort their git operation when s3lfs fails.
@@ -44,14 +49,14 @@ class TestHookExitStatus(unittest.TestCase):
         script.write_text(f"#!/bin/sh\necho 'fake s3lfs ran'\nexit {exit_code}\n")
         script.chmod(0o755)
         env = dict(os.environ)
-        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         return env
 
     def _run_hook(self, hook_name, exit_code, args=(), stdin=""):
         env = self._fake_s3lfs(exit_code)
         hook_path = _install_hook(self.hooks_dir, hook_name, HOOK_SCRIPTS[hook_name])
         return subprocess.run(
-            ["/bin/sh", str(hook_path), *args],
+            [SH, str(hook_path), *args],
             capture_output=True,
             text=True,
             env=env,
@@ -126,6 +131,10 @@ class TestHookInstallAtomicity(unittest.TestCase):
         self.assertIn("user hook", content)
         self.assertIn("s3lfs", content)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows has no POSIX exec bit; git-for-Windows runs hooks via sh",
+    )
     def test_installed_hook_is_executable(self):
         _install_hook(self.hooks_dir, "pre-push", HOOK_SCRIPTS["pre-push"])
         mode = (self.hooks_dir / "pre-push").stat().st_mode

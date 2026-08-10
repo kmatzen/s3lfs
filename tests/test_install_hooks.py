@@ -41,6 +41,10 @@ class TestInstallHookHelper(unittest.TestCase):
         self.assertTrue(content.startswith("#!/bin/sh\n"))
         self.assertIn("echo hello", content)
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "Windows has no POSIX exec bit; git-for-Windows runs hooks via sh",
+    )
     def test_new_hook_is_executable(self):
         """Newly created hook file has executable permission."""
         block = f"{S3LFS_HOOK_START}\necho hello\n{S3LFS_HOOK_END}"
@@ -99,7 +103,9 @@ class TestInstallHookHelper(unittest.TestCase):
         )
         # And it really runs
         result = subprocess.run(
-            ["/bin/sh", str(hook_path)], capture_output=True, text=True
+            [shutil.which("sh") or "/bin/sh", str(hook_path)],
+            capture_output=True,
+            text=True,
         )
         self.assertIn("s3lfs", result.stdout)
 
@@ -209,9 +215,15 @@ class TestGetHooksDir(unittest.TestCase):
         custom_hooks = git_root / "custom-hooks"
         custom_hooks.mkdir()
 
-        # Initialize a real git repo so git config works
-        os.system("git init >/dev/null 2>&1")
-        os.system(f"git config core.hooksPath {custom_hooks}")
+        # Initialize a real git repo so git config works. subprocess, not
+        # os.system: ">/dev/null" hands cmd.exe a redirect to a path that
+        # does not exist on Windows, so git init never ran there.
+        subprocess.run(["git", "init"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "core.hooksPath", str(custom_hooks)],
+            capture_output=True,
+            check=True,
+        )
 
         hooks_dir = _get_hooks_dir(git_root)
         self.assertEqual(hooks_dir, custom_hooks)
