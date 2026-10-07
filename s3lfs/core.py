@@ -788,10 +788,12 @@ class S3LFS:
             )
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
-            if code == "InvalidArgument":
+            if code in ("InvalidArgument", "RestoreAlreadyInProgress"):
                 # A restore is already in progress, either ours or a
-                # concurrent caller's; S3 says so with an explanatory
-                # message and a 409-ish InvalidArgument.
+                # concurrent caller's. S3 reports this as InvalidArgument
+                # on some tiers and as RestoreAlreadyInProgress on
+                # Intelligent-Tiering archive tiers; either way the object
+                # is already queued, so poll for readability as normal.
                 print(f"Restore already in progress: {key}")
                 return True
             raise
