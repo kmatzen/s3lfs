@@ -200,6 +200,36 @@ class TestRestoreRequest(_RepoTestCase):
         self.assertEqual(failed, 1)
         client.restore_object.assert_called_once()
 
+    def test_restore_already_in_progress_error_code_is_tolerated(self):
+        """Intelligent-Tiering reports a concurrent restore with its own
+        code, RestoreAlreadyInProgress, not InvalidArgument. It must be
+        treated like any in-flight restore: no request error, and the
+        object enters the readability poll loop instead of being dropped
+        at request time."""
+        with open(self.manifest_path, "w") as f:
+            yaml.safe_dump(
+                {
+                    "bucket_name": "test-bucket",
+                    "repo_prefix": "test-prefix",
+                    "files": {self.key: self.digest},
+                },
+                f,
+            )
+        client = self._archived_client(
+            {self.base_key: 1024},
+            restore_side_effect=_client_error("RestoreAlreadyInProgress"),
+        )
+        s3lfs = self._s3lfs(client)
+
+        failed = s3lfs.restore({self.key: self.digest}, timeout=2, interval=0)
+
+        self.assertEqual(failed, 1)  # still archived when the timeout hits
+        client.restore_object.assert_called_once()
+        # Two GETs happen before the request (probe + re-probe inside the
+        # request); more than two proves the poll loop ran afterwards,
+        # which is what the pre-fix code did not do.
+        self.assertGreaterEqual(client.get_object.call_count, 3)
+
     def test_restore_restores_every_chunk(self):
         """A chunked object needs one RestoreObject call per chunk."""
         with open(self.manifest_path, "w") as f:
