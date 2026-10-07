@@ -108,15 +108,22 @@ class TestChunkAtomicity(unittest.TestCase):
         s3lfs, _ = self._s3lfs()
         compressed = s3lfs.compress_file(Path("big.bin"))
 
+        # A pre-existing good copy must survive a failed finalize.
+        good = Path("big.bin")
+        good.write_bytes(self.payload)
+
         with self.assertRaises(RuntimeError) as ctx:
             s3lfs._finalize_file(
                 "big.bin", [compressed], False, expected_hash="not_the_right_hash"
             )
 
         self.assertIn("Checksum mismatch", str(ctx.exception))
-        self.assertFalse(
-            Path("big.bin").exists(), "corrupt output should be removed, not left"
-        )
+        # Atomic finalization: the bad content is staged in a temp file and
+        # never swapped in, so the pre-existing destination is untouched
+        # and no staging temp is left behind.
+        self.assertEqual(good.read_bytes(), self.payload)
+        leftovers = list(Path(".").glob("*.s3lfs-tmp"))
+        self.assertEqual(leftovers, [], "staging temp file was left behind")
 
     def test_finalize_accepts_matching_checksum(self):
         s3lfs, _ = self._s3lfs()
