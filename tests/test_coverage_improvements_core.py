@@ -698,9 +698,14 @@ class TestCoreCoverageImprovements(unittest.TestCase):
                     silence=True,
                 )
         filesystem_path = s3lfs.path_resolver.to_filesystem_path(manifest_key)
-        # Removal of the mismatched output failed (patched), so it remains.
-        self.assertTrue(filesystem_path.exists())
-        filesystem_path.unlink()
+        # Atomic finalization: the destination is only written by os.replace
+        # after the hash check passes, so a mismatch never touches it. A
+        # staging file may remain when its cleanup remove() fails (patched).
+        self.assertFalse(
+            filesystem_path.exists(), "destination must stay untouched on mismatch"
+        )
+        for leftover in filesystem_path.parent.glob("*.s3lfs-tmp"):
+            leftover.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # lines 2035, 2038-2040: parallel_download_chunked shutdown/discovery

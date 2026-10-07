@@ -446,6 +446,88 @@ def checkout(
         raise click.Abort()
 
 
+@cli.command(name="restore")
+@click.argument("paths", required=False, nargs=-1)
+@click.option("--no-sign-request", is_flag=True, help="Use unsigned S3 requests")
+@click.option(
+    "--use-acceleration", is_flag=True, help="Enable S3 Transfer Acceleration"
+)
+@click.option(
+    "--endpoint-url",
+    default=None,
+    help="Custom S3 endpoint URL for S3-compatible storage",
+)
+@click.option(
+    "--timeout",
+    type=int,
+    default=None,
+    help=(
+        "Seconds to keep waiting for restores to finish. Default: wait "
+        "indefinitely (Deep Archive restores take roughly 12 hours)."
+    ),
+)
+@click.option(
+    "--interval",
+    type=int,
+    default=20,
+    help="Seconds between readability polls (default: 20)",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Number of parallel workers (default: auto-detected from CPU count)",
+)
+def restore(
+    paths,
+    no_sign_request,
+    use_acceleration,
+    endpoint_url,
+    timeout,
+    interval,
+    workers,
+):
+    """Restore stored objects that have aged into S3 archive tiers.
+
+    S3 Intelligent-Tiering moves cold objects into Archive Access and
+    Deep Archive Access, where reads fail with InvalidObjectState until a
+    restore completes. This command takes the same paths and globs as
+    checkout, probes each stored object (every chunk of a chunked file),
+    requests a Standard-tier restore for the ones that need it, and polls
+    until everything accepts a read. Exits non-zero if any object is
+    missing or the timeout is hit.
+    """
+    if not paths:
+        click.echo("Error: Must provide at least one path or glob")
+        raise click.Abort()
+
+    # Resolve every path argument to a manifest key first, so a typo fails
+    # without building an S3 client.
+    git_root, manifest_path, path_resolver = _setup_s3lfs_command()
+    keys = [path_resolver.from_cli_input(cli_path, cwd=Path.cwd()) for cli_path in paths]
+
+    s3lfs = _make_s3lfs(
+        git_root,
+        manifest_path,
+        no_sign_request=no_sign_request,
+        use_acceleration=use_acceleration,
+        endpoint_url=endpoint_url,
+        workers=workers,
+    )
+
+    files = {}
+    for key in keys:
+        matched = s3lfs._resolve_manifest_paths(key)
+        if not matched:
+            click.echo(f"Error: No tracked files match '{key}'.")
+            raise SystemExit(1)
+        files.update(matched)
+
+    failed = s3lfs.restore(files, timeout=timeout, interval=interval)
+    if failed:
+        raise SystemExit(1)
+
+
 def _recoverable(s3lfs, on_disk):
     """Which of these paths hold content that can be fetched back from S3.
 
@@ -2940,6 +3022,7 @@ def _warn_if_commit_will_look_empty(git_root, staged_paths):
 cli.add_command(init)
 cli.add_command(track)
 cli.add_command(checkout)
+cli.add_command(restore)
 cli.add_command(ls)
 cli.add_command(remove)
 cli.add_command(cleanup)

@@ -735,6 +735,187 @@ class S3LFS:
             client.delete_object(Bucket=self.bucket_name, Key=key)
             print(f"File removed from S3: s3://{self.bucket_name}/{key}")
 
+    # Probe outcome codes for _probe_object_readable.
+    RESTORE_STATUS_READABLE = "readable"
+    RESTORE_STATUS_ARCHIVED = "archived"
+    RESTORE_STATUS_MISSING = "missing"
+
+    def _probe_object_readable(self, key):
+        """Can this object serve a ranged GET right now?
+
+        Returns one of the RESTORE_STATUS_* codes. A ranged read of one
+        byte is used because it answers the question -- can the object be
+        read -- without transferring it, and S3 refuses it with
+        InvalidObjectState while the object sits in an archive tier of
+        S3 Intelligent-Tiering.
+        """
+        from botocore.exceptions import ClientError
+
+        client = self._get_s3_client()
+        try:
+            client.get_object(
+                Bucket=self.bucket_name, Key=key, Range="bytes=0-0"
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "InvalidObjectState":
+                return self.RESTORE_STATUS_ARCHIVED
+            if code == "NoSuchKey":
+                return self.RESTORE_STATUS_MISSING
+            raise
+        return self.RESTORE_STATUS_READABLE
+
+    def _request_restore(self, key):
+        """Ask S3 to restore one archived object.
+
+        Returns True when the object is already readable, a restore is
+        in flight (whether ours or a concurrent one), or one was
+        requested. Raises for a missing object.
+        """
+        from botocore.exceptions import ClientError
+
+        client = self._get_s3_client()
+        status = self._probe_object_readable(key)
+        if status == self.RESTORE_STATUS_READABLE:
+            return True
+        if status == self.RESTORE_STATUS_MISSING:
+            raise RuntimeError(f"Object not found in S3: {key}")
+        try:
+            client.restore_object(
+                Bucket=self.bucket_name,
+                Key=key,
+                RestoreRequest={"GlacierJobParameters": {"Tier": "Standard"}},
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "InvalidArgument":
+                # A restore is already in progress, either ours or a
+                # concurrent caller's; S3 says so with an explanatory
+                # message and a 409-ish InvalidArgument.
+                print(f"Restore already in progress: {key}")
+                return True
+            raise
+        return True
+
+    def restore(self, files, timeout=None, interval=20):
+        """Restore stored objects that have aged into archive tiers.
+
+        :param files: dict of manifest_key -> file_hash, or iterable of
+            (manifest_key, file_hash) pairs, as in find_missing_assets.
+        :param timeout: seconds to keep polling before giving up; None
+            means wait indefinitely. Deep Archive restores take roughly
+            12 hours, so the default deliberately does not give up.
+        :param interval: seconds between polls.
+        :return: number of objects that were never readable (missing or
+            still archived when the timeout was hit), or a negative count
+            when interrupted.
+
+        Every chunk of a chunked object is probed and restored separately,
+        because each is its own S3 object with its own state.
+        """
+        items = list(files.items()) if hasattr(files, "items") else list(files)
+        if not items:
+            print("Nothing to restore.")
+            return 0
+
+        # Resolve every manifest entry to its stored object(s) first: a
+        # missing or incomplete object is a failure either way, and it is
+        # not one a restore can fix.
+        targets: list = []  # (manifest_key, key)
+        problems: list = []
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._discover_chunks_for_file, mk, fh): (mk, fh)
+                for mk, fh in items
+            }
+            for future in as_completed(futures):
+                mk, fh = futures[future]
+                try:
+                    chunks = future.result()
+                except Exception as e:
+                    print(f"Error resolving {mk}: {e}")
+                    problems.append(mk)
+                    continue
+                targets.extend((mk, c["s3_key"]) for c in chunks)
+
+        if not targets:
+            if problems:
+                print(f"Error: no stored objects found for {len(problems)} file(s).")
+            return len(problems)
+
+        print(f"Probing readability of {len(targets)} object(s)...")
+        missing = []
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(self._probe_object_readable, key): (mk, key) for mk, key in targets}
+            for future in as_completed(futures):
+                mk, key = futures[future]
+                try:
+                    status = future.result()
+                except Exception as e:
+                    print(f"Error probing {key}: {e}")
+                    status = self.RESTORE_STATUS_ARCHIVED  # re-probe in the loop
+                if status == self.RESTORE_STATUS_READABLE:
+                    print(f"Already readable: {mk}")
+                    targets.remove((mk, key))
+                elif status == self.RESTORE_STATUS_MISSING:
+                    print(f"Missing from S3: {mk} ({key})")
+                    missing.append(mk)
+                    targets.remove((mk, key))
+
+        if not targets:
+            if missing:
+                print(f"Error: {len(missing)} of {len(items)} file(s) have no readable object in S3.")
+            return len(missing)
+
+        print(f"Requesting restore of {len(targets)} archived object(s)...")
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {pool.submit(self._request_restore, key): (mk, key) for mk, key in targets}
+            for future in as_completed(futures):
+                mk, key = futures[future]
+                try:
+                    future.result()
+                    print(f"Restore requested: {mk}")
+                except Exception as e:
+                    print(f"Error restoring {key}: {e}")
+                    if mk not in missing:
+                        missing.append(mk)
+                    targets.remove((mk, key))
+
+        if not targets:
+            if missing:
+                print(f"Error: {len(missing)} file(s) could not be restored.")
+            return len(missing)
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            still = []
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = {pool.submit(self._probe_object_readable, key): (mk, key) for mk, key in targets}
+                for future in as_completed(futures):
+                    mk, key = futures[future]
+                    try:
+                        if future.result() != self.RESTORE_STATUS_READABLE:
+                            still.append((mk, key))
+                    except Exception as e:
+                        print(f"Error probing {key}: {e}")
+                        still.append((mk, key))  # transient; try again
+            if not still:
+                print(f"All {len(targets)} object(s) are readable again.")
+                return len(missing)
+            if deadline is not None and time.monotonic() >= deadline:
+                for mk, key in still:
+                    if mk not in missing:
+                        missing.append(mk)
+                print(
+                    f"Error: timeout after {timeout}s with {len(still)} object(s) "
+                    "still archived."
+                )
+                return len(missing)
+            print(
+                f"{len(still)} object(s) still archived; waiting {interval}s..."
+            )
+            time.sleep(interval)
+
     def _live_asset_keys(self):
         """Base keys reachable from the manifest. Caller must hold the lock."""
         return {
@@ -2833,36 +3014,53 @@ class S3LFS:
             compressed_path = chunk_paths[0]
 
         os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
+        # Finalize into a temp file in the destination directory and swap it
+        # in only after everything has succeeded. decompress_file opens its
+        # output path itself, so a failure mid-decompress left a truncated
+        # destination behind, destroying whatever was there before. With a
+        # staging file, any failure leaves a pre-existing destination
+        # untouched and no 0-byte file behind.
+        staging_path = filesystem_path.with_name(
+            f"{filesystem_path.name}.{uuid4().hex}.s3lfs-tmp"
+        )
         try:
-            if compressed:
-                self.decompress_file(compressed_path, filesystem_path)
-            else:
-                shutil.move(str(compressed_path), str(filesystem_path))
-        finally:
             try:
-                os.remove(compressed_path)
-            except OSError:
-                pass
-
-        if expected_hash is not None:
-            # stream_hash was computed while the bytes were written; a
-            # re-read of the finished file tells us nothing it does not.
-            actual_hash = (
-                stream_hash
-                if stream_hash is not None
-                else self.hash_file(filesystem_path)
-            )
-            if actual_hash != expected_hash:
-                # Remove the bad output rather than leave it looking valid.
+                if compressed:
+                    self.decompress_file(compressed_path, staging_path)
+                else:
+                    shutil.move(str(compressed_path), str(staging_path))
+            finally:
+                # The raw path moves the temp file into the staging name, so
+                # it is already gone by here.
                 try:
-                    os.remove(filesystem_path)
+                    os.remove(compressed_path)
                 except OSError:
                     pass
-                raise RuntimeError(
-                    f"Checksum mismatch for {manifest_key}: "
-                    f"expected {expected_hash}, got {actual_hash}. "
-                    f"The stored object is incomplete or corrupt."
+
+            if expected_hash is not None:
+                # stream_hash was computed while the bytes were written; a
+                # re-read of the finished file tells us nothing it does not.
+                actual_hash = (
+                    stream_hash
+                    if stream_hash is not None
+                    else self.hash_file(staging_path)
                 )
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        f"Checksum mismatch for {manifest_key}: "
+                        f"expected {expected_hash}, got {actual_hash}. "
+                        f"The stored object is incomplete or corrupt."
+                    )
+
+            os.replace(staging_path, filesystem_path)
+        except Exception:
+            # Remove the partial staging file; the destination, if there was
+            # one, was never touched.
+            try:
+                os.remove(staging_path)
+            except OSError:
+                pass
+            raise
 
     def parallel_download_chunked(self, file_items, silence=True):
         """Download files with block-level parallelism.
@@ -4031,8 +4229,8 @@ class S3LFS:
                 pass
 
         for idx, key in enumerate(keys):
+            target_path = self.temp_dir / f"{uuid4()}.part"
             try:
-                target_path = self.temp_dir / f"{uuid4()}.part"
                 target_paths.append(target_path)
                 file_size = key_sizes[key]
 
@@ -4078,7 +4276,15 @@ class S3LFS:
                             )
                             stream_digests.append(writer.hexdigest())
             except Exception as e:
+                # A failed transfer must abort the download, not be
+                # swallowed: the temp file it left is 0 bytes, and
+                # finalizing from it would destroy the destination.
+                if target_path in target_paths:
+                    target_paths.remove(target_path)
+                with contextlib.suppress(OSError):
+                    target_path.unlink()
                 print(f"Error downloading {key}: {e}")
+                raise
 
         if is_chunked and len(target_paths) > 1:
             compressed_path = self.merge_files(compressed_path, target_paths)
@@ -4089,17 +4295,30 @@ class S3LFS:
 
         if os.path.dirname(filesystem_path):
             os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
+        # Atomic finalization, same as _finalize_file: write to a temp
+        # file in the destination directory and swap it in only on
+        # success, so a mid-decompress failure cannot truncate a
+        # previously-good copy.
+        staging_path = filesystem_path.with_name(
+            f"{filesystem_path.name}.{uuid4().hex}.s3lfs-tmp"
+        )
         try:
-            if compressed:
-                with metrics.track("decompression", str(filesystem_path)):
-                    self.decompress_file(compressed_path, filesystem_path)
-            else:
-                shutil.move(str(compressed_path), str(filesystem_path))
-        except Exception as e:
-            print(f"Error finalizing {compressed_path} for key {keys}: {e}")
+            try:
+                if compressed:
+                    with metrics.track("decompression", str(filesystem_path)):
+                        self.decompress_file(compressed_path, staging_path)
+                else:
+                    shutil.move(str(compressed_path), str(staging_path))
+            finally:
+                # The raw path moves the temp file into the staging name,
+                # so it is already gone by here.
+                Path(compressed_path).unlink(missing_ok=True)
+
+            os.replace(staging_path, filesystem_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.remove(staging_path)
             raise
-        # The raw path moves the temp file into place, so it is already gone.
-        Path(compressed_path).unlink(missing_ok=True)
 
         # End-to-end verification, same as the parallel path: transport
         # checksums are off, so this is the check that the bytes on disk
@@ -4116,10 +4335,8 @@ class S3LFS:
         else:
             actual_hash = self.hash_file(filesystem_path)
         if actual_hash != expected_hash:
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(filesystem_path)
-            except OSError:
-                pass
             raise RuntimeError(
                 f"Checksum mismatch for {manifest_key}: expected "
                 f"{expected_hash}, got {actual_hash}. The stored object is "
