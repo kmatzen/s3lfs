@@ -50,7 +50,7 @@ def load_config(git_root):
     path = find_config(git_root)
     if path is None:
         return {}
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     unknown = sorted(set(data) - set(DEFAULTS))

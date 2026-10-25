@@ -28,6 +28,9 @@ CHECK_RULES_BATCH = 5000
 
 
 def _git(git_root, *args, **kwargs):
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        # git prints repo paths; the locale codec (cp1252 on Windows) can't decode non-ASCII.
+        kwargs.setdefault("encoding", "utf-8")
     return subprocess.run(
         ["git", *args],
         capture_output=True,
