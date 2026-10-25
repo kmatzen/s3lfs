@@ -173,7 +173,9 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, ["/data/"])
+        self.assertEqual(
+            entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", "/data/"]
+        )
         self.assertEqual(self._git("check-ignore", "data/sub/b.bin").returncode, 0)
 
     def test_a_file_added_under_a_tracked_directory_is_reported(self):
@@ -222,7 +224,9 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "clips/*.mp4"])
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, ["/clips/*.mp4"])
+        self.assertEqual(
+            entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", "/clips/*.mp4"]
+        )
         self.assertNotEqual(self._git("check-ignore", "clips/notes.txt").returncode, 0)
 
     def test_track_escapes_gitignore_metacharacters(self):
@@ -237,7 +241,10 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, [r"/runs\[2024\]/a.bin"])
+        self.assertEqual(
+            entries,
+            ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", r"/runs\[2024\]/a.bin"],
+        )
         self.assertEqual(
             self._git("check-ignore", "runs[2024]/a.bin").returncode,
             0,
@@ -285,7 +292,7 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "no/such/file.bin"])
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, [])
+        self.assertEqual(entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/"])
 
     def test_remove_drops_gitignore_entry(self):
         self._write("data/big.bin", "payload")
@@ -1681,3 +1688,55 @@ class TestDoctor(GitRepoTestCase):
             result = self.runner.invoke(cli, ["doctor"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("s3:PutObject", result.output)
+
+
+class TestInitPlacementAndExitCode(GitRepoTestCase):
+    """`init` must place its files at the git root and fail loudly.
+
+- init from a subdirectory used to drop the manifest and .gitignore in
+  the subdirectory while reporting success, so every later command from
+  the root said "not initialized".
+- init on an already-initialized repo printed "Error:" but exited 0, so
+  CI saw success on a failed init.
+- The old unmanaged gitignore writer added unanchored `*_cache.yaml` /
+  `*_cache.json` patterns that match every such file repo-wide; init
+  must write anchored patterns inside the managed s3lfs block instead.
+    """
+
+    def test_init_from_subdirectory_writes_at_root(self):
+        Path(".s3_manifest.yaml").unlink()  # fresh, uninitialized repo
+        Path("sub/deep").mkdir(parents=True)
+        os.chdir("sub/deep")
+        try:
+            result = self.runner.invoke(cli, ["init", TEST_BUCKET, "p"])
+        finally:
+            os.chdir(self.temp_dir)
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        self.assertTrue(
+            Path(".s3_manifest.yaml").exists(),
+            "manifest must be created at the git root",
+        )
+        self.assertFalse(Path("sub/deep/.s3_manifest.yaml").exists())
+        self.assertFalse(Path("sub/deep/.gitignore").exists())
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/.s3_manifest_cache.yaml", entries)
+        self.assertIn("/.s3lfs_temp/", entries)
+
+    def test_init_already_initialized_exits_nonzero(self):
+        result = self.runner.invoke(cli, ["init", TEST_BUCKET, "p"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("already initialized", result.output)
+
+    def test_init_writes_anchored_block_patterns_only(self):
+        content = Path(".gitignore").read_text()
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/.s3_manifest_cache.yaml", entries)
+        self.assertIn("/.s3lfs_temp/", entries)
+
+        # No unanchored cache patterns anywhere in .gitignore: they would
+        # match e.g. a real source file called pipeline_cache.yaml.
+        lines = [line.strip() for line in content.splitlines()]
+        for line in lines:
+            self.assertNotIn(line, ("*_cache.yaml", "*_cache.json"))
