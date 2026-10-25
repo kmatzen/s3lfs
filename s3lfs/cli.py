@@ -240,7 +240,7 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
     manifest_path = get_manifest_path(git_root)
     if manifest_path.exists():
         print("Error: Repository already initialized")
-        return
+        raise SystemExit(1)
 
     try:
         s3lfs = S3LFS(
@@ -249,12 +249,23 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
             no_sign_request=no_sign_request,
             use_acceleration=use_acceleration,
             endpoint_url=endpoint_url,
+            manifest_file=str(manifest_path),
         )
         s3lfs.initialize_repo()
+        # Keep the cache and temp files out of git through the managed
+        # block, with root-anchored patterns: unanchored "*_cache.yaml"
+        # would match real source files anywhere in the repository.
+        cache_suffix = (
+            ".yaml" if manifest_path.suffix in (".yaml", ".yml") else ".json"
+        )
+        _add_gitignore_entries(
+            git_root,
+            [f"/{manifest_path.stem}_cache{cache_suffix}", "/.s3lfs_temp/"],
+        )
         print(f"Repository initialized with bucket '{bucket}' and prefix '{prefix}'")
     except Exception as e:
         print(f"Error: {e}")
-        return
+        raise SystemExit(1)
 
 
 @cli.command()
@@ -1628,6 +1639,11 @@ def _hidden_untracked_files(git_root, s3lfs, tracked, limit=200, since=None):
     for directory in directories:
         root = git_root / directory
         if not root.is_dir():
+            continue
+        # s3lfs's own state (the temp dir is now a block entry) is not
+        # user content that got hidden by accident; skip it as a root too,
+        # not just as a subdirectory name during the walk.
+        if root.name in skip_dirs:
             continue
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in skip_dirs]

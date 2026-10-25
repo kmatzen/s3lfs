@@ -84,6 +84,7 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         # Second init should fail
         result = runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
         self.assertIn("Error: Repository already initialized", result.output)
+        self.assertNotEqual(result.exit_code, 0)
 
     def test_init_with_exception_handling(self):
         """Test init command exception handling."""
@@ -92,6 +93,7 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         # Test with invalid bucket name to trigger exception
         result = runner.invoke(s3lfs_main, ["init", "", "test_prefix"])
         self.assertIn("Error:", result.output)
+        self.assertNotEqual(result.exit_code, 0)
 
     def test_path_resolution_from_subdirectory(self):
         """Test that path resolution works correctly when running commands from subdirectories."""

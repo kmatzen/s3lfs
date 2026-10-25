@@ -252,206 +252,26 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                 compressed_file.unlink()
 
     # GitIgnore Tests
-    def test_update_gitignore_create_new(self):
-        """Test _update_gitignore when .gitignore doesn't exist."""
-        # Use a temporary directory for this test to avoid polluting git root
+    def test_initialize_repo_does_not_write_gitignore(self):
+        """The unmanaged .gitignore writer was removed; `s3lfs init` now
+        writes anchored exclusions through the managed block in the CLI, so
+        initialize_repo() must not create or modify .gitignore in the cwd."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
             original_cwd = os.getcwd()
             try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
+                os.chdir(temp_dir)
+                self.assertFalse(Path(".gitignore").exists())
 
-                # Ensure .gitignore doesn't exist
-                if gitignore_path.exists():
-                    gitignore_path.unlink()
+                self.versioner.initialize_repo()
 
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    self.assertTrue(gitignore_path.exists())
-
-                    with open(gitignore_path, "r") as f:
-                        content = f.read()
-
-                    self.assertIn("*_cache.json", content)
-                    self.assertIn(".s3lfs_temp/", content)
-                    self.assertIn("*.s3lfs.lock", content)
-                    self.assertIn("S3LFS cache and temporary files", content)
-
-                    # Should print the creation message
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    create_calls = [
-                        call
-                        for call in calls
-                        if "Updated .gitignore to exclude S3LFS" in call
-                    ]
-                    self.assertTrue(len(create_calls) > 0)
+                self.assertFalse(Path(".gitignore").exists())
             finally:
                 os.chdir(original_cwd)
 
-    def test_update_gitignore_existing_s3lfs_section(self):
-        """Test _update_gitignore when S3LFS section already exists."""
-        # Use a temporary directory for this test to avoid polluting git root
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "",
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                    "# Additional content",
-                    "*.tmp",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Should print the "already contains" message
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_partial_patterns(self):
-        """Test _update_gitignore when some patterns are missing."""
-        # Use a temporary directory for this test to avoid polluting git root
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                gitignore_content = [
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    # Missing .s3lfs_temp/ and *.s3lfs.lock
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Verify patterns were added
-                    with open(gitignore_path, "r") as f:
-                        updated_content = f.read()
-
-                    self.assertIn(".s3lfs_temp/", updated_content)
-                    self.assertIn("*.s3lfs.lock", updated_content)
-
-                    # Should print message about adding missing patterns
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    missing_calls = [
-                        call for call in calls if "missing S3LFS patterns" in call
-                    ]
-                    self.assertTrue(len(missing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_no_missing_patterns_with_header(self):
-        """Test _update_gitignore when S3LFS section exists but no patterns are missing."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                # Create gitignore with S3LFS section but missing header patterns
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Should print the "already contains" message since no missing patterns
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_existing_without_s3lfs_section_but_has_patterns(self):
-        """Test _update_gitignore when patterns exist but no S3LFS section header."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                # Create gitignore with patterns but no S3LFS header
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Since all patterns already exist, should print "already contains" message
-                    # The method checks if patterns exist, not if the header exists
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-
-                    # Content should remain the same since all patterns exist
-                    with open(gitignore_path, "r") as f:
-                        updated_content = f.read()
-
-                    # Original patterns should still be there
-                    self.assertIn("*_cache.json", updated_content)
-                    self.assertIn(".s3lfs_temp/", updated_content)
-                    self.assertIn("*.s3lfs.lock", updated_content)
-            finally:
-                os.chdir(original_cwd)
+    def test_update_gitignore_is_removed(self):
+        """The old writer appended unanchored `*_cache.yaml` / `*_cache.json`
+        patterns matching repo-wide; it must be gone, not shadowed."""
+        self.assertFalse(hasattr(self.versioner, "_update_gitignore"))
 
     # Enhanced Cache Management Tests
     def test_cleanup_stale_cache_no_stale_entries(self):

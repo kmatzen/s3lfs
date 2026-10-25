@@ -1021,7 +1021,6 @@ class S3LFS:
     def initialize_repo(self):
         """
         Initialize the repository with a bucket name and a repo-specific prefix.
-        Also updates .gitignore to exclude S3LFS cache files.
 
         :param bucket_name: Name of the S3 bucket to use
         :param repo_prefix: A unique prefix for this repository in the bucket
@@ -1036,73 +1035,12 @@ class S3LFS:
                 self.manifest["endpoint_url"] = str(self.endpoint_url)
             self.save_manifest()
 
-        # Update .gitignore to exclude cache files
-        self._update_gitignore()
-
         print("Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         if self.endpoint_url:
             print(f"   Endpoint URL: {self.endpoint_url}")
         print(f"Manifest file saved as {self.manifest_file.name}")
-
-    def _update_gitignore(self):
-        """
-        Update .gitignore to exclude S3LFS cache files and temporary directories.
-        Creates .gitignore if it doesn't exist, or appends to existing one.
-        """
-        gitignore_path = Path(".gitignore")
-
-        # S3LFS patterns to add
-        s3lfs_patterns = [
-            "",  # Empty line for separation
-            "# S3LFS cache and temporary files - should not be version controlled",
-            "*_cache.json",
-            "*_cache.yaml",
-            ".s3lfs_temp/",
-            "*.s3lfs.lock",
-        ]
-
-        # Check if .gitignore exists and read current content
-        existing_content = []
-        if gitignore_path.exists():
-            with open(gitignore_path, "r") as f:
-                existing_content = [line.rstrip() for line in f.readlines()]
-
-        # Check which patterns are already present
-        patterns_to_add = []
-        for pattern in s3lfs_patterns:
-            if pattern.startswith("#") or pattern == "":
-                # Always add comments and empty lines for structure
-                patterns_to_add.append(pattern)
-            elif pattern not in existing_content:
-                patterns_to_add.append(pattern)
-
-        # Only update if we have patterns to add
-        if any(p for p in patterns_to_add if not p.startswith("#") and p != ""):
-            # Check if we already have S3LFS section
-            has_s3lfs_section = any("S3LFS" in line for line in existing_content)
-
-            if not has_s3lfs_section:
-                # Add all patterns including header
-                with open(gitignore_path, "a") as f:
-                    for pattern in patterns_to_add:
-                        f.write(f"{pattern}\n")
-                print("Updated .gitignore to exclude S3LFS cache files")
-            else:
-                # Only add missing patterns (without header)
-                missing_patterns = [
-                    p for p in patterns_to_add if not p.startswith("#") and p != ""
-                ]
-                if missing_patterns:
-                    with open(gitignore_path, "a") as f:
-                        for pattern in missing_patterns:
-                            f.write(f"{pattern}\n")
-                    print(
-                        f"Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
-                    )
-        else:
-            print(".gitignore already contains S3LFS cache exclusions")
 
     @property
     def shard_dir(self):
