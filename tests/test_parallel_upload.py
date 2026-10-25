@@ -1,7 +1,9 @@
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -196,6 +198,46 @@ class TestParallelUploadChunked(unittest.TestCase):
 
             # No upload should have happened
             mock_client.upload_fileobj.assert_not_called()
+
+
+class TestUploadReportSurvivesManifestFailure(unittest.TestCase):
+    """The upload report must print even when publishing the manifest fails.
+
+    The report is in a finally block precisely so a failed publish still
+    tells the user what landed; when it sat after the manifest write in the
+    same block, a raising write left only a traceback.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.original_cwd = os.getcwd()
+        os.chdir(self.temp_dir)
+        os.makedirs(".git")
+        with open(".s3_manifest.yaml", "w") as f:
+            yaml.safe_dump(
+                {"bucket_name": "test-bucket", "repo_prefix": "pfx", "files": {}}, f
+            )
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_report_prints_and_claims_survive_a_failed_manifest_write(self):
+        with patch("boto3.client") as mock_boto3:
+            mock_boto3.return_value = Mock()
+            s3lfs = S3LFS(bucket_name="test-bucket")
+            Path("data.bin").write_bytes(b"hello world")
+            s3lfs.save_manifest = Mock(side_effect=RuntimeError("disk full"))
+
+            out = io.StringIO()
+            with self.assertRaises(RuntimeError), redirect_stdout(out):
+                s3lfs.parallel_upload_chunked(["data.bin"])
+
+        self.assertIn("Uploaded 1 file(s)", out.getvalue())
+        # Uploaded, unpublished: the claims have to survive, or the next
+        # cleanup deletes objects the manifest has not referenced yet.
+        with s3lfs._lock_context():
+            self.assertTrue(s3lfs._live_inflight_keys())
 
 
 if __name__ == "__main__":

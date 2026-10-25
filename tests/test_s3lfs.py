@@ -2722,12 +2722,15 @@ class TestS3LFS(unittest.TestCase):
                 return_value=mock_paginator,
             ),
             patch.object(
-                self.versioner._get_s3_client(), "delete_object"
+                self.versioner._get_s3_client(), "delete_objects"
             ) as mock_delete,
         ):
             self.versioner.cleanup_s3(force=True)
             # Should only try to delete the valid key, not the short one
             mock_delete.assert_called_once()
+            self.assertEqual(
+                len(mock_delete.call_args.kwargs["Delete"]["Objects"]), 1
+            )
 
     def test_parallel_upload_with_shutdown_signal(self):
         """Test parallel_upload handling shutdown signal."""

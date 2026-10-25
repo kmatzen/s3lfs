@@ -45,6 +45,7 @@ class TestPathAwareGC(unittest.TestCase):
 
     def _s3lfs(self):
         store = self.store
+        self.clients = []
 
         def factory(no_sign_request):
             client = MagicMock()
@@ -64,6 +65,14 @@ class TestPathAwareGC(unittest.TestCase):
             client.delete_object.side_effect = lambda Bucket=None, Key=None, **kw: (
                 store.pop(Key, None)
             )
+
+            def delete_objects(Bucket=None, Delete=None, **kw):
+                for obj in Delete["Objects"]:
+                    store.pop(obj["Key"], None)
+                return {"Deleted": [{"Key": o["Key"]} for o in Delete["Objects"]]}
+
+            client.delete_objects.side_effect = delete_objects
+            self.clients.append(client)
             return client
 
         with patch("boto3.client"):
@@ -155,6 +164,24 @@ class TestPathAwareGC(unittest.TestCase):
             s3lfs._key_covered_by("test-prefix/assets/h/a.bin.gz2", {base})
         )
         self.assertFalse(s3lfs._key_covered_by(f"{base}.chunkX", {base}))
+
+    def test_unreferenced_objects_are_deleted_in_batched_requests(self):
+        """One request per 1000 objects, not one per object.
+
+        The deletes run under the working-copy lock every other s3lfs
+        command waits on, so at one round trip per key a sweep of a large
+        repository locked out the pre-commit hook for its whole duration.
+        """
+        self._write_manifest({"keep.bin": "h1"})
+        for i in range(2500):
+            self.store[f"test-prefix/assets/dead/{i:04d}.bin.gz"] = b"data"
+
+        self._s3lfs().cleanup_s3(force=True)
+
+        client = self.clients[-1]
+        self.assertEqual(client.delete_objects.call_count, 3)
+        self.assertEqual(client.delete_object.call_count, 0)
+        self.assertEqual(self.store, {})
 
 
 if __name__ == "__main__":

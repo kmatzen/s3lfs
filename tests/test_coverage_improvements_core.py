@@ -436,6 +436,9 @@ class TestCoreCoverageImprovements(unittest.TestCase):
         fake_client.delete_object.side_effect = lambda **kw: real_client.delete_object(
             **kw
         )
+        fake_client.delete_objects.side_effect = lambda **kw: real_client.delete_objects(
+            **kw
+        )
 
         with patch.object(s3lfs, "_get_s3_client", return_value=fake_client):
             s3lfs.cleanup_s3(force=True)
