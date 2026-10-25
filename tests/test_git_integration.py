@@ -22,6 +22,7 @@ from s3lfs.cli import (
     _add_gitignore_entry,
     _install_merge_driver,
     _load_gitignore_block,
+    _manifest_files_at_revision,
     _merge_gitignore,
     _remove_gitignore_entry,
     cli,
@@ -1305,6 +1306,71 @@ class TestShardedManifest(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "."])
         listed = self.runner.invoke(cli, ["ls"]).output
         self.assertNotIn(".s3lfs_manifest", listed)
+
+    def test_manifest_files_at_revision_reads_shards(self):
+        """A past sharded manifest must yield its entries, not an empty map.
+
+        Returning {} is indistinguishable from 'this revision tracked
+        nothing', which turns sync --from and verify --revision into no-ops.
+        """
+        self._write("data/a.bin", "a")
+        self._write("models/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "models"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded manifest")
+
+        files = _manifest_files_at_revision(Path(self.temp_dir), "HEAD")
+        self.assertIsNotNone(files)
+        self.assertEqual(sorted(files), ["data/a.bin", "models/b.bin"])
+        self.assertTrue(all(isinstance(h, str) and h for h in files.values()))
+
+    def test_sync_from_prunes_entry_dropped_in_a_sharded_repo(self):
+        """sync --from must see the shard entries of the baseline revision
+        so files the new state dropped are pruned."""
+        self._write("data/a.bin", "a")
+        self._write("data/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("track and shard")
+
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertFalse(
+            Path("data/a.bin").exists(),
+            "dropped entry was not pruned; the sharded baseline read as empty",
+        )
+        self.assertIn("Removed 1 file(s)", result.output)
+
+    def test_verify_revision_reports_sharded_entries(self):
+        """The pre-push safety net must verify shards, not announce an
+        empty manifest and exit 0 for every push."""
+        self._write("data/big.bin", "payload")
+        self.runner.invoke(cli, ["track", "data/big.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded track")
+
+        resp = self.s3.list_objects_v2(Bucket=TEST_BUCKET)
+        for obj in resp.get("Contents", []):
+            self.s3.delete_object(Bucket=TEST_BUCKET, Key=obj["Key"])
+
+        result = self.runner.invoke(cli, ["verify", "--revision", "HEAD"])
+        self.assertIn("Verifying 1 manifest entry", result.output)
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("data/big.bin", result.output)
+
+    def test_verify_revision_passes_with_sharded_entries_in_s3(self):
+        self._write("data/big.bin", "payload")
+        self.runner.invoke(cli, ["track", "data/big.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded track")
+
+        result = self.runner.invoke(cli, ["verify", "--revision", "HEAD"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("verified present", result.output)
 
 
 class TestBulkDeletionGuard(GitRepoTestCase):
