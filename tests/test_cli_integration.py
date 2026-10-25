@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -672,7 +673,7 @@ class TestCLIInProcessStaysOutOfItsCheckout(unittest.TestCase):
         Path("test_cli_file.txt").write_text("repo-owned\n")
 
         suite = unittest.TestLoader().loadTestsFromName(
-            "test_init_command", TestS3LFSCLIInProcess
+            "TestS3LFSCLIInProcess.test_init_command", sys.modules[__name__]
         )
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
 

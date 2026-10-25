@@ -422,9 +422,7 @@ class TestNonAsciiShardDirsInCone(SparseRepoTestCase):
         # intersection: an unresolvable shard name drops the directory's
         # entries from the expected set, exactly as `ls`, `checkout
         # --all` and the pre-commit scan do through _manifest_files.
-        out = self.runner.invoke(
-            cli, ["status", "--all", "--porcelain"]
-        ).output
+        out = self.runner.invoke(cli, ["status", "--all", "--porcelain"]).output
         self.assertIn("report\u2013q3/f.bin", out)
         self.assertNotIn("keep/g.bin", out)
 

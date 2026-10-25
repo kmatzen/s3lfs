@@ -122,9 +122,12 @@ class TestParallelDownloadAllCacheAware(GitRepoTestCase):
         s3lfs = self._s3lfs({"a.bin": "aaa", "b.bin": "bbb"})
 
         calls = []
-        with patch.object(
-            s3lfs, "hash_file", side_effect=lambda *a, **k: calls.append(a) or "x" * 64
-        ):
+
+        def record(*a, **k):
+            calls.append(a)
+            return "x" * 64
+
+        with patch.object(s3lfs, "hash_file", side_effect=record):
             n = s3lfs.parallel_download_all(silence=True)
 
         self.assertEqual(calls, [], "parallel_download_all re-hashed cached files")
@@ -182,7 +185,11 @@ class TestCleanupStaleCache(GitRepoTestCase):
             "timestamp": time.time(),
         }
         s3lfs.hash_cache.update(
-            {"keep.txt": dict(entry), "sub/keep2.txt": dict(entry), "gone.txt": dict(entry)}
+            {
+                "keep.txt": dict(entry),
+                "sub/keep2.txt": dict(entry),
+                "gone.txt": dict(entry),
+            }
         )
         s3lfs._cache_dirty = True
         s3lfs.save_cache()

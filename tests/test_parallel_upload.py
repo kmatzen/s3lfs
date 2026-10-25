@@ -227,10 +227,15 @@ class TestUploadReportSurvivesManifestFailure(unittest.TestCase):
             mock_boto3.return_value = Mock()
             s3lfs = S3LFS(bucket_name="test-bucket")
             Path("data.bin").write_bytes(b"hello world")
-            s3lfs.save_manifest = Mock(side_effect=RuntimeError("disk full"))
 
             out = io.StringIO()
-            with self.assertRaises(RuntimeError), redirect_stdout(out):
+            with (
+                patch.object(
+                    s3lfs, "save_manifest", side_effect=RuntimeError("disk full")
+                ),
+                self.assertRaises(RuntimeError),
+                redirect_stdout(out),
+            ):
                 s3lfs.parallel_upload_chunked(["data.bin"])
 
         self.assertIn("Uploaded 1 file(s)", out.getvalue())

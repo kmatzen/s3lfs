@@ -29,7 +29,9 @@ def _bindings(step):
     """Input names this step exposes as env variables, by exact binding."""
     return {
         m.group(1)
-        for m in (ENV_BINDING.fullmatch(str(v)) for v in (step.get("env") or {}).values())
+        for m in (
+            ENV_BINDING.fullmatch(str(v)) for v in (step.get("env") or {}).values()
+        )
         if m
     }
 
@@ -62,6 +64,6 @@ def test_every_input_a_step_uses_is_bound_to_an_env_variable():
             "without binding them in env:"
         )
         for name in set(step.get("env") or {}):
-            assert f"${name}" in run, (
-                f"step {step.get('name')!r} binds ${name} but never reads it"
-            )
+            assert (
+                f"${name}" in run
+            ), f"step {step.get('name')!r} binds ${name} but never reads it"

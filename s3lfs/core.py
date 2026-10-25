@@ -21,8 +21,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional, Union
-from uuid import uuid4
 from urllib.parse import quote, unquote
+from uuid import uuid4
 
 import portalocker
 import yaml
@@ -90,6 +90,7 @@ def _shard_stem_legacy(shard):
     return "".join(
         ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
     )
+
 
 # Bulk-absence guard for deletion detection: more than this many missing
 # files, and more than this fraction of those checked, reads as a wiped
@@ -794,9 +795,7 @@ class S3LFS:
 
         client = self._get_s3_client()
         try:
-            client.get_object(
-                Bucket=self.bucket_name, Key=key, Range="bytes=0-0"
-            )
+            client.get_object(Bucket=self.bucket_name, Key=key, Range="bytes=0-0")
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "InvalidObjectState":
@@ -967,9 +966,7 @@ class S3LFS:
                     "still archived."
                 )
                 return len(missing)
-            print(
-                f"{len(still)} object(s) still archived; waiting {interval}s..."
-            )
+            print(f"{len(still)} object(s) still archived; waiting {interval}s...")
             time.sleep(interval)
 
     def _live_asset_keys(self):
@@ -3948,9 +3945,7 @@ class S3LFS:
             # landed in S3; discarding them leaves the objects unreferenced
             # (cleanup will delete them) and forces a full re-upload.
             if files_uploaded:
-                print(
-                    f"Updating manifest with {len(files_uploaded)} uploaded files..."
-                )
+                print(f"Updating manifest with {len(files_uploaded)} uploaded files...")
                 with self._lock_context():
                     self.load_manifest()
                     for file_path, file_hash in files_uploaded:
