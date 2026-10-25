@@ -187,47 +187,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             args = mock_run.call_args[0][0]
             self.assertEqual(args[0], "sha256sum")
 
-    # MD5 CLI Method Tests
-    @patch("sys.platform", "linux")
-    @patch("shutil.which")
-    def test_md5_file_cli_method_linux(self, mock_which):
-        """Test MD5 CLI method on Linux."""
-        mock_which.return_value = "/usr/bin/md5sum"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-    @patch("sys.platform", "darwin")
-    @patch("shutil.which")
-    def test_md5_file_cli_method_macos(self, mock_which):
-        """Test MD5 CLI method on macOS."""
-        mock_which.return_value = "/usr/bin/md5"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-            mock_run.assert_called_once()
-            args = mock_run.call_args[0][0]
-            self.assertEqual(args[:2], ["md5", "-r"])
-
-    def test_md5_file_cli_method_unavailable(self):
-        """Test MD5 CLI method when no suitable CLI is available."""
-        with patch("sys.platform", "win32"), patch("shutil.which", return_value=None):
-            with self.assertRaises(RuntimeError) as cm:
-                self.versioner.md5_file(self.test_file, method="cli")
-
-            self.assertIn("No suitable MD5 CLI utility found", str(cm.exception))
-
     # Compression CLI Method Tests
     @patch("sys.platform", "linux")
     @patch("shutil.which")
@@ -662,13 +621,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
         self.assertIn("Unsupported hashing method", str(cm.exception))
 
-    def test_md5_file_unsupported_method(self):
-        """Test md5_file with unsupported method."""
-        with self.assertRaises(ValueError) as cm:
-            self.versioner.md5_file(self.test_file, method="unsupported")
-
-        self.assertIn("Unsupported MD5 hashing method", str(cm.exception))
-
     def test_compress_file_unsupported_method(self):
         """Test compress_file with unsupported method."""
         with self.assertRaises(ValueError) as cm:
@@ -707,34 +659,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                 result,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
-
-    def test_md5_file_auto_selection_linux(self):
-        """Test MD5 auto selection on Linux."""
-        with (
-            patch("sys.platform", "linux"),
-            patch("shutil.which", return_value="/usr/bin/md5sum"),
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-    def test_md5_file_auto_selection_macos(self):
-        """Test MD5 auto selection on macOS."""
-        with (
-            patch("sys.platform", "darwin"),
-            patch("shutil.which", return_value="/usr/bin/md5"),
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
 
     def test_compress_file_auto_selection_cli(self):
         """Test automatic selection of CLI compression method."""

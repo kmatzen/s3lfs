@@ -1113,7 +1113,8 @@ def shard(force, undo):
         s3lfs.save_manifest()
         for path in sorted(shard_dir.glob("*.yaml")):
             path.unlink()
-        shard_dir.rmdir() if not any(shard_dir.iterdir()) else None
+        if not any(shard_dir.iterdir()):
+            shard_dir.rmdir()
         click.echo(f"Merged {len(files)} entr(y/ies) back into {manifest_path.name}")
         return
 
@@ -1585,7 +1586,7 @@ def _has_glob(spec):
     return any(ch in spec for ch in "*?[")
 
 
-def _gitignore_entries_for(git_root, spec, matched_keys):
+def _gitignore_entries_for(git_root, spec):
     """Root-anchored .gitignore patterns covering what a spec tracked.
 
     A glob spec is used verbatim: it is already precise, and gitignore
@@ -1765,7 +1766,7 @@ def _protect_tracked_path(git_root, s3lfs, manifest_key):
         return
 
     added, removed = _apply_gitignore_entries(
-        git_root, _gitignore_entries_for(git_root, manifest_key, matched.keys())
+        git_root, _gitignore_entries_for(git_root, manifest_key)
     )
     if removed:
         click.echo(

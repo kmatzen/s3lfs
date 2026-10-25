@@ -248,18 +248,6 @@ class TestCoreCoverageImprovements(unittest.TestCase):
             s3lfs.track_modified_files_cached()
 
     # ------------------------------------------------------------------
-    # line 1141: md5_file "auto" falls back to mmap on unsupported platform
-    # ------------------------------------------------------------------
-    def test_md5_file_auto_fallback_to_mmap(self):
-        s3lfs = self._make_s3lfs()
-        test_file = self.test_dir / "md5.bin"
-        test_file.write_text("md5 content")
-
-        with patch("s3lfs.core.sys.platform", "win32"):
-            result = s3lfs.md5_file(test_file, method="auto")
-        self.assertEqual(len(result), 32)
-
-    # ------------------------------------------------------------------
     # lines 1276-1285: _compress_file_pigz
     # ------------------------------------------------------------------
     def test_compress_file_pigz_method(self):
@@ -454,18 +442,6 @@ class TestCoreCoverageImprovements(unittest.TestCase):
 
         resp = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=key)
         self.assertEqual(resp.get("KeyCount", 0), 0, "aged object was not deleted")
-
-    # ------------------------------------------------------------------
-    # lines 1631-1632: track_modified_files reports missing file
-    # ------------------------------------------------------------------
-    def test_track_modified_files_missing_file(self):
-        s3lfs = self._make_s3lfs()
-        s3lfs.load_manifest()
-        s3lfs.manifest["files"]["ghost.bin"] = "somehash"
-        s3lfs.save_manifest()
-
-        with patch.object(s3lfs, "hash_file", return_value=None):
-            s3lfs.track_modified_files(silence=True)
 
     # ------------------------------------------------------------------
     # lines 1671-1672: _prepare_file_for_upload removes compressed file
