@@ -612,7 +612,9 @@ class S3LFS:
         """
         Context manager for acquiring and releasing the file-based lock using portalocker.
         """
-        lock = open(self._lock_file, "w")  # Open the lock file in write mode
+        lock = open(
+            self._lock_file, "w", encoding="utf-8"
+        )  # Open the lock file in write mode
         try:
             portalocker.lock(lock, portalocker.LOCK_EX)  # Acquire an exclusive lock
             yield lock  # Provide the lock to the context
@@ -630,7 +632,7 @@ class S3LFS:
         if not self._inflight_file.exists():
             return {}
         try:
-            with open(self._inflight_file, "r") as f:
+            with open(self._inflight_file, "r", encoding="utf-8") as f:
                 data = yaml_load(f) or {}
             claims = data.get("claims", {})
             return claims if isinstance(claims, dict) else {}
@@ -648,7 +650,7 @@ class S3LFS:
         temp_file = self._inflight_file.with_name(
             f"{self._inflight_file.name}.{uuid4().hex}.tmp"
         )
-        with open(temp_file, "w") as f:
+        with open(temp_file, "w", encoding="utf-8") as f:
             yaml_dump({"claims": claims}, f)
         temp_file.replace(self._inflight_file)
 
@@ -1155,11 +1157,11 @@ class S3LFS:
     def _read_shard_file(self, path):
         """Parse the shard file at this path."""
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = yaml_load(f) or {}
         except yaml.YAMLError as e:
             hint = ""
-            if "<<<<<<<" in path.read_text(errors="replace"):
+            if "<<<<<<<" in path.read_text(encoding="utf-8", errors="replace"):
                 hint = (
                     " It contains merge conflict markers -- resolve the "
                     "conflict, or run 's3lfs install' to register the "
@@ -1193,7 +1195,7 @@ class S3LFS:
     def _write_atomic(self, path, data):
         temp_file = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         try:
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 yaml_dump(data, f, default_flow_style=False, sort_keys=True)
             temp_file.replace(path)
         except Exception as e:
@@ -1214,7 +1216,7 @@ class S3LFS:
         self._loaded_shards = {}
         if self.manifest_file.exists():
             try:
-                with open(self.manifest_file, "r") as f:
+                with open(self.manifest_file, "r", encoding="utf-8") as f:
                     # Detect format based on extension
                     if self.manifest_file.suffix in [".yaml", ".yml"]:
                         self.manifest = yaml_load(f) or {"files": {}}
@@ -1225,7 +1227,9 @@ class S3LFS:
                 # teammate who has not run 's3lfs install' will hit. A bare
                 # parser traceback does not tell them that.
                 hint = ""
-                if "<<<<<<<" in self.manifest_file.read_text(errors="replace"):
+                if "<<<<<<<" in self.manifest_file.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
                     hint = (
                         " It contains merge conflict markers -- resolve the "
                         "conflict, or run 's3lfs install' to register the "
@@ -1274,7 +1278,7 @@ class S3LFS:
         )
         try:
             # Write the manifest to a temporary file
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 # Detect format based on extension
                 if self.manifest_file.suffix in [".yaml", ".yml"]:
                     yaml_dump(
@@ -1323,7 +1327,7 @@ class S3LFS:
             return
 
         try:
-            with open(self.cache_file, "r") as f:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
                     self.hash_cache = yaml_load(f) or {}
                 else:
@@ -1349,7 +1353,7 @@ class S3LFS:
             f"{self.cache_file.name}.{uuid4().hex}.tmp"
         )
         try:
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
                     yaml_dump(
                         self.hash_cache, f, default_flow_style=False, sort_keys=True
@@ -2040,6 +2044,7 @@ class S3LFS:
             capture_output=True,
             text=True,
             check=True,
+            encoding="utf-8",
         )
         # GNU coreutils prefixes the whole line with a backslash when the
         # filename needed escaping -- which every Windows path does, since

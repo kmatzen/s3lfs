@@ -54,6 +54,13 @@
   tracked manifest. It now runs in a throwaway directory.
 - **`ls --verbose` reports sizes when run from a subdirectory**, and never
   reads file contents to do it.
+- **Repositories with non-ASCII paths work on Windows.** Manifests, shards,
+  the hash cache, inflight claims, `.gitattributes` and `.gitignore` are now
+  read and written as UTF-8, and git's output is decoded as UTF-8, instead of
+  using the locale's codec. On Windows the locale is cp1252, so a directory
+  named `report–q3` made `track`, `status` and `shard` die with
+  `UnicodeEncodeError` / `UnicodeDecodeError`; the same happened on POSIX
+  under any non-UTF-8 locale.
 
 ### Changed
 

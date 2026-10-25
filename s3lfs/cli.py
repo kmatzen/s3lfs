@@ -98,6 +98,7 @@ def _shards_are_hidden(git_root):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     return listed.returncode == 0 and bool(listed.stdout.strip())
 
@@ -114,6 +115,7 @@ def _shards_outside_sparse_cone(git_root):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if active.returncode != 0 or active.stdout.strip() != "true":
         return False
@@ -143,6 +145,7 @@ def _ensure_shards_visible(git_root):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if result.returncode == 0:
         click.echo(
@@ -1166,7 +1169,7 @@ def migrate(force):
 
     # Load JSON manifest
     try:
-        with open(json_manifest, "r") as f:
+        with open(json_manifest, "r", encoding="utf-8") as f:
             manifest_data = json.load(f)
     except Exception as e:
         click.echo(f"Error: Failed to read JSON manifest: {e}")
@@ -1191,7 +1194,7 @@ def migrate(force):
 
     # Write YAML manifest
     try:
-        with open(yaml_manifest, "w") as f:
+        with open(yaml_manifest, "w", encoding="utf-8") as f:
             yaml_dump(manifest_data, f, default_flow_style=False, sort_keys=True)
         click.echo(f"Successfully created {yaml_manifest.name}")
     except Exception as e:
@@ -1204,9 +1207,9 @@ def migrate(force):
 
     if json_cache.exists() and not yaml_cache.exists():
         try:
-            with open(json_cache, "r") as f:
+            with open(json_cache, "r", encoding="utf-8") as f:
                 cache_data = json.load(f)
-            with open(yaml_cache, "w") as f:
+            with open(yaml_cache, "w", encoding="utf-8") as f:
                 yaml_dump(cache_data, f, default_flow_style=False, sort_keys=True)
             click.echo(f"Successfully migrated cache file to {yaml_cache.name}")
         except Exception as e:
@@ -1243,7 +1246,7 @@ def _parse_lfs_patterns(git_root):
     if not gitattributes.exists():
         return patterns
 
-    with open(gitattributes, "r") as f:
+    with open(gitattributes, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -1437,7 +1440,7 @@ def _remove_lfs_from_gitattributes(gitattributes_path, lfs_patterns):
     Removes lines whose pattern matches one of the LFS patterns.
     Leaves other lines intact.
     """
-    lines = gitattributes_path.read_text().splitlines(keepends=True)
+    lines = gitattributes_path.read_text(encoding="utf-8").splitlines(keepends=True)
     kept = []
     for line in lines:
         stripped = line.strip()
@@ -1449,7 +1452,7 @@ def _remove_lfs_from_gitattributes(gitattributes_path, lfs_patterns):
 
     # Remove trailing blank lines
     text = "".join(kept).rstrip("\n") + "\n" if kept else ""
-    gitattributes_path.write_text(text)
+    gitattributes_path.write_text(text, encoding="utf-8")
 
 
 S3LFS_GITIGNORE_START = "# >>> s3lfs tracked files >>>"
@@ -1484,7 +1487,9 @@ def _load_marked_block(path, start_marker, end_marker):
     """
     if not path.exists():
         return [], [], []
-    return _split_marked_lines(path.read_text().splitlines(), start_marker, end_marker)
+    return _split_marked_lines(
+        path.read_text(encoding="utf-8").splitlines(), start_marker, end_marker
+    )
 
 
 def _save_marked_block(path, start_marker, end_marker, before, entries, after):
@@ -1499,7 +1504,7 @@ def _save_marked_block(path, start_marker, end_marker, before, entries, after):
     lines.extend(after)
     if not lines and not path.exists():
         return
-    path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def _add_marked_entries(path, start_marker, end_marker, new_entries):
@@ -1807,6 +1812,7 @@ def _commits_between(git_root, base, revision):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if result.returncode != 0:
         return []
@@ -1825,6 +1831,7 @@ def _manifest_document_at_revision(git_root, revision):
             capture_output=True,
             text=True,
             cwd=str(git_root),
+            encoding="utf-8",
         )
         if result.returncode == 0:
             # `git show` exits 0 for things that are not manifests too -- a
@@ -1858,6 +1865,7 @@ def _shard_files_at_revision(git_root, revision):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if listing.returncode != 0:
         return {}
@@ -1871,6 +1879,7 @@ def _shard_files_at_revision(git_root, revision):
             capture_output=True,
             text=True,
             cwd=str(git_root),
+            encoding="utf-8",
         )
         if result.returncode != 0:
             continue
@@ -2030,6 +2039,7 @@ def _get_hooks_dir(git_root):
             capture_output=True,
             text=True,
             cwd=str(git_root),
+            encoding="utf-8",
         )
         if result.returncode == 0 and result.stdout.strip():
             hooks_path = Path(result.stdout.strip())
@@ -2049,6 +2059,7 @@ def _get_hooks_dir(git_root):
             capture_output=True,
             text=True,
             cwd=str(git_root),
+            encoding="utf-8",
         )
         if result.returncode == 0 and result.stdout.strip():
             hooks_path = Path(result.stdout.strip())
@@ -2091,7 +2102,7 @@ def _install_hook(hooks_dir, hook_name, hook_block):
     shebang = "#!/bin/sh\n"
 
     if hook_path.exists():
-        content = hook_path.read_text()
+        content = hook_path.read_text(encoding="utf-8")
         if S3LFS_HOOK_START in content:
             pattern = re.escape(S3LFS_HOOK_START) + r".*?" + re.escape(S3LFS_HOOK_END)
             content = re.sub(pattern, lambda _m: hook_block, content, flags=re.DOTALL)
@@ -2131,7 +2142,7 @@ def _write_hook_atomically(hook_path, content):
 
     temp_path = hook_path.with_name(f"{hook_path.name}.{uuid4().hex}.tmp")
     try:
-        temp_path.write_text(content)
+        temp_path.write_text(content, encoding="utf-8")
         temp_path.chmod(0o755)
         temp_path.replace(hook_path)
     except Exception:
@@ -2146,7 +2157,7 @@ def _uninstall_hook(hooks_dir, hook_name):
     if not hook_path.exists():
         return False
 
-    content = hook_path.read_text()
+    content = hook_path.read_text(encoding="utf-8")
     if S3LFS_HOOK_START not in content:
         return False
 
@@ -2375,7 +2386,7 @@ def _merge_maps(base, ours, theirs):
 
 def _read_text_or_empty(path):
     try:
-        return Path(path).read_text()
+        return Path(path).read_text(encoding="utf-8")
     except OSError:
         return ""
 
@@ -2386,7 +2397,7 @@ def _read_manifest_for_merge(path):
     if not path.exists():
         return {}
     # safe_load parses both the YAML and JSON manifest formats
-    data = yaml_load(path.read_text()) or {}
+    data = yaml_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} is not a manifest mapping")
     return data
@@ -2418,7 +2429,7 @@ def _merge_gitignore(base, ours, theirs):
     sides = {}
     for name, path in (("base", base), ("ours", ours), ("theirs", theirs)):
         path = Path(path)
-        text = path.read_text() if path.exists() else ""
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
         before, entries, after = _split_marked_lines(
             text.splitlines(), S3LFS_GITIGNORE_START, S3LFS_GITIGNORE_END
         )
@@ -2434,12 +2445,15 @@ def _merge_gitignore(base, ours, theirs):
         paths = {}
         for name, (rest, _) in sides.items():
             side_path = Path(tmp) / name
-            side_path.write_text("\n".join(rest) + ("\n" if rest else ""))
+            side_path.write_text(
+                "\n".join(rest) + ("\n" if rest else ""), encoding="utf-8"
+            )
             paths[name] = str(side_path)
         result = subprocess.run(
             ["git", "merge-file", "-p", paths["ours"], paths["base"], paths["theirs"]],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         # git merge-file returns the number of conflicts, or <0 on error.
         conflict = result.returncode != 0
@@ -2599,6 +2613,7 @@ def doctor(no_sign_request, endpoint_url):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if driver.returncode == 0 and driver.stdout.strip():
         ok("manifest merge driver registered")
@@ -2713,7 +2728,7 @@ def merge_driver(base, ours, theirs, target):
     )
     if is_gitignore:
         merged_text, conflict = _merge_gitignore(base, ours, theirs)
-        Path(ours).write_text(merged_text)
+        Path(ours).write_text(merged_text, encoding="utf-8")
         if conflict:
             click.echo(
                 "s3lfs: .gitignore has conflicting non-s3lfs edits; "
@@ -2749,7 +2764,7 @@ def merge_driver(base, ours, theirs, target):
     )
     if is_shard:
         merged_shard, conflicts = _merge_maps(base_data, our_data, their_data)
-        with open(ours, "w") as f:
+        with open(ours, "w", encoding="utf-8") as f:
             yaml_dump(merged_shard, f, default_flow_style=False, sort_keys=True)
         if conflicts:
             click.echo(
@@ -2782,10 +2797,10 @@ def merge_driver(base, ours, theirs, target):
     # %A is a temp file, so the real path (%P) is what says which format to
     # write back; without it, fall back to what our side looks like.
     name = target or ours
-    as_json = str(name).endswith(".json") or Path(ours).read_text().lstrip().startswith(
-        "{"
-    )
-    with open(ours, "w") as f:
+    as_json = str(name).endswith(".json") or Path(ours).read_text(
+        encoding="utf-8"
+    ).lstrip().startswith("{")
+    with open(ours, "w", encoding="utf-8") as f:
         if as_json:
             json.dump(merged, f, indent=4, sort_keys=True)
         else:
@@ -2985,6 +3000,7 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     staged = {p for p in result.stdout.split("\0") if p}
     offenders = sorted(staged & tracked)
@@ -3022,6 +3038,7 @@ def pre_commit(no_sign_request, use_acceleration, endpoint_url):
         capture_output=True,
         text=True,
         cwd=str(git_root),
+        encoding="utf-8",
     )
     if result.returncode != 0:
         # Letting the commit proceed here would record the old hashes while

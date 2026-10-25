@@ -61,7 +61,7 @@ class SparseRepoTestCase(unittest.TestCase):
     def _write(self, rel_path, content):
         path = Path(self.temp_dir) / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def _track_both_dirs(self):
@@ -177,7 +177,7 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        self.assertEqual(Path("keep/in.bin").read_text(), "keep-v2")
+        self.assertEqual(Path("keep/in.bin").read_text(encoding="utf-8"), "keep-v2")
         self.assertFalse(
             Path("drop/out.bin").exists(),
             "sync refilled a file outside the sparse profile",
@@ -204,7 +204,9 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         self.assertTrue(Path("drop/out.bin").exists())
-        self.assertEqual(Path("drop/out.bin").read_text(), "unsaved local work")
+        self.assertEqual(
+            Path("drop/out.bin").read_text(encoding="utf-8"), "unsaved local work"
+        )
         self.assertIn("not in S3", result.output)
 
     def test_sync_no_prune_keeps_out_of_profile_files(self):
@@ -370,7 +372,11 @@ class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
     def _tracked(self):
         import yaml as _yaml
 
-        return sorted(_yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"])
+        return sorted(
+            _yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+                "files"
+            ]
+        )
 
     def test_narrowing_then_tracking_keeps_out_of_profile_entries(self):
         self._track_both_dirs()
