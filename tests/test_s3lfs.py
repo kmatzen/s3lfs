@@ -2708,15 +2708,18 @@ class TestS3LFS(unittest.TestCase):
                     os.remove("decompressed_cli_test.txt")
 
     def test_decompress_file_cli_failure(self):
-        """Test CLI decompression failure handling."""
+        """Test CLI decompression failure handling.
+
+        The unreachable `returncode != 0` branch behind `check=True` was
+        removed; the CLI's CalledProcessError propagates instead.
+        """
         if sys.platform.startswith("linux") and shutil.which("gzip"):
             # Mock subprocess to simulate failure
             with patch("subprocess.run") as mock_run:
-                mock_run.return_value.returncode = 1  # Non-zero return code
+                mock_run.side_effect = subprocess.CalledProcessError(1, ["gzip"])
 
-                with self.assertRaises(RuntimeError) as cm:
+                with self.assertRaises(subprocess.CalledProcessError):
                     self.versioner._decompress_file_cli("fake.gz", "output.txt")
-                self.assertIn("Failed to decompress file", str(cm.exception))
 
     def test_decompress_file_string_chunk_handling(self):
         """Test decompression with string chunk handling."""
@@ -2787,51 +2790,60 @@ class TestS3LFS(unittest.TestCase):
             if os.path.exists(large_file):
                 os.remove(large_file)
 
-    def test_upload_md5_mismatch_scenario(self):
-        """Test upload when MD5 mismatch occurs."""
-        # Upload file first
+    def test_upload_reuploads_on_size_mismatch(self):
+        """An object at the key whose ContentLength differs from the local
+        staged size must be re-uploaded. The dedup test is key + size."""
         self.versioner.upload(self.test_file)
 
-        # Mock head_object to return different ETag
-        with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
-            mock_head.return_value = {"ETag": '"different_md5_hash"'}
+        stored_size = self.s3.head_object(
+            Bucket=self.bucket_name,
+            Key=self.s3.list_objects_v2(Bucket=self.bucket_name)["Contents"][0]["Key"],
+        )["ContentLength"]
 
-            # Upload again - should detect mismatch and re-upload
+        # head_object reports the key occupied by a different size.
+        with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
+            mock_head.return_value = {"ContentLength": stored_size + 1}
+
+            # Upload again - should detect the size mismatch and re-upload
             with patch.object(
                 self.versioner._get_s3_client(), "upload_fileobj"
             ) as mock_upload:
                 self.versioner.upload(self.test_file)
-                # Should have called upload_fileobj due to MD5 mismatch
-                self.assertTrue(mock_upload.called)
+                self.assertTrue(
+                    mock_upload.called, "size mismatch must trigger a re-upload"
+                )
 
-    def test_upload_s3_skip_existing_file(self):
-        """Test upload skipping when file already exists with same MD5."""
-        # Upload file first
+    def test_upload_skips_on_size_match(self):
+        """An unchanged object already in S3 with the right size is skipped.
+
+        The skip decision is head_object's ContentLength vs the local size;
+        the ETag is irrelevant (for multipart uploads it is not an MD5, so
+        an ETag comparison can never match a chunked object). The
+        multipart-style ETag here makes the old MD5-vs-ETag rule fail,
+        proving the decision is made on size alone.
+        """
         self.versioner.upload(self.test_file)
 
-        # Calculate the MD5 of the form upload will actually stage:
-        # adaptive compression stores this tiny file raw.
-        if self.versioner._should_compress(self.test_file):
-            compressed = self.versioner.compress_file(self.test_file)
-            try:
-                staged_bytes = compressed.read_bytes()
-            finally:
-                compressed.unlink()
-        else:
-            staged_bytes = Path(self.test_file).read_bytes()
-        actual_md5 = hashlib.md5(staged_bytes).hexdigest()
+        stored_size = self.s3.head_object(
+            Bucket=self.bucket_name,
+            Key=self.s3.list_objects_v2(Bucket=self.bucket_name)["Contents"][0]["Key"],
+        )["ContentLength"]
 
-        # Mock head_object to return same ETag
         with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
-            mock_head.return_value = {"ETag": f'"{actual_md5}"'}
+            mock_head.return_value = {
+                "ETag": '"0123456789abcdef0123456789abcdef-4"',  # multipart form
+                "ContentLength": stored_size,
+            }
 
-            # Upload again - should skip
+            # Upload again - should skip on the matching size
             with patch.object(
                 self.versioner._get_s3_client(), "upload_fileobj"
             ) as mock_upload:
                 self.versioner.upload(self.test_file)
-                # Should NOT have called upload_fileobj due to matching MD5
-                self.assertFalse(mock_upload.called)
+                self.assertFalse(
+                    mock_upload.called,
+                    "object with matching size must not be re-uploaded",
+                )
 
     def test_upload_cleanup_on_os_error(self):
         """Test upload cleanup when OSError occurs during file removal."""

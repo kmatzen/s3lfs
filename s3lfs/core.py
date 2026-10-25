@@ -850,8 +850,12 @@ class S3LFS:
 
         # Resolve every manifest entry to its stored object(s) first: a
         # missing or incomplete object is a failure either way, and it is
-        # not one a restore can fix.
-        targets: list = []  # (manifest_key, key)
+        # not one a restore can fix. `targets` is a dict keyed by
+        # (manifest_key, key) and `missing` a set so the polling loop is
+        # linear: a list `.remove` / `in` scan per resolved object is
+        # quadratic, and Deep Archive restores run it every poll interval
+        # over tens of thousands of objects.
+        targets: dict = {}  # (manifest_key, key) -> None
         problems: list = []
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = {
@@ -866,7 +870,7 @@ class S3LFS:
                     print(f"Error resolving {mk}: {e}")
                     problems.append(mk)
                     continue
-                targets.extend((mk, c["s3_key"]) for c in chunks)
+                targets.update({(mk, c["s3_key"]): None for c in chunks})
 
         if not targets:
             if problems:
@@ -874,7 +878,7 @@ class S3LFS:
             return len(problems)
 
         print(f"Probing readability of {len(targets)} object(s)...")
-        missing = []
+        missing = set()
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = {pool.submit(self._probe_object_readable, key): (mk, key) for mk, key in targets}
             for future in as_completed(futures):
@@ -886,11 +890,11 @@ class S3LFS:
                     status = self.RESTORE_STATUS_ARCHIVED  # re-probe in the loop
                 if status == self.RESTORE_STATUS_READABLE:
                     print(f"Already readable: {mk}")
-                    targets.remove((mk, key))
+                    targets.pop((mk, key), None)
                 elif status == self.RESTORE_STATUS_MISSING:
                     print(f"Missing from S3: {mk} ({key})")
-                    missing.append(mk)
-                    targets.remove((mk, key))
+                    missing.add(mk)
+                    targets.pop((mk, key), None)
 
         if not targets:
             if missing:
@@ -907,9 +911,8 @@ class S3LFS:
                     print(f"Restore requested: {mk}")
                 except Exception as e:
                     print(f"Error restoring {key}: {e}")
-                    if mk not in missing:
-                        missing.append(mk)
-                    targets.remove((mk, key))
+                    missing.add(mk)
+                    targets.pop((mk, key), None)
 
         if not targets:
             if missing:
@@ -934,8 +937,7 @@ class S3LFS:
                 return len(missing)
             if deadline is not None and time.monotonic() >= deadline:
                 for mk, key in still:
-                    if mk not in missing:
-                        missing.append(mk)
+                    missing.add(mk)
                 print(
                     f"Error: timeout after {timeout}s with {len(still)} object(s) "
                     "still archived."
@@ -2262,15 +2264,11 @@ class S3LFS:
         """
         Decompress the file using the `gzip` CLI utility and save it to the output path.
         """
-        result = subprocess.run(
-            ["gzip", "-d", "-c", str(compressed_path)],
-            stdout=open(output_path, "wb"),
-            check=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to decompress file using gzip CLI: {compressed_path}"
+        with open(output_path, "wb") as f_out:
+            subprocess.run(
+                ["gzip", "-d", "-c", str(compressed_path)],
+                stdout=f_out,
+                check=True,
             )
 
         return output_path
@@ -2279,15 +2277,11 @@ class S3LFS:
         """
         Decompress the file using pigz (parallel gzip) and save it to the output path.
         """
-        result = subprocess.run(
-            ["pigz", "-d", "-c", str(compressed_path)],
-            stdout=open(output_path, "wb"),
-            check=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to decompress file using pigz: {compressed_path}"
+        with open(output_path, "wb") as f_out:
+            subprocess.run(
+                ["pigz", "-d", "-c", str(compressed_path)],
+                stdout=f_out,
+                check=True,
             )
 
         return output_path
@@ -2378,24 +2372,18 @@ class S3LFS:
                 with context_manager:
                     upload_key = s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}"
 
-                    # Compute the local MD5 checksum (streaming)
-                    md5_hash = hashlib.md5()
-                    with open(path, "rb") as f:
-                        while True:
-                            block = f.read(DEFAULT_BUFFER_SIZE)
-                            if not block:
-                                break
-                            md5_hash.update(block)
-                    local_md5 = md5_hash.hexdigest()
-
-                    # Check if the file already exists in S3
+                    # Check if the file already exists in S3. The key
+                    # already embeds the content SHA-256, so "this key
+                    # exists with this size" is the whole dedup test.
+                    # (A full MD5 pass to compare against the ETag read
+                    # every upload a second time and can never match a
+                    # multipart upload, whose ETag is not an MD5.)
                     try:
                         s3_object = self._get_s3_client().head_object(
                             Bucket=self.bucket_name,
                             Key=upload_key,
                         )
-                        s3_etag = s3_object["ETag"].strip('"')
-                        if local_md5 == s3_etag:
+                        if s3_object["ContentLength"] == file_size:
                             if not silence:
                                 print(
                                     f"Skipping upload for {path}, "
