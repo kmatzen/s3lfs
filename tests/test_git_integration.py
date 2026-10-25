@@ -1278,6 +1278,70 @@ class TestShardedManifest(GitRepoTestCase):
         self.assertEqual(self.runner.invoke(cli, ["ls"]).output, before)
         self.assertFalse(Path(".s3lfs_manifest").exists())
 
+    def _s3lfs(self):
+        from s3lfs.core import S3LFS
+
+        return S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+
+    def test_awkward_directory_names_survive_sharding(self):
+        """A top-level directory whose name needs escaping -- en dash,
+        emoji, CJK punctuation, space, brackets, a literal percent --
+        must keep its entries after sharding. The hand-rolled codec
+        emitted 3+ hex digits for code points above U+00FF but decoded
+        only two, so the shard name came back mangled and every entry
+        under that directory vanished from ls/status/checkout."""
+        dirs = [
+            "report\u2013q3",
+            "launch\U0001f680",
+            "\u6570\u636e\u3010v2\u3011",
+            "my dir",
+            "runs[2024]",
+            "a%b",
+        ]
+        for d in dirs:
+            self._write(f"{d}/f.bin", d)
+            result = self.runner.invoke(cli, ["track", f"{d}/f.bin"])
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+        result = self.runner.invoke(cli, ["shard", "--force"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        s3lfs = self._s3lfs()
+        self.assertEqual(set(s3lfs.shard_names()), set(dirs))
+        files = dict(s3lfs.manifest.get("files", {}))
+        self.assertEqual(set(files), {f"{d}/f.bin" for d in dirs})
+        out = self.runner.invoke(cli, ["ls"]).output
+        for d in dirs:
+            self.assertIn(f"{d}/f.bin", out)
+
+    def test_shard_files_named_by_the_original_codec_still_resolve(self):
+        """Shard files already on disk (names from the original codec:
+        every non-alnum, non--_. character as '%' + lowercase hex code
+        point, ASCII/Latin-1 only) must encode to the same file name
+        today and decode back to the directory name they name."""
+        dirs = ["data", "my dir", "runs[2024]", "a%b", "\u00feor", "\u00a1ola!"]
+        for d in dirs:
+            self._write(f"{d}/f.bin", d)
+            self.runner.invoke(cli, ["track", f"{d}/f.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        s3lfs = self._s3lfs()
+        for d in dirs:
+            # The original codec's on-disk name for this directory.
+            legacy = "".join(
+                c if c.isalnum() or c in "-_." else f"%{ord(c):02x}" for c in d
+            )
+            self.assertTrue(
+                (s3lfs.shard_dir / f"{legacy}.yaml").is_file(),
+                f"shard for {d!r} is not the file the original codec named",
+            )
+        self.assertEqual(set(s3lfs.shard_names()), set(dirs))
+        files = dict(s3lfs.manifest.get("files", {}))
+        self.assertEqual(set(files), {f"{d}/f.bin" for d in dirs})
+
     def test_tracking_rewrites_only_the_affected_shard(self):
         """The point of sharding: a change under one directory does not
         produce a new copy of the whole manifest in git history."""
