@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import yaml
 from click.testing import CliRunner
 
-from s3lfs.config import CONFIG_FILENAME, apply_config, find_config, load_config
+from s3lfs.config import CONFIG_FILENAME, find_config, load_config
 
 
 class TestFindConfig(unittest.TestCase):
@@ -65,34 +65,6 @@ class TestLoadConfig(unittest.TestCase):
         config = load_config(self.temp_dir)
         self.assertEqual(config, {"use_acceleration": True})
         self.assertNotIn("no_sign_request", config)
-
-
-class TestApplyConfig(unittest.TestCase):
-    def test_cli_true_overrides_config_false(self):
-        config = {"no_sign_request": False, "use_acceleration": False}
-        cli_kwargs = {"no_sign_request": True, "use_acceleration": False}
-        merged = apply_config(config, cli_kwargs)
-        self.assertTrue(merged["no_sign_request"])
-        self.assertFalse(merged["use_acceleration"])
-
-    def test_config_true_used_when_cli_false(self):
-        config = {"no_sign_request": True, "use_acceleration": True}
-        cli_kwargs = {"no_sign_request": False, "use_acceleration": False}
-        merged = apply_config(config, cli_kwargs)
-        self.assertTrue(merged["no_sign_request"])
-        self.assertTrue(merged["use_acceleration"])
-
-    def test_defaults_when_no_config_no_cli(self):
-        config: dict = {}
-        cli_kwargs = {"no_sign_request": False, "use_acceleration": False}
-        merged = apply_config(config, cli_kwargs)
-        self.assertFalse(merged["no_sign_request"])
-        self.assertFalse(merged["use_acceleration"])
-
-    def test_empty_cli_kwargs(self):
-        config = {"no_sign_request": True}
-        merged = apply_config(config, {})
-        self.assertTrue(merged["no_sign_request"])
 
 
 class TestConfigCLIIntegration(unittest.TestCase):

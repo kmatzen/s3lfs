@@ -201,13 +201,6 @@ class ShardedFiles(MutableMapping):
                 path.unlink(missing_ok=True)
         self._dirty.clear()
 
-    def as_dict(self):
-        self._ensure_all()
-        merged: dict = {}
-        for entries in self._loaded.values():
-            merged.update(entries)
-        return merged
-
 
 class _HashingWriter:
     """File-object wrapper that folds every written byte into a SHA-256.
@@ -781,9 +774,7 @@ class S3LFS:
 
         client = self._get_s3_client()
         try:
-            client.get_object(
-                Bucket=self.bucket_name, Key=key, Range="bytes=0-0"
-            )
+            client.get_object(Bucket=self.bucket_name, Key=key, Range="bytes=0-0")
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "InvalidObjectState":
@@ -880,7 +871,10 @@ class S3LFS:
         print(f"Probing readability of {len(targets)} object(s)...")
         missing = set()
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._probe_object_readable, key): (mk, key) for mk, key in targets}
+            futures = {
+                pool.submit(self._probe_object_readable, key): (mk, key)
+                for mk, key in targets
+            }
             for future in as_completed(futures):
                 mk, key = futures[future]
                 try:
@@ -898,12 +892,17 @@ class S3LFS:
 
         if not targets:
             if missing:
-                print(f"Error: {len(missing)} of {len(items)} file(s) have no readable object in S3.")
+                print(
+                    f"Error: {len(missing)} of {len(items)} file(s) have no readable object in S3."
+                )
             return len(missing)
 
         print(f"Requesting restore of {len(targets)} archived object(s)...")
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._request_restore, key): (mk, key) for mk, key in targets}
+            futures = {
+                pool.submit(self._request_restore, key): (mk, key)
+                for mk, key in targets
+            }
             for future in as_completed(futures):
                 mk, key = futures[future]
                 try:
@@ -923,7 +922,10 @@ class S3LFS:
         while True:
             still = []
             with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                futures = {pool.submit(self._probe_object_readable, key): (mk, key) for mk, key in targets}
+                futures = {
+                    pool.submit(self._probe_object_readable, key): (mk, key)
+                    for mk, key in targets
+                }
                 for future in as_completed(futures):
                     mk, key = futures[future]
                     try:
@@ -943,9 +945,7 @@ class S3LFS:
                     "still archived."
                 )
                 return len(missing)
-            print(
-                f"{len(still)} object(s) still archived; waiting {interval}s..."
-            )
+            print(f"{len(still)} object(s) still archived; waiting {interval}s...")
             time.sleep(interval)
 
     def _live_asset_keys(self):
@@ -1108,17 +1108,8 @@ class S3LFS:
         except UnicodeEncodeError:
             stem = quote(shard, safe=_SHARD_NAME_SAFE).replace("~", "%7e")
         else:
-            stem = _SHARD_LEGACY_ESCAPE.sub(
-                lambda m: f"%{ord(m.group(0)):02x}", shard
-            )
+            stem = _SHARD_LEGACY_ESCAPE.sub(lambda m: f"%{ord(m.group(0)):02x}", shard)
         return self.shard_dir / f"{stem}.yaml"
-
-    def _load_shards(self):
-        """Merge every shard into one files mapping (eager; tests use it)."""
-        files: dict = {}
-        for shard in self.shard_names():
-            files.update(self._read_shard(shard))
-        return files
 
     def _read_shard(self, shard):
         """Parse one shard file. Missing reads as empty."""
@@ -1160,13 +1151,6 @@ class S3LFS:
             else:
                 names.append(unquote(stem, encoding="latin-1"))
         return names
-
-    def files_in_shards(self, shards):
-        """Entries from just these shards, leaving the rest unread."""
-        files = {}
-        for shard in shards:
-            files.update(self._read_shard(shard))
-        return files
 
     def _write_atomic(self, path, data):
         temp_file = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
@@ -2023,95 +2007,6 @@ class S3LFS:
             return self._hash_file_mmap(file_path)
         return digest
 
-    def md5_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
-        """
-        Compute an MD5 hash of the file using its content.
-        Supports multiple hashing methods for performance optimization.
-
-        :param file_path: Path to the file to hash.
-        :param method: Hashing method to use. Options are:
-                    - "auto": Automatically select the best method.
-                    - "mmap": Use memory-mapped files (default for non-empty files).
-                    - "iter": Use an iterative read approach (fallback for empty files).
-                    - "cli": Use the `md5sum` CLI utility (POSIX only).
-        :return: The computed MD5 hash as a hexadecimal string.
-        """
-        file_path = Path(file_path)
-
-        # Ensure the file exists
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        # Automatically select the best method if "auto" is specified
-        if method == "auto":
-            if file_path.stat().st_size == 0:  # Empty file
-                method = "iter"
-            elif sys.platform.startswith("linux") and shutil.which("md5sum"):
-                method = "cli"
-            elif sys.platform.startswith("darwin") and shutil.which("md5"):
-                method = "cli"
-            else:
-                method = "mmap"
-
-        # Use the selected hashing method
-        if method == "mmap":
-            return self._md5_file_mmap(file_path)
-        elif method == "iter":
-            return self._md5_file_iter(file_path)
-        elif method == "cli":
-            return self._md5_file_cli(file_path)
-        else:
-            raise ValueError(f"Unsupported MD5 hashing method: {method}")
-
-    def _md5_file_mmap(self, file_path):
-        """
-        Compute the MD5 hash using memory-mapped files.
-        """
-        hasher = hashlib.md5()
-        with open(file_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                hasher.update(mm)
-        return hasher.hexdigest()
-
-    def _md5_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
-        """
-        Compute the MD5 hash by iteratively reading the file in chunks.
-        """
-        hasher = hashlib.md5()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-
-    def _md5_file_cli(self, file_path):
-        """
-        Compute the MD5 hash using the appropriate CLI utility (md5sum on Linux, md5 on macOS).
-        """
-        if sys.platform.startswith("linux") and shutil.which("md5sum"):
-            # Linux: use md5sum
-            result = subprocess.run(
-                ["md5sum", str(file_path)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            # Same coreutils backslash-escape prefix as sha256sum.
-            digest = result.stdout.split()[0].lstrip("\\").lower()
-            if len(digest) != 32 or any(c not in "0123456789abcdef" for c in digest):
-                return self._md5_file_mmap(file_path)
-            return digest
-        elif sys.platform.startswith("darwin") and shutil.which("md5"):
-            # macOS: use md5 -r (for raw output similar to md5sum)
-            result = subprocess.run(
-                ["md5", "-r", str(file_path)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return result.stdout.split()[0]  # Extract the hash from the output
-        else:
-            raise RuntimeError("No suitable MD5 CLI utility found (md5sum or md5)")
-
     def compress_file(self, file_path, method="auto"):
         """
         Compress the file using gzip and return the path of the compressed file in the temp directory.
@@ -2558,47 +2453,10 @@ class S3LFS:
                 if self._key_covered_by(key, live_now):
                     print(f"Skipping {key} (became referenced during cleanup)")
                     continue
-                self._get_s3_client().delete_object(
-                    Bucket=self.bucket_name, Key=key
-                )
+                self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
                 print(f"Deleted {key}")
 
         print("S3 cleanup completed.")
-
-    def track_modified_files(self, silence=True):
-        """Check manifest for outdated hashes and upload changed files in parallel."""
-
-        files_to_upload = []
-        with self._lock_context():
-            files_to_check = list(
-                self.manifest["files"].keys()
-            )  # Files listed in the manifest
-
-        # Compute hashes in parallel
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
-
-        # Process results
-        for file, current_hash in results:
-            with self._lock_context():
-                stored_hash = self.manifest["files"].get(file)
-
-            if current_hash is None:
-                print(f"Warning: File {file} is missing. Skipping.")
-                continue
-
-            if current_hash != stored_hash:
-                print(f"File {file} has changed. Marking for upload.")
-                files_to_upload.append(file)
-
-        # Upload files in parallel if needed
-        if files_to_upload:
-            print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
-            # parallel_upload_chunked commits the manifest itself; see the
-            # note in track_modified_files_cached.
-            self.parallel_upload(files_to_upload, silence=silence)
-        else:
-            print("No modified files needing upload.")
 
     def parallel_upload(self, files, silence=True):
         """Upload multiple files with block-level parallelism."""
@@ -4219,8 +4077,6 @@ class S3LFS:
             return None
 
         # If the file exists, check its hash
-        if not silence:
-            print(f"file_path exists?: {filesystem_path.exists()}")
         if filesystem_path.exists():
             current_hash = self.hash_file(filesystem_path)
             if not silence:
@@ -4385,42 +4241,14 @@ class S3LFS:
         :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         # Resolve manifest paths using the same logic as checkout
-        files_to_list = self._resolve_manifest_paths(path)
-
-        if not files_to_list:
-            if verbose:
-                print(f"No tracked files found for '{path}'.")
-            return
-
-        if verbose:
-            print(f"Found {len(files_to_list)} tracked file(s) for '{path}':")
-            print()
-
-        # Sort files for consistent output
-        sorted_files = sorted(files_to_list.items())
-
-        for file_path, file_hash in sorted_files:
-            # Strip prefix if provided
-            display_path = file_path
-            if strip_prefix and file_path.startswith(strip_prefix + "/"):
-                display_path = file_path[len(strip_prefix + "/") :]
-
-            if verbose:
-                # Get file status if it exists locally
-                file_status = self.get_file_status(file_path)
-                if file_status["exists"]:
-                    size_str = f"{file_status['size']:,} bytes"
-                    status = "" if file_status["cache_valid"] else ""
-                else:
-                    size_str = "missing"
-                    status = ""
-
-                print(f"{status} {display_path}")
-                print(f"    Hash: {file_hash}")
-                print(f"    Size: {size_str}")
-                print()
-            else:
-                print(display_path)
+        files = self._resolve_manifest_paths(path)
+        self._print_tracked_files(
+            files,
+            f"No tracked files found for '{path}'.",
+            f"Found {len(files)} tracked file(s) for '{path}':",
+            verbose,
+            strip_prefix,
+        )
 
     def list_all_files(self, verbose=False, strip_prefix=None):
         """
@@ -4430,35 +4258,45 @@ class S3LFS:
         :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         with self._lock_context():
-            all_files = dict(self.manifest["files"])
+            files = dict(self.manifest["files"])
+        self._print_tracked_files(
+            files,
+            "No files are currently tracked.",
+            f"All tracked files ({len(files)} total):",
+            verbose,
+            strip_prefix,
+        )
 
-        if not all_files:
+    def _print_tracked_files(self, files, empty_msg, header, verbose, strip_prefix):
+        """Print one tracked-file listing shared by list_files/list_all_files."""
+        if not files:
             if verbose:
-                print("No files are currently tracked.")
+                print(empty_msg)
             return
 
         if verbose:
-            print(f"All tracked files ({len(all_files)} total):")
+            print(header)
             print()
+            # One batch pass: "modified" means the disk copy does not
+            # match the manifest hash -- the same verdict `s3lfs status`
+            # gives, served by the hash cache.
+            states = self.compare_to_hashes(files)
 
-        # Sort files for consistent output
-        sorted_files = sorted(all_files.items())
-
-        for file_path, file_hash in sorted_files:
+        for file_path, file_hash in sorted(files.items()):
             # Strip prefix if provided
             display_path = file_path
             if strip_prefix and file_path.startswith(strip_prefix + "/"):
                 display_path = file_path[len(strip_prefix + "/") :]
 
             if verbose:
-                # Get file status if it exists locally
-                file_status = self.get_file_status(file_path)
-                if file_status["exists"]:
-                    size_str = f"{file_status['size']:,} bytes"
-                    status = "" if file_status["cache_valid"] else ""
-                else:
+                state = states[file_path]
+                if state == "missing":
                     size_str = "missing"
-                    status = ""
+                    status = "missing"
+                else:
+                    file_status = self.get_file_status(file_path)
+                    size_str = f"{file_status['size']:,} bytes"
+                    status = "ok" if state == "up_to_date" else "modified"
 
                 print(f"{status} {display_path}")
                 print(f"    Hash: {file_hash}")
