@@ -76,6 +76,21 @@ _SHARD_LEGACY_ESCAPE = re.compile(r"[^\w\-.]")
 # uppercase escape is enough to identify a UTF-8 encoded shard name.
 _SHARD_UTF8_ESCAPE = re.compile(r"%(?:[A-F][0-9A-F]|[0-9A-F][A-F])")
 
+
+def _shard_stem_legacy(shard):
+    """The shard file name written by s3lfs up to 0.6.3.
+
+    Kept verbatim so an existing working copy can still find its shards.
+    `_shard_path` now encodes names that codec corrupted -- a code point
+    above U+00FF escaped in two hex digits -- so those repositories have
+    the old name on disk and the new name nowhere. Encoding is
+    deterministic, so the old name is reproduced from the directory name
+    directly; no decoding, and so no ambiguity, is involved.
+    """
+    return "".join(
+        ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
+    )
+
 # Bulk-absence guard for deletion detection: more than this many missing
 # files, and more than this fraction of those checked, reads as a wiped
 # working copy rather than a set of deliberate deletions.
@@ -199,6 +214,11 @@ class ShardedFiles(MutableMapping):
                 self._owner._write_atomic(path, entries)
             else:
                 path.unlink(missing_ok=True)
+            # Retire the pre-codec-fix name; a leftover would keep a stale
+            # second copy of these entries in git history.
+            legacy = self._owner._shard_path_legacy(shard)
+            if legacy != path and legacy.is_file():
+                legacy.unlink()
         self._dirty.clear()
 
 
@@ -774,7 +794,9 @@ class S3LFS:
 
         client = self._get_s3_client()
         try:
-            client.get_object(Bucket=self.bucket_name, Key=key, Range="bytes=0-0")
+            client.get_object(
+                Bucket=self.bucket_name, Key=key, Range="bytes=0-0"
+            )
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "InvalidObjectState":
@@ -945,7 +967,9 @@ class S3LFS:
                     "still archived."
                 )
                 return len(missing)
-            print(f"{len(still)} object(s) still archived; waiting {interval}s...")
+            print(
+                f"{len(still)} object(s) still archived; waiting {interval}s..."
+            )
             time.sleep(interval)
 
     def _live_asset_keys(self):
@@ -1111,11 +1135,28 @@ class S3LFS:
             stem = _SHARD_LEGACY_ESCAPE.sub(lambda m: f"%{ord(m.group(0)):02x}", shard)
         return self.shard_dir / f"{stem}.yaml"
 
+    def _shard_path_legacy(self, shard):
+        """Where s3lfs up to 0.6.3 wrote this shard.
+
+        A read-only fallback for repositories sharded before the codec fix.
+        For the names that fix changed the old name cannot be recovered by
+        decoding -- that is what made those entries vanish -- so it is
+        re-encoded here.
+        """
+        return self.shard_dir / f"{_shard_stem_legacy(shard)}.yaml"
+
     def _read_shard(self, shard):
         """Parse one shard file. Missing reads as empty."""
         path = self._shard_path(shard)
         if not path.is_file():
-            return {}
+            legacy = self._shard_path_legacy(shard)
+            if legacy == path or not legacy.is_file():
+                return {}
+            path = legacy
+        return self._read_shard_file(path)
+
+    def _read_shard_file(self, path):
+        """Parse the shard file at this path."""
         try:
             with open(path, "r") as f:
                 data = yaml_load(f) or {}
@@ -1529,10 +1570,17 @@ class S3LFS:
         file_path = Path(file_path)
         file_path_str = self._cache_key(file_path)
 
-        if not file_path.exists():
+        # A manifest key is repo-relative, so a bare Path() resolves it
+        # against the CWD: from a subdirectory every file looked missing.
+        filesystem_path = (
+            file_path
+            if file_path.is_absolute()
+            else self.path_resolver.to_filesystem_path(str(file_path))
+        )
+        if not filesystem_path.exists():
             return {"exists": False, "cached": False}
 
-        stat = file_path.stat()
+        stat = filesystem_path.stat()
         current_metadata = {
             "size": stat.st_size,
             "mtime": stat.st_mtime,
@@ -2449,12 +2497,26 @@ class S3LFS:
         with self._lock_context():
             self.load_manifest()
             live_now = self._live_asset_keys() | self._live_inflight_keys()
-            for key in unreferenced_files:
-                if self._key_covered_by(key, live_now):
-                    print(f"Skipping {key} (became referenced during cleanup)")
-                    continue
-                self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
-                print(f"Deleted {key}")
+            to_delete = [
+                key
+                for key in unreferenced_files
+                if not self._key_covered_by(key, live_now)
+            ]
+            spared = len(unreferenced_files) - len(to_delete)
+            if spared:
+                print(
+                    f"Skipping {spared} object(s) that became referenced "
+                    "during cleanup"
+                )
+            # Batched inside the lock -- every other command in this working
+            # copy blocks on it, and delete_objects carries 1000 keys/request.
+            for i in range(0, len(to_delete), 1000):
+                batch = to_delete[i : i + 1000]
+                self._get_s3_client().delete_objects(
+                    Bucket=self.bucket_name,
+                    Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+                )
+                print(f"Deleted {len(batch)} object(s)")
 
         print("S3 cleanup completed.")
 
@@ -2720,42 +2782,42 @@ class S3LFS:
         except KeyboardInterrupt:
             print("\nUpload interrupted by user.")
         finally:
-            if manifest_updates:
-                with self._lock_context():
-                    self.load_manifest()
-                    self.manifest["files"].update(manifest_updates)
-                    self.save_manifest()
+            try:
+                if manifest_updates:
+                    with self._lock_context():
+                        self.load_manifest()
+                        self.manifest["files"].update(manifest_updates)
+                        self.save_manifest()
 
-            # Strictly after the manifest is published. Releasing first would
-            # reopen the window the registry exists to close: the hash would be
-            # in neither the manifest nor the registry, and a sweep running in
-            # between would delete the objects.
-            self._release_inflight(claimed)
-
-            # Files whose chunks did not all land are deliberately absent from
-            # the manifest. Recording them would leave an entry pointing at an
-            # incomplete object, and checkout infers the chunk count from the
-            # objects that exist -- so a missing tail reassembles into a
-            # truncated file with no error raised anywhere.
-            incomplete = sorted(
-                key for key, v in pending.items() if v["done"] != v["expected"]
-            )
-            if incomplete:
-                print(
-                    f"WARNING: {len(incomplete)} file(s) did not upload "
-                    f"completely and were NOT added to the manifest:"
+                # After the manifest is published: releasing first would let a
+                # sweep delete objects that are in neither place. On a failed
+                # write the claims stay, keeping unpublished objects alive for
+                # a retry.
+                self._release_inflight(claimed)
+            finally:
+                # Files whose chunks did not all land are absent from the
+                # manifest on purpose (a partial object reassembles as a
+                # truncated file). This reports in every case, including a
+                # failed manifest write.
+                incomplete = sorted(
+                    key for key, v in pending.items() if v["done"] != v["expected"]
                 )
-                for key in incomplete[:10]:
-                    v = pending[key]
-                    print(f"  {key} ({v['done']}/{v['expected']} chunks)")
-                if len(incomplete) > 10:
-                    print(f"  ... and {len(incomplete) - 10} more")
+                if incomplete:
+                    print(
+                        f"WARNING: {len(incomplete)} file(s) did not upload "
+                        f"completely and were NOT added to the manifest:"
+                    )
+                    for key in incomplete[:10]:
+                        v = pending[key]
+                        print(f"  {key} ({v['done']}/{v['expected']} chunks)")
+                    if len(incomplete) > 10:
+                        print(f"  ... and {len(incomplete) - 10} more")
 
-            print(
-                f"Uploaded {len(manifest_updates)} file(s) "
-                f"({chunks_done} chunks, "
-                f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
-            )
+                print(
+                    f"Uploaded {len(manifest_updates)} file(s) "
+                    f"({chunks_done} chunks, "
+                    f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
+                )
 
     def parallel_download_all(self, silence=True, only=None, preserve_modified=False):
         """Download all files using block-level parallelism.
@@ -4277,10 +4339,6 @@ class S3LFS:
         if verbose:
             print(header)
             print()
-            # One batch pass: "modified" means the disk copy does not
-            # match the manifest hash -- the same verdict `s3lfs status`
-            # gives, served by the hash cache.
-            states = self.compare_to_hashes(files)
 
         for file_path, file_hash in sorted(files.items()):
             # Strip prefix if provided
@@ -4289,16 +4347,15 @@ class S3LFS:
                 display_path = file_path[len(strip_prefix + "/") :]
 
             if verbose:
-                state = states[file_path]
-                if state == "missing":
-                    size_str = "missing"
-                    status = "missing"
-                else:
-                    file_status = self.get_file_status(file_path)
-                    size_str = f"{file_status['size']:,} bytes"
-                    status = "ok" if state == "up_to_date" else "modified"
+                # A stat, not a hash: listing must not read the working copy.
+                file_status = self.get_file_status(file_path)
+                size_str = (
+                    f"{file_status['size']:,} bytes"
+                    if file_status["exists"]
+                    else "missing"
+                )
 
-                print(f"{status} {display_path}")
+                print(display_path)
                 print(f"    Hash: {file_hash}")
                 print(f"    Size: {size_str}")
                 print()

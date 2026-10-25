@@ -438,6 +438,47 @@ class TestNonAsciiShardDirsInCone(SparseRepoTestCase):
         self.assertIn("report\u2013q3", set(s3lfs.shard_names()))
 
 
+class TestShardsFromTheOldCodec(SparseRepoTestCase):
+    """A working copy sharded before the codec fix keeps the shard file
+    name the old codec wrote -- for a directory of code points above
+    U+00FF that name is the corrupted one. Reading it is the
+    compatibility contract: those entries must not disappear."""
+
+    def _s3lfs(self):
+        from s3lfs.core import S3LFS
+
+        return S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+
+    def test_legacy_shard_name_is_read_and_migrated(self):
+        # str.isalnum() is True for CJK, so the old codec left this
+        # directory name literal in the shard file name.
+        legacy_name = "\u6570\u636e.yaml"
+        self._write("\u6570\u636e/model.bin", "v1")
+        self.assertEqual(
+            self.runner.invoke(cli, ["track", "\u6570\u636e/model.bin"]).exit_code, 0
+        )
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        shard_dir = Path(".s3lfs_manifest")
+        current = next(p for p in shard_dir.glob("*.yaml") if p.name != legacy_name)
+        current.rename(shard_dir / legacy_name)  # the pre-fix disk state
+
+        s3lfs = self._s3lfs()
+        self.assertIn("\u6570\u636e/model.bin", dict(s3lfs.manifest["files"]))
+        self.assertIn("\u6570\u636e", set(s3lfs.shard_names()))
+
+        s3lfs.manifest["files"]["\u6570\u636e/model.bin"] = "1" * 64
+        s3lfs.save_manifest()
+        self.assertFalse((shard_dir / legacy_name).exists())
+        self.assertEqual(
+            self._s3lfs().manifest["files"]["\u6570\u636e/model.bin"], "1" * 64
+        )
+
+
 class TestShardsStayVisible(SparseRepoTestCase):
     """Manifest shards are git-tracked files under a directory, so enabling
     a sparse checkout removes them from the working copy unless that

@@ -15,6 +15,7 @@ os.replace()s it onto the destination after full success.
 import contextlib
 import gzip
 import hashlib
+import io
 import os
 import shutil
 import subprocess
@@ -87,6 +88,27 @@ class _RepoTestCase(unittest.TestCase):
 
         client.list_objects_v2.side_effect = list_objects_v2
         return client
+
+
+class _ComparedKey(str):
+    """A manifest key that counts the `==` comparisons it is asked to make.
+
+    Set and dict membership goes through the hash, so linear bookkeeping
+    compares each key a couple of times; a list scan compares it against
+    every entry it walks past. Counting comparisons pins the complexity of
+    the bookkeeping, which a wall-clock bound cannot: on shared CI hardware
+    the mock S3 calls cost more than the scanning did.
+    """
+
+    __slots__ = ()
+    comparisons = 0
+
+    def __eq__(self, other):
+        type(self).comparisons += 1
+        return str.__eq__(self, other)
+
+    def __hash__(self):
+        return str.__hash__(self)
 
 
 class TestRestoreRequest(_RepoTestCase):
@@ -276,16 +298,16 @@ class TestRestoreRequest(_RepoTestCase):
         self.assertEqual(failed, 1)
         client.restore_object.assert_called_once()
 
-    def test_restore_scales_to_thousands_of_objects(self):
-        """restore() over a large set completes fast and reports counts.
+    def test_restore_scales_to_tens_of_thousands_of_objects(self):
+        """restore() over a large set reports correct counts and finishes.
 
-        Regression test for the quadratic bookkeeping (list.remove /
-        `mk not in missing` scans per resolved object, per poll). With
-        dict/set bookkeeping this is linear; the old code did O(n^2)
-        comparisons per pass, which at Deep-Archive object counts meant
-        minutes of pure scanning every poll interval.
+        Functional coverage at Deep-Archive object counts -- every object
+        resolved, the missing ones reported. The complexity of the
+        bookkeeping is pinned by
+        test_restore_bookkeeping_is_linear_in_object_count; a wall-clock
+        bound here is slack on purpose, since the mock S3 calls dominate it.
         """
-        n = 2000
+        n = 20000
         n_missing = 100
         files = {}
         objects = {}
@@ -324,13 +346,82 @@ class TestRestoreRequest(_RepoTestCase):
         s3lfs = self._s3lfs(client)
 
         start = time.monotonic()
-        failed = s3lfs.restore(files, timeout=10, interval=0)
+        failed = s3lfs.restore(files, timeout=120, interval=0)
         elapsed = time.monotonic() - start
 
         self.assertEqual(failed, n_missing)
         self.assertEqual(client.restore_object.call_count, n - n_missing)
         self.assertEqual(state["restored"], set(objects) - missing_keys)
-        self.assertLess(elapsed, 60, f"restore of {n} objects took {elapsed:.1f}s")
+        self.assertLess(elapsed, 90, f"restore of {n} objects took {elapsed:.1f}s")
+
+    def test_restore_bookkeeping_is_linear_in_object_count(self):
+        """Per-key bookkeeping must not scan lists -- the quadratic bug.
+
+        The shape that triggers it is a mixed set: objects that are already
+        readable, and objects whose restore request fails, are each dropped
+        from the pending collection, which a list does with an O(n) scan.
+        A Deep-Archive restore of a large repository is exactly that -- a
+        first checkout after aging, where most objects are readable and some
+        are gone. The wall-clock test above cannot pin this: its objects are
+        all archived, so nothing is ever removed.
+        """
+        n = 3000
+        n_readable = n // 2
+        n_restore_fails = n // 3
+        files = {}
+        objects = {}
+        readable_at_probe = set()
+        restore_fails = set()
+        for i in range(n):
+            digest = hashlib.sha256(f"payload-{i}".encode()).hexdigest()
+            key = _ComparedKey(f"data/file{i:05d}.bin")
+            files[key] = digest
+            s3_key = f"test-prefix/assets/{digest}/{key}"
+            objects[s3_key] = 1024
+            if i < n_readable:
+                readable_at_probe.add(s3_key)
+            elif i < n_readable + n_restore_fails:
+                restore_fails.add(s3_key)
+
+        with open(self.manifest_path, "w") as f:
+            yaml.safe_dump(
+                {
+                    "bucket_name": "test-bucket",
+                    "repo_prefix": "test-prefix",
+                    "files": {str(k): v for k, v in files.items()},
+                },
+                f,
+            )
+
+        client = self._list_client(objects)
+        state = {"restored": set()}
+
+        def get_object(Bucket=None, Key=None, Range=None, **kwargs):
+            if Key in readable_at_probe or Key in state["restored"]:
+                return {"Body": Mock(read=lambda size: b"")}
+            raise _client_error("InvalidObjectState")
+
+        def restore_object(Bucket=None, Key=None, **kwargs):
+            if Key in restore_fails:
+                raise _client_error("InvalidRequest")
+            state["restored"].add(Key)
+
+        client.get_object.side_effect = get_object
+        client.restore_object.side_effect = restore_object
+        s3lfs = self._s3lfs(client)
+
+        _ComparedKey.comparisons = 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            failed = s3lfs.restore(files, timeout=60, interval=0)
+        comparisons = _ComparedKey.comparisons
+
+        self.assertEqual(failed, n_restore_fails)
+        self.assertEqual(len(state["restored"]), n - n_readable - n_restore_fails)
+        self.assertLessEqual(
+            comparisons,
+            10 * n,
+            f"{comparisons} key comparisons for {n} keys: bookkeeping scans lists",
+        )
 
 
 class TestAtomicFinalize(_RepoTestCase):
