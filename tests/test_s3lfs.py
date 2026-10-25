@@ -1026,9 +1026,7 @@ class TestS3LFS(unittest.TestCase):
             return result
 
         try:
-            with patch.object(
-                S3LFS, "upload", autospec=True, side_effect=flaky_upload
-            ):
+            with patch.object(S3LFS, "upload", autospec=True, side_effect=flaky_upload):
                 with self.assertRaises(RuntimeError):
                     versioner.track_interleaved("itr_fail_*.txt")
 
@@ -2728,9 +2726,7 @@ class TestS3LFS(unittest.TestCase):
             self.versioner.cleanup_s3(force=True)
             # Should only try to delete the valid key, not the short one
             mock_delete.assert_called_once()
-            self.assertEqual(
-                len(mock_delete.call_args.kwargs["Delete"]["Objects"]), 1
-            )
+            self.assertEqual(len(mock_delete.call_args.kwargs["Delete"]["Objects"]), 1)
 
     def test_parallel_upload_with_shutdown_signal(self):
         """Test parallel_upload handling shutdown signal."""

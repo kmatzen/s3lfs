@@ -7,7 +7,6 @@ made the failure path leak too, with a partial file behind it. A checkout
 of thousands of compressed assets died with "Too many open files".
 """
 
-import os
 import shutil
 import subprocess
 import tempfile

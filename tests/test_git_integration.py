@@ -1828,14 +1828,14 @@ class TestDoctor(GitRepoTestCase):
 class TestInitPlacementAndExitCode(GitRepoTestCase):
     """`init` must place its files at the git root and fail loudly.
 
-- init from a subdirectory used to drop the manifest and .gitignore in
-  the subdirectory while reporting success, so every later command from
-  the root said "not initialized".
-- init on an already-initialized repo printed "Error:" but exited 0, so
-  CI saw success on a failed init.
-- The old unmanaged gitignore writer added unanchored `*_cache.yaml` /
-  `*_cache.json` patterns that match every such file repo-wide; init
-  must write anchored patterns inside the managed s3lfs block instead.
+    - init from a subdirectory used to drop the manifest and .gitignore in
+      the subdirectory while reporting success, so every later command from
+      the root said "not initialized".
+    - init on an already-initialized repo printed "Error:" but exited 0, so
+      CI saw success on a failed init.
+    - The old unmanaged gitignore writer added unanchored `*_cache.yaml` /
+      `*_cache.json` patterns that match every such file repo-wide; init
+      must write anchored patterns inside the managed s3lfs block instead.
     """
 
     def test_init_from_subdirectory_writes_at_root(self):

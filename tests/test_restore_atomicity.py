@@ -126,7 +126,9 @@ class TestRestoreRequest(_RepoTestCase):
 
         client.get_object.side_effect = get_object
         if restore_side_effect is None:
-            client.restore_object.side_effect = lambda **kw: state["restored"].__setitem__(kw["Key"], True)
+            client.restore_object.side_effect = lambda **kw: state[
+                "restored"
+            ].__setitem__(kw["Key"], True)
         else:
             client.restore_object.side_effect = restore_side_effect
         return client
@@ -154,9 +156,7 @@ class TestRestoreRequest(_RepoTestCase):
         self.assertEqual(kwargs["Key"], self.base_key)
         request = kwargs["RestoreRequest"]
         self.assertNotIn("Days", request, "Days is rejected for Intelligent-Tiering")
-        self.assertEqual(
-            request, {"GlacierJobParameters": {"Tier": "Standard"}}
-        )
+        self.assertEqual(request, {"GlacierJobParameters": {"Tier": "Standard"}})
 
     def test_restore_marks_already_readable_as_skipped(self):
         """Objects that accept a ranged GET are not restore-requested."""
@@ -332,7 +332,7 @@ class TestRestoreRequest(_RepoTestCase):
             )
 
         client = self._list_client(objects)
-        state = {"restored": set()}
+        state: dict = {"restored": set()}
 
         def get_object(Bucket=None, Key=None, Range=None, **kwargs):
             if Key in missing_keys:
@@ -342,7 +342,9 @@ class TestRestoreRequest(_RepoTestCase):
             return {"Body": Mock(read=lambda n: b"")}
 
         client.get_object.side_effect = get_object
-        client.restore_object.side_effect = lambda **kw: state["restored"].add(kw["Key"])
+        client.restore_object.side_effect = lambda **kw: state["restored"].add(
+            kw["Key"]
+        )
         s3lfs = self._s3lfs(client)
 
         start = time.monotonic()
@@ -394,7 +396,7 @@ class TestRestoreRequest(_RepoTestCase):
             )
 
         client = self._list_client(objects)
-        state = {"restored": set()}
+        state: dict = {"restored": set()}
 
         def get_object(Bucket=None, Key=None, Range=None, **kwargs):
             if Key in readable_at_probe or Key in state["restored"]:

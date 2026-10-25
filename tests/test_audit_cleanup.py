@@ -14,8 +14,6 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from click.testing import CliRunner
-
 from s3lfs.cli import cli
 
 from .test_git_integration import TEST_BUCKET, GitRepoTestCase

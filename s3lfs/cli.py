@@ -255,9 +255,7 @@ def init(bucket, prefix, no_sign_request, use_acceleration, endpoint_url):
         # Keep the cache and temp files out of git through the managed
         # block, with root-anchored patterns: unanchored "*_cache.yaml"
         # would match real source files anywhere in the repository.
-        cache_suffix = (
-            ".yaml" if manifest_path.suffix in (".yaml", ".yml") else ".json"
-        )
+        cache_suffix = ".yaml" if manifest_path.suffix in (".yaml", ".yml") else ".json"
         _add_gitignore_entries(
             git_root,
             [f"/{manifest_path.stem}_cache{cache_suffix}", "/.s3lfs_temp/"],
@@ -515,7 +513,9 @@ def restore(
     # Resolve every path argument to a manifest key first, so a typo fails
     # without building an S3 client.
     git_root, manifest_path, path_resolver = _setup_s3lfs_command()
-    keys = [path_resolver.from_cli_input(cli_path, cwd=Path.cwd()) for cli_path in paths]
+    keys = [
+        path_resolver.from_cli_input(cli_path, cwd=Path.cwd()) for cli_path in paths
+    ]
 
     s3lfs = _make_s3lfs(
         git_root,

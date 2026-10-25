@@ -45,7 +45,7 @@ class TestPathAwareGC(unittest.TestCase):
 
     def _s3lfs(self):
         store = self.store
-        self.clients = []
+        self.clients: list = []
 
         def factory(no_sign_request):
             client = MagicMock()
