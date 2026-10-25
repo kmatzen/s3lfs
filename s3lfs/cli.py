@@ -1840,6 +1840,43 @@ def _manifest_config_at_revision(git_root, revision):
     return document or {}
 
 
+def _shard_files_at_revision(git_root, revision):
+    """Merge the shard blobs of a revision's sharded manifest into one map.
+
+    Shard file names are percent-encoded to safe characters, so `git
+    ls-tree` never quotes them. Junk blobs (unparseable, not a mapping,
+    unreadable) are skipped like _manifest_document_at_revision skips them.
+    """
+    listing = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", revision, "--", MANIFEST_SHARD_DIR],
+        capture_output=True,
+        text=True,
+        cwd=str(git_root),
+    )
+    if listing.returncode != 0:
+        return {}
+    files = {}
+    for path in listing.stdout.splitlines():
+        path = path.strip()
+        if not path:
+            continue
+        result = subprocess.run(
+            ["git", "show", f"{revision}:{path}"],
+            capture_output=True,
+            text=True,
+            cwd=str(git_root),
+        )
+        if result.returncode != 0:
+            continue
+        try:
+            data = yaml_load(result.stdout)
+        except yaml.YAMLError:
+            continue
+        if isinstance(data, dict):
+            files.update(data)
+    return files
+
+
 def _manifest_files_at_revision(git_root, revision):
     """Load the manifest's files mapping as of a git revision.
 
@@ -1850,6 +1887,11 @@ def _manifest_files_at_revision(git_root, revision):
     document = _manifest_document_at_revision(git_root, revision)
     if document is None:
         return None
+    if document.get("manifest_format") == "sharded":
+        # The root file carries configuration only; the entries live in
+        # .s3lfs_manifest/<shard>.yaml blobs beside it. Reading only the
+        # root would report {} -- indistinguishable from "tracked nothing".
+        return _shard_files_at_revision(git_root, revision)
     files = document.get("files")
     return files if isinstance(files, dict) else {}
 
