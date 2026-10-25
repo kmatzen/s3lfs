@@ -1,5 +1,83 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **`init` writes at the repository root.** Run from a subdirectory, it
+  created `.s3_manifest.yaml` in the current directory and configured the
+  bucket there, so the next command from the root reported nothing tracked.
+  It also wrote an unmanaged `.gitignore` with unanchored patterns; the
+  ignore patterns now live only in the `s3lfs` block that `track` maintains,
+  anchored to the root. A failing `init` (already initialized, not a git
+  repository) now exits non-zero instead of printing an error and exiting 0.
+- **`sync --from` and `verify` work on sharded manifests.** Both read the
+  file set from the single root manifest, which a sharded repository does
+  not have, so they saw no files and reported success. Shard blobs are now
+  read from the revision they are syncing from.
+- **Shard file names round-trip every directory name.** The codec escaped
+  code points above U+00FF into two hex digits, so `report–q3` decoded to
+  `report 13q3` and every entry under that directory disappeared from
+  sparse checkouts. Names are percent-encoded now; a shard written by an
+  older release is still read from the name it has on disk and renamed on
+  the first write.
+- **Ctrl-C during `track` keeps completed uploads.** The manifest was
+  updated after the upload loop, so an interrupt discarded work already in
+  S3 and the next run uploaded it again. The update runs in a `finally`, and
+  the report of what did not finish prints even when the manifest write
+  fails.
+- **`cleanup` cannot delete an object a collaborator is uploading.**
+  Deletion now happens under the working-copy lock, and objects modified in
+  the last 24 hours (`CLEANUP_GRACE_PERIOD`) are spared: the lock is
+  per-working-copy and cannot see another machine's in-progress upload.
+- **A failed manifest write is an error.** It printed a message and
+  returned, so the command exited 0 with objects in S3 that nothing
+  references.
+- **The hash cache has one key per file.** Some paths keyed it by absolute
+  path and others by manifest key, so a file could hold two entries and a
+  checkout re-hashed a working copy it had just hashed. `s3lfs cleanup`
+  now prunes entries for files that are no longer tracked.
+- **`restore()` is linear in object count.** Per-object bookkeeping scanned
+  lists, which at tens of thousands of archived objects cost minutes of pure
+  scanning on every poll interval.
+- **Upload reads each file once.** The ETag dedup pass hashed the entire
+  file before uploading it, doubling read volume on multi-GB assets; a
+  size check is used instead.
+- **The GitHub Action no longer interpolates inputs into the shell.**
+  `${{ inputs.checkout }}` and friends were substituted as text into the
+  `run:` script, so an input containing shell metacharacters executed as
+  code on the runner. Inputs are passed as `env:` variables.
+- **Running the test suite no longer deletes the repository's manifest.**
+  `tests/test_cli_integration.py`'s in-process CLI class ran in the current
+  working directory and unlinked `.s3_manifest.yaml` in `setUp` and
+  `tearDown`, so `pytest` inside a working copy removed that repository's
+  tracked manifest. It now runs in a throwaway directory.
+- **`ls --verbose` reports sizes when run from a subdirectory**, and never
+  reads file contents to do it.
+- **Repositories with non-ASCII paths work on Windows.** Manifests, shards,
+  the hash cache, inflight claims, `.gitattributes` and `.gitignore` are now
+  read and written as UTF-8, and git's output is decoded as UTF-8, instead of
+  using the locale's codec. On Windows the locale is cp1252, so a directory
+  named `report–q3` made `track`, `status` and `shard` die with
+  `UnicodeEncodeError` / `UnicodeDecodeError`; the same happened on POSIX
+  under any non-UTF-8 locale.
+
+### Changed
+
+- `ls --verbose` lists each tracked file and its size. The status column
+  printed nothing: `status = "" if file_status["cache_valid"] else ""`.
+- `cleanup` deletes unreferenced objects with `delete_objects`, 1000 keys
+  per request, instead of one request per object -- the deletes run under
+  the lock every other command in the working copy waits on.
+
+### Removed
+
+- Public helpers with no callers: `S3LFS.md5_file`,
+  `S3LFS.track_modified_files` (use `track_modified_files_cached`),
+  `ShardedFiles.as_dict`, `S3LFS._load_shards`, `S3LFS.files_in_shards`,
+  `PathResolver.validate_manifest_key`, `PathResolver.is_within_repo`,
+  `PathResolver.get_relative_cwd`, and `config.apply_config`.
+
 ## [0.6.3] - 2026-08-09
 
 ### Fixed

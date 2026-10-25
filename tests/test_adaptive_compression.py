@@ -10,7 +10,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
 import yaml
@@ -188,7 +190,10 @@ class TestLifecycleWithRawObjects(AdaptiveRepoTestCase):
         self.runner.invoke(cli, ["track", "drop.jpg"])
         self.runner.invoke(cli, ["remove", "drop.jpg"])
 
-        result = self.runner.invoke(cli, ["cleanup", "--force"])
+        # Grace period zeroed: the objects were uploaded moments ago, and GC
+        # now skips objects inside the upload grace window by design.
+        with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+            result = self.runner.invoke(cli, ["cleanup", "--force"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         keys = self._keys()

@@ -9,7 +9,9 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
 import yaml
@@ -22,6 +24,7 @@ from s3lfs.cli import (
     _add_gitignore_entry,
     _install_merge_driver,
     _load_gitignore_block,
+    _manifest_files_at_revision,
     _merge_gitignore,
     _remove_gitignore_entry,
     cli,
@@ -42,7 +45,7 @@ class TestGitignoreBlockHelpers(unittest.TestCase):
     def test_add_creates_block(self):
         added = _add_gitignore_entry(self.temp_dir, "/data/")
         self.assertTrue(added)
-        content = (self.temp_dir / ".gitignore").read_text()
+        content = (self.temp_dir / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(S3LFS_GITIGNORE_START, content)
         self.assertIn("/data/", content)
         self.assertIn(S3LFS_GITIGNORE_END, content)
@@ -51,22 +54,22 @@ class TestGitignoreBlockHelpers(unittest.TestCase):
         _add_gitignore_entry(self.temp_dir, "/data/")
         added = _add_gitignore_entry(self.temp_dir, "/data/")
         self.assertFalse(added)
-        content = (self.temp_dir / ".gitignore").read_text()
+        content = (self.temp_dir / ".gitignore").read_text(encoding="utf-8")
         self.assertEqual(content.count("/data/"), 1)
 
     def test_add_preserves_existing_content(self):
-        (self.temp_dir / ".gitignore").write_text("*.pyc\n")
+        (self.temp_dir / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
         _add_gitignore_entry(self.temp_dir, "/data/")
-        content = (self.temp_dir / ".gitignore").read_text()
+        content = (self.temp_dir / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("*.pyc", content)
         self.assertLess(content.index("*.pyc"), content.index("/data/"))
 
     def test_remove_deletes_entry_and_empty_block(self):
-        (self.temp_dir / ".gitignore").write_text("*.pyc\n")
+        (self.temp_dir / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
         _add_gitignore_entry(self.temp_dir, "/data/")
         removed = _remove_gitignore_entry(self.temp_dir, {"/data/", "/data"})
         self.assertTrue(removed)
-        content = (self.temp_dir / ".gitignore").read_text()
+        content = (self.temp_dir / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("*.pyc", content)
         self.assertNotIn("/data/", content)
         self.assertNotIn(S3LFS_GITIGNORE_START, content)
@@ -75,7 +78,7 @@ class TestGitignoreBlockHelpers(unittest.TestCase):
         _add_gitignore_entry(self.temp_dir, "/data/")
         _add_gitignore_entry(self.temp_dir, "/models/big.bin")
         _remove_gitignore_entry(self.temp_dir, {"/data/", "/data"})
-        content = (self.temp_dir / ".gitignore").read_text()
+        content = (self.temp_dir / ".gitignore").read_text(encoding="utf-8")
         self.assertNotIn("/data/", content)
         self.assertIn("/models/big.bin", content)
 
@@ -85,7 +88,7 @@ class TestGitignoreBlockHelpers(unittest.TestCase):
 
     def test_content_after_block_is_preserved(self):
         _add_gitignore_entry(self.temp_dir, "/data/")
-        with open(self.temp_dir / ".gitignore", "a") as f:
+        with open(self.temp_dir / ".gitignore", "a", encoding="utf-8") as f:
             f.write("*.log\n")
         _add_gitignore_entry(self.temp_dir, "/models/")
         before, entries, after = _load_gitignore_block(self.temp_dir)
@@ -141,7 +144,7 @@ class GitRepoTestCase(unittest.TestCase):
     def _write(self, rel_path, content):
         path = Path(self.temp_dir) / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
 
@@ -153,7 +156,7 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "data/big.bin"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        content = Path(".gitignore").read_text()
+        content = Path(".gitignore").read_text(encoding="utf-8")
         self.assertIn(S3LFS_GITIGNORE_START, content)
         self.assertIn("/data/big.bin", content)
         # git must now consider the file ignored
@@ -173,7 +176,9 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, ["/data/"])
+        self.assertEqual(
+            entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", "/data/"]
+        )
         self.assertEqual(self._git("check-ignore", "data/sub/b.bin").returncode, 0)
 
     def test_a_file_added_under_a_tracked_directory_is_reported(self):
@@ -222,7 +227,9 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "clips/*.mp4"])
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, ["/clips/*.mp4"])
+        self.assertEqual(
+            entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", "/clips/*.mp4"]
+        )
         self.assertNotEqual(self._git("check-ignore", "clips/notes.txt").returncode, 0)
 
     def test_track_escapes_gitignore_metacharacters(self):
@@ -237,7 +244,10 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, [r"/runs\[2024\]/a.bin"])
+        self.assertEqual(
+            entries,
+            ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/", r"/runs\[2024\]/a.bin"],
+        )
         self.assertEqual(
             self._git("check-ignore", "runs[2024]/a.bin").returncode,
             0,
@@ -278,14 +288,14 @@ class TestTrackProtectsFromGit(GitRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         self.assertNotIn("data/big.bin", self._git_files())
-        self.assertEqual(Path("data/big.bin").read_text(), "v2")
+        self.assertEqual(Path("data/big.bin").read_text(encoding="utf-8"), "v2")
 
     def test_track_never_tracked_path_leaves_git_alone(self):
         """Tracking a path that matches nothing must not touch .gitignore."""
         self.runner.invoke(cli, ["track", "no/such/file.bin"])
 
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
-        self.assertEqual(entries, [])
+        self.assertEqual(entries, ["/.s3_manifest_cache.yaml", "/.s3lfs_temp/"])
 
     def test_remove_drops_gitignore_entry(self):
         self._write("data/big.bin", "payload")
@@ -434,7 +444,7 @@ class TestReadOnlyCommandsLeaveTreeClean(GitRepoTestCase):
 
     def test_init_still_writes_configuration(self):
         """The guard must not stop a real configuration change landing."""
-        manifest = yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        manifest = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["bucket_name"], TEST_BUCKET)
         self.assertEqual(manifest["repo_prefix"], "test-prefix")
 
@@ -481,7 +491,7 @@ class TestSyncCommand(GitRepoTestCase):
         self._write("data/a.bin", "v1")
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertEqual(Path("data/a.bin").read_text(), "v2")
+        self.assertEqual(Path("data/a.bin").read_text(encoding="utf-8"), "v2")
 
     def test_sync_keeps_locally_modified_file(self):
         """Tracked files are gitignored, so git never warns that one is
@@ -495,7 +505,9 @@ class TestSyncCommand(GitRepoTestCase):
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertEqual(Path("data/a.bin").read_text(), "PRECIOUS UNSAVED WORK")
+        self.assertEqual(
+            Path("data/a.bin").read_text(encoding="utf-8"), "PRECIOUS UNSAVED WORK"
+        )
         self.assertIn("not in S3", result.output)
 
     def test_sync_force_overwrites_locally_modified_file(self):
@@ -508,7 +520,7 @@ class TestSyncCommand(GitRepoTestCase):
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1", "--force"])
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertEqual(Path("data/a.bin").read_text(), "v2")
+        self.assertEqual(Path("data/a.bin").read_text(encoding="utf-8"), "v2")
 
     def test_full_checkout_fallback_keeps_locally_modified_file(self):
         """The no-baseline path cannot tell clean from edited, so it must
@@ -519,7 +531,9 @@ class TestSyncCommand(GitRepoTestCase):
         result = self.runner.invoke(cli, ["sync"])
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        self.assertEqual(Path("data/a.bin").read_text(), "PRECIOUS UNSAVED WORK")
+        self.assertEqual(
+            Path("data/a.bin").read_text(encoding="utf-8"), "PRECIOUS UNSAVED WORK"
+        )
         self.assertIn("locally modified", result.output)
 
     def test_sync_reports_when_already_in_sync(self):
@@ -558,7 +572,9 @@ class TestSyncCommand(GitRepoTestCase):
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertTrue(Path("data/a.bin").exists())
-        self.assertEqual(Path("data/a.bin").read_text(), "local edits worth keeping")
+        self.assertEqual(
+            Path("data/a.bin").read_text(encoding="utf-8"), "local edits worth keeping"
+        )
         self.assertIn("not in S3", result.output)
 
     def test_sync_no_prune_keeps_dropped_files(self):
@@ -665,13 +681,15 @@ class TestMergeDriver(unittest.TestCase):
         path = self.temp_dir / name
         data = {"bucket_name": "b", "repo_prefix": "p", "files": files}
         data.update(extra)
-        path.write_text(_yaml.safe_dump(data))
+        path.write_text(_yaml.safe_dump(data), encoding="utf-8")
         return path
 
     def _merged_files(self):
         import yaml as _yaml
 
-        return _yaml.safe_load((self.temp_dir / "ours.yaml").read_text())["files"]
+        return _yaml.safe_load(
+            (self.temp_dir / "ours.yaml").read_text(encoding="utf-8")
+        )["files"]
 
     def test_disjoint_additions_merge_cleanly(self):
         base = self._manifest("base.yaml", {"shared.bin": "h0"})
@@ -749,7 +767,7 @@ class TestMergeDriver(unittest.TestCase):
             ],
         )
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        data = json.loads((self.temp_dir / "ours.yaml").read_text())
+        data = json.loads((self.temp_dir / "ours.yaml").read_text(encoding="utf-8"))
         self.assertEqual(data["files"], {"a.bin": "ha", "b.bin": "hb"})
 
 
@@ -771,7 +789,8 @@ class TestMergeDriverEndToEnd(GitRepoTestCase):
         shim.write_text(
             "#!/bin/sh\n"
             f'PYTHONPATH="{repo_root}" exec "{sys.executable}" '
-            '-m s3lfs.cli "$@"\n'
+            '-m s3lfs.cli "$@"\n',
+            encoding="utf-8",
         )
         shim.chmod(0o755)
         self.env = dict(os.environ)
@@ -805,7 +824,9 @@ class TestMergeDriverEndToEnd(GitRepoTestCase):
         merge = self._git_with_shim("merge", "feature", "--no-edit")
         self.assertEqual(merge.returncode, 0, msg=merge.stdout + merge.stderr)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertIn("data/a.bin", files)
         self.assertIn("data/b.bin", files)
 
@@ -813,7 +834,7 @@ class TestMergeDriverEndToEnd(GitRepoTestCase):
         _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
         self.assertIn("/data/a.bin", entries)
         self.assertIn("/data/b.bin", entries)
-        content = Path(".gitignore").read_text()
+        content = Path(".gitignore").read_text(encoding="utf-8")
         self.assertEqual(content.count(S3LFS_GITIGNORE_START), 1)
 
     def test_git_merge_reports_real_manifest_conflict(self):
@@ -850,7 +871,7 @@ class TestGitignoreMerge(unittest.TestCase):
 
     def _side(self, name, text):
         path = self.temp_dir / name
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         return path
 
     def _block(self, *entries):
@@ -897,7 +918,7 @@ class TestInstallRegistersMergeDriver(GitRepoTestCase):
         result = self.runner.invoke(cli, ["install"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        attributes = Path(".gitattributes").read_text()
+        attributes = Path(".gitattributes").read_text(encoding="utf-8")
         self.assertIn(".s3_manifest.yaml merge=s3lfs", attributes)
 
         driver = self._git("config", "merge.s3lfs.driver").stdout.strip()
@@ -910,15 +931,15 @@ class TestInstallRegistersMergeDriver(GitRepoTestCase):
 
         attributes = Path(".gitattributes")
         if attributes.exists():
-            self.assertNotIn("merge=s3lfs", attributes.read_text())
+            self.assertNotIn("merge=s3lfs", attributes.read_text(encoding="utf-8"))
         self.assertEqual(self._git("config", "merge.s3lfs.driver").stdout.strip(), "")
 
     def test_install_preserves_existing_gitattributes(self):
-        Path(".gitattributes").write_text("*.txt text\n")
+        Path(".gitattributes").write_text("*.txt text\n", encoding="utf-8")
         self.runner.invoke(cli, ["install"])
         self.runner.invoke(cli, ["uninstall"])
 
-        self.assertIn("*.txt text", Path(".gitattributes").read_text())
+        self.assertIn("*.txt text", Path(".gitattributes").read_text(encoding="utf-8"))
 
 
 class TestCloneCommand(GitRepoTestCase):
@@ -940,7 +961,7 @@ class TestCloneCommand(GitRepoTestCase):
 
         # The tracked file is gitignored, so it can only be here via S3
         self.assertTrue((dest / "data/a.bin").exists())
-        self.assertEqual((dest / "data/a.bin").read_text(), "payload")
+        self.assertEqual((dest / "data/a.bin").read_text(encoding="utf-8"), "payload")
         self.assertTrue((dest / ".git/hooks/pre-commit").exists())
 
     def test_clone_no_checkout_skips_download(self):
@@ -1024,14 +1045,15 @@ class TestRevisionManifestRobustness(GitRepoTestCase):
         """A manifest committed with conflict markers -- what a teammate
         without the merge driver produces -- must not raise a traceback out
         of a post-checkout hook."""
-        good = Path(".s3_manifest.yaml").read_text()
+        good = Path(".s3_manifest.yaml").read_text(encoding="utf-8")
         Path(".s3_manifest.yaml").write_text(
-            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n"
+            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n",
+            encoding="utf-8",
         )
         self._git("add", "-f", ".s3_manifest.yaml")
         self._git("commit", "-qm", "conflicted manifest")
         # Working tree is fine again; only the committed baseline is broken.
-        Path(".s3_manifest.yaml").write_text(good)
+        Path(".s3_manifest.yaml").write_text(good, encoding="utf-8")
 
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
@@ -1040,7 +1062,8 @@ class TestRevisionManifestRobustness(GitRepoTestCase):
     def test_conflicted_working_manifest_explains_itself(self):
         """A bare YAML traceback does not tell the user what to do."""
         Path(".s3_manifest.yaml").write_text(
-            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n"
+            "<<<<<<< HEAD\nfiles: {}\n=======\nfiles: {}\n>>>>>>> other\n",
+            encoding="utf-8",
         )
         result = self.runner.invoke(cli, ["status"])
 
@@ -1076,7 +1099,7 @@ class TestMergeDriverRobustness(unittest.TestCase):
 
     def _write(self, name, text):
         path = self.temp_dir / name
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         return path
 
     def test_null_valued_key_is_not_dropped(self):
@@ -1091,7 +1114,7 @@ class TestMergeDriverRobustness(unittest.TestCase):
         )
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        merged = yaml.safe_load(ours.read_text())
+        merged = yaml.safe_load(ours.read_text(encoding="utf-8"))
         self.assertIn("endpoint_url", merged)
         self.assertIsNone(merged["endpoint_url"])
 
@@ -1112,7 +1135,7 @@ class TestMergeDriverRobustness(unittest.TestCase):
         )
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        merged = ours.read_text()
+        merged = ours.read_text(encoding="utf-8")
         self.assertIn("/ours.bin", merged)
         self.assertIn("/theirs.bin", merged)
         self.assertIn(S3LFS_GITIGNORE_START, merged)
@@ -1147,7 +1170,10 @@ class TestSyncNeverRemovesUnrecoverableContent(GitRepoTestCase):
 
         self.runner.invoke(cli, ["remove", "data/a.bin"])
         self._commit_all("untrack a")
-        cleanup = self.runner.invoke(cli, ["cleanup", "--force"])
+        # Grace period zeroed: cleanup would skip the freshly-uploaded
+        # object (upload grace window), and the test needs it collected.
+        with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+            cleanup = self.runner.invoke(cli, ["cleanup", "--force"])
         self.assertEqual(cleanup.exit_code, 0, msg=cleanup.output)
 
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
@@ -1157,7 +1183,9 @@ class TestSyncNeverRemovesUnrecoverableContent(GitRepoTestCase):
             Path("data/a.bin").exists(),
             "sync deleted the last copy of content that is no longer in S3",
         )
-        self.assertEqual(Path("data/a.bin").read_text(), "the only copy")
+        self.assertEqual(
+            Path("data/a.bin").read_text(encoding="utf-8"), "the only copy"
+        )
         self.assertIn("not in S3", result.output)
 
     def test_force_still_removes_it(self):
@@ -1191,7 +1219,9 @@ class TestDeletionsPropagate(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertNotIn("data/a.bin", files)
         self.assertIn("data/b.bin", files)
         self.assertIn("data/a.bin", result.output)
@@ -1215,7 +1245,9 @@ class TestDeletionsPropagate(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertIn("data/a.bin", files)
 
     def test_no_prune_deleted_keeps_the_entry(self):
@@ -1227,7 +1259,9 @@ class TestDeletionsPropagate(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified", "--no-prune-deleted"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertIn("data/a.bin", files)
 
 
@@ -1252,7 +1286,7 @@ class TestShardedManifest(GitRepoTestCase):
         self.assertEqual(
             self._shard_files(), ["_root.yaml", "data.yaml", "models.yaml"]
         )
-        root = yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        root = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))
         self.assertEqual(root.get("manifest_format"), "sharded")
         self.assertNotIn("files", root)
 
@@ -1270,6 +1304,70 @@ class TestShardedManifest(GitRepoTestCase):
         self.assertEqual(self.runner.invoke(cli, ["ls"]).output, before)
         self.assertFalse(Path(".s3lfs_manifest").exists())
 
+    def _s3lfs(self):
+        from s3lfs.core import S3LFS
+
+        return S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+
+    def test_awkward_directory_names_survive_sharding(self):
+        """A top-level directory whose name needs escaping -- en dash,
+        emoji, CJK punctuation, space, brackets, a literal percent --
+        must keep its entries after sharding. The hand-rolled codec
+        emitted 3+ hex digits for code points above U+00FF but decoded
+        only two, so the shard name came back mangled and every entry
+        under that directory vanished from ls/status/checkout."""
+        dirs = [
+            "report\u2013q3",
+            "launch\U0001f680",
+            "\u6570\u636e\u3010v2\u3011",
+            "my dir",
+            "runs[2024]",
+            "a%b",
+        ]
+        for d in dirs:
+            self._write(f"{d}/f.bin", d)
+            result = self.runner.invoke(cli, ["track", f"{d}/f.bin"])
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+        result = self.runner.invoke(cli, ["shard", "--force"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        s3lfs = self._s3lfs()
+        self.assertEqual(set(s3lfs.shard_names()), set(dirs))
+        files = dict(s3lfs.manifest.get("files", {}))
+        self.assertEqual(set(files), {f"{d}/f.bin" for d in dirs})
+        out = self.runner.invoke(cli, ["ls"]).output
+        for d in dirs:
+            self.assertIn(f"{d}/f.bin", out)
+
+    def test_shard_files_named_by_the_original_codec_still_resolve(self):
+        """Shard files already on disk (names from the original codec:
+        every non-alnum, non--_. character as '%' + lowercase hex code
+        point, ASCII/Latin-1 only) must encode to the same file name
+        today and decode back to the directory name they name."""
+        dirs = ["data", "my dir", "runs[2024]", "a%b", "\u00feor", "\u00a1ola!"]
+        for d in dirs:
+            self._write(f"{d}/f.bin", d)
+            self.runner.invoke(cli, ["track", f"{d}/f.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        s3lfs = self._s3lfs()
+        for d in dirs:
+            # The original codec's on-disk name for this directory.
+            legacy = "".join(
+                c if c.isalnum() or c in "-_." else f"%{ord(c):02x}" for c in d
+            )
+            self.assertTrue(
+                (s3lfs.shard_dir / f"{legacy}.yaml").is_file(),
+                f"shard for {d!r} is not the file the original codec named",
+            )
+        self.assertEqual(set(s3lfs.shard_names()), set(dirs))
+        files = dict(s3lfs.manifest.get("files", {}))
+        self.assertEqual(set(files), {f"{d}/f.bin" for d in dirs})
+
     def test_tracking_rewrites_only_the_affected_shard(self):
         """The point of sharding: a change under one directory does not
         produce a new copy of the whole manifest in git history."""
@@ -1286,7 +1384,9 @@ class TestShardedManifest(GitRepoTestCase):
         self._write("data/c.bin", "c")
         self.runner.invoke(cli, ["track", "data/c.bin"])
 
-        self.assertIn("data/c.bin", Path(".s3lfs_manifest/data.yaml").read_text())
+        self.assertIn(
+            "data/c.bin", Path(".s3lfs_manifest/data.yaml").read_text(encoding="utf-8")
+        )
         self.assertEqual(untouched.read_bytes(), before)
         self.assertEqual(untouched.stat().st_mtime_ns, stamp)
 
@@ -1298,6 +1398,71 @@ class TestShardedManifest(GitRepoTestCase):
         self.runner.invoke(cli, ["track", "."])
         listed = self.runner.invoke(cli, ["ls"]).output
         self.assertNotIn(".s3lfs_manifest", listed)
+
+    def test_manifest_files_at_revision_reads_shards(self):
+        """A past sharded manifest must yield its entries, not an empty map.
+
+        Returning {} is indistinguishable from 'this revision tracked
+        nothing', which turns sync --from and verify --revision into no-ops.
+        """
+        self._write("data/a.bin", "a")
+        self._write("models/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["track", "models"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded manifest")
+
+        files = _manifest_files_at_revision(Path(self.temp_dir), "HEAD")
+        self.assertIsNotNone(files)
+        self.assertEqual(sorted(files), ["data/a.bin", "models/b.bin"])
+        self.assertTrue(all(isinstance(h, str) and h for h in files.values()))
+
+    def test_sync_from_prunes_entry_dropped_in_a_sharded_repo(self):
+        """sync --from must see the shard entries of the baseline revision
+        so files the new state dropped are pruned."""
+        self._write("data/a.bin", "a")
+        self._write("data/b.bin", "b")
+        self.runner.invoke(cli, ["track", "data"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("track and shard")
+
+        self.runner.invoke(cli, ["remove", "data/a.bin"])
+        self._commit_all("untrack a")
+
+        result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertFalse(
+            Path("data/a.bin").exists(),
+            "dropped entry was not pruned; the sharded baseline read as empty",
+        )
+        self.assertIn("Removed 1 file(s)", result.output)
+
+    def test_verify_revision_reports_sharded_entries(self):
+        """The pre-push safety net must verify shards, not announce an
+        empty manifest and exit 0 for every push."""
+        self._write("data/big.bin", "payload")
+        self.runner.invoke(cli, ["track", "data/big.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded track")
+
+        resp = self.s3.list_objects_v2(Bucket=TEST_BUCKET)
+        for obj in resp.get("Contents", []):
+            self.s3.delete_object(Bucket=TEST_BUCKET, Key=obj["Key"])
+
+        result = self.runner.invoke(cli, ["verify", "--revision", "HEAD"])
+        self.assertIn("Verifying 1 manifest entry", result.output)
+        self.assertNotEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("data/big.bin", result.output)
+
+    def test_verify_revision_passes_with_sharded_entries_in_s3(self):
+        self._write("data/big.bin", "payload")
+        self.runner.invoke(cli, ["track", "data/big.bin"])
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("sharded track")
+
+        result = self.runner.invoke(cli, ["verify", "--revision", "HEAD"])
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.assertIn("verified present", result.output)
 
 
 class TestBulkDeletionGuard(GitRepoTestCase):
@@ -1323,7 +1488,9 @@ class TestBulkDeletionGuard(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertEqual(len(files), 8, "a wiped working copy untracked everything")
         self.assertIn("wiped working copy", result.output)
 
@@ -1342,7 +1509,9 @@ class TestBulkDeletionGuard(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertEqual(len(files), 8, "git clean untracked everything")
 
     def test_a_few_deletions_still_propagate(self):
@@ -1355,7 +1524,9 @@ class TestBulkDeletionGuard(GitRepoTestCase):
         result = self.runner.invoke(cli, ["track", "--modified"])
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
-        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"]
+        files = yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+            "files"
+        ]
         self.assertNotIn("data/f0.bin", files)
         self.assertEqual(len(files), 7)
 
@@ -1457,7 +1628,10 @@ class TestLazyShardLoading(GitRepoTestCase):
         s3lfs.manifest["files"]["alpha/new.bin"] = "deadbeef"
         s3lfs.save_manifest()
 
-        self.assertIn("alpha/new.bin", Path(".s3lfs_manifest/alpha.yaml").read_text())
+        self.assertIn(
+            "alpha/new.bin",
+            Path(".s3lfs_manifest/alpha.yaml").read_text(encoding="utf-8"),
+        )
         self.assertEqual(untouched.stat().st_mtime_ns, stamp)
 
 
@@ -1524,7 +1698,8 @@ class TestGitignoreUpgrade(GitRepoTestCase):
         Path(".gitignore").write_text(
             f"{S3LFS_GITIGNORE_START}\n"
             + "".join(f"/data/f{i}.bin\n" for i in range(5))
-            + f"{S3LFS_GITIGNORE_END}\n"
+            + f"{S3LFS_GITIGNORE_END}\n",
+            encoding="utf-8",
         )
 
         result = self.runner.invoke(cli, ["track", "data"])
@@ -1539,7 +1714,8 @@ class TestGitignoreUpgrade(GitRepoTestCase):
         self._write("data/a.bin", "a")
         self._write("other/b.bin", "b")
         Path(".gitignore").write_text(
-            f"{S3LFS_GITIGNORE_START}\n/other/b.bin\n{S3LFS_GITIGNORE_END}\n"
+            f"{S3LFS_GITIGNORE_START}\n/other/b.bin\n{S3LFS_GITIGNORE_END}\n",
+            encoding="utf-8",
         )
 
         self.runner.invoke(cli, ["track", "data"])
@@ -1607,9 +1783,9 @@ class TestDoctor(GitRepoTestCase):
     def test_unreachable_bucket_is_a_failure(self):
         import yaml as _yaml
 
-        m = _yaml.safe_load(Path(".s3_manifest.yaml").read_text())
+        m = _yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))
         m["bucket_name"] = "no-such-bucket-doctor-test"
-        Path(".s3_manifest.yaml").write_text(_yaml.safe_dump(m))
+        Path(".s3_manifest.yaml").write_text(_yaml.safe_dump(m), encoding="utf-8")
 
         result = self.runner.invoke(cli, ["doctor"])
         self.assertNotEqual(result.exit_code, 0)
@@ -1641,7 +1817,7 @@ class TestDoctor(GitRepoTestCase):
 
         from s3lfs.core import S3LFS
 
-        Path(".s3lfsconfig").write_text("encryption: false\n")
+        Path(".s3lfsconfig").write_text("encryption: false\n", encoding="utf-8")
         client = MagicMock()
         with patch.object(S3LFS, "_get_s3_client", return_value=client):
             self.runner.invoke(cli, ["doctor"])
@@ -1681,3 +1857,55 @@ class TestDoctor(GitRepoTestCase):
             result = self.runner.invoke(cli, ["doctor"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("s3:PutObject", result.output)
+
+
+class TestInitPlacementAndExitCode(GitRepoTestCase):
+    """`init` must place its files at the git root and fail loudly.
+
+    - init from a subdirectory used to drop the manifest and .gitignore in
+      the subdirectory while reporting success, so every later command from
+      the root said "not initialized".
+    - init on an already-initialized repo printed "Error:" but exited 0, so
+      CI saw success on a failed init.
+    - The old unmanaged gitignore writer added unanchored `*_cache.yaml` /
+      `*_cache.json` patterns that match every such file repo-wide; init
+      must write anchored patterns inside the managed s3lfs block instead.
+    """
+
+    def test_init_from_subdirectory_writes_at_root(self):
+        Path(".s3_manifest.yaml").unlink()  # fresh, uninitialized repo
+        Path("sub/deep").mkdir(parents=True)
+        os.chdir("sub/deep")
+        try:
+            result = self.runner.invoke(cli, ["init", TEST_BUCKET, "p"])
+        finally:
+            os.chdir(self.temp_dir)
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+
+        self.assertTrue(
+            Path(".s3_manifest.yaml").exists(),
+            "manifest must be created at the git root",
+        )
+        self.assertFalse(Path("sub/deep/.s3_manifest.yaml").exists())
+        self.assertFalse(Path("sub/deep/.gitignore").exists())
+
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/.s3_manifest_cache.yaml", entries)
+        self.assertIn("/.s3lfs_temp/", entries)
+
+    def test_init_already_initialized_exits_nonzero(self):
+        result = self.runner.invoke(cli, ["init", TEST_BUCKET, "p"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("already initialized", result.output)
+
+    def test_init_writes_anchored_block_patterns_only(self):
+        content = Path(".gitignore").read_text(encoding="utf-8")
+        _, entries, _ = _load_gitignore_block(Path(self.temp_dir))
+        self.assertIn("/.s3_manifest_cache.yaml", entries)
+        self.assertIn("/.s3lfs_temp/", entries)
+
+        # No unanchored cache patterns anywhere in .gitignore: they would
+        # match e.g. a real source file called pipeline_cache.yaml.
+        lines = [line.strip() for line in content.splitlines()]
+        for line in lines:
+            self.assertNotIn(line, ("*_cache.yaml", "*_cache.json"))

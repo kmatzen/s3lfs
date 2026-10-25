@@ -16,6 +16,7 @@ difficult to test in normal usage scenarios.
 
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -112,11 +113,29 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     # Error Handling Tests
     def test_save_manifest_error_handling(self):
-        """Test save_manifest error handling and cleanup."""
+        """Test save_manifest raises on write failure and cleans up its temp file."""
         with patch("json.dump", side_effect=Exception("JSON error")):
-            with patch("builtins.print") as mock_print:
+            with self.assertRaises(RuntimeError) as ctx:
                 self.versioner.save_manifest()
-                mock_print.assert_any_call("Failed to save manifest: JSON error")
+        self.assertIn("Failed to save manifest: JSON error", str(ctx.exception))
+        leftovers = list(
+            self.versioner.manifest_file.parent.glob(
+                self.versioner.manifest_file.name + ".*.tmp"
+            )
+        )
+        self.assertEqual(leftovers, [], "temp file was not cleaned up")
+
+    def test_save_manifest_replace_failure_raises(self):
+        """A failed atomic replace (e.g. disk full) must propagate: printing a
+        warning and returning leaves S3 and the index out of sync with exit
+        code 0, which is a data-loss path."""
+        self.versioner.load_manifest()
+        with patch.object(
+            Path, "replace", side_effect=OSError(28, "No space left on device")
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.versioner.save_manifest()
+        self.assertIn("Failed to save manifest", str(ctx.exception))
 
     def test_save_cache_error_handling(self):
         """Test save_cache error handling and cleanup."""
@@ -168,47 +187,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
             args = mock_run.call_args[0][0]
             self.assertEqual(args[0], "sha256sum")
 
-    # MD5 CLI Method Tests
-    @patch("sys.platform", "linux")
-    @patch("shutil.which")
-    def test_md5_file_cli_method_linux(self, mock_which):
-        """Test MD5 CLI method on Linux."""
-        mock_which.return_value = "/usr/bin/md5sum"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-    @patch("sys.platform", "darwin")
-    @patch("shutil.which")
-    def test_md5_file_cli_method_macos(self, mock_which):
-        """Test MD5 CLI method on macOS."""
-        mock_which.return_value = "/usr/bin/md5"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-            mock_run.assert_called_once()
-            args = mock_run.call_args[0][0]
-            self.assertEqual(args[:2], ["md5", "-r"])
-
-    def test_md5_file_cli_method_unavailable(self):
-        """Test MD5 CLI method when no suitable CLI is available."""
-        with patch("sys.platform", "win32"), patch("shutil.which", return_value=None):
-            with self.assertRaises(RuntimeError) as cm:
-                self.versioner.md5_file(self.test_file, method="cli")
-
-            self.assertIn("No suitable MD5 CLI utility found", str(cm.exception))
-
     # Compression CLI Method Tests
     @patch("sys.platform", "linux")
     @patch("shutil.which")
@@ -231,227 +209,48 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
     @patch("sys.platform", "linux")
     @patch("shutil.which")
     def test_decompress_file_cli_method_error(self, mock_which):
-        """Test decompression CLI method error handling."""
+        """Test decompression CLI method error handling.
+
+        The unreachable `returncode != 0` branch behind `check=True` was
+        removed; the real contract is that the CLI's CalledProcessError
+        propagates to the caller.
+        """
         mock_which.return_value = "/usr/bin/gzip"
         compressed_file = self.test_dir / "test.gz"
         compressed_file.touch()
 
         try:
             with patch("subprocess.run") as mock_run:
-                mock_run.return_value.returncode = 1
+                mock_run.side_effect = subprocess.CalledProcessError(1, ["gzip"])
 
                 with patch("builtins.open", mock_open()):
-                    with self.assertRaises(RuntimeError) as cm:
+                    with self.assertRaises(subprocess.CalledProcessError):
                         self.versioner.decompress_file(compressed_file, method="cli")
-
-                    self.assertIn(
-                        "Failed to decompress file using gzip CLI", str(cm.exception)
-                    )
         finally:
             if compressed_file.exists():
                 compressed_file.unlink()
 
     # GitIgnore Tests
-    def test_update_gitignore_create_new(self):
-        """Test _update_gitignore when .gitignore doesn't exist."""
-        # Use a temporary directory for this test to avoid polluting git root
+    def test_initialize_repo_does_not_write_gitignore(self):
+        """The unmanaged .gitignore writer was removed; `s3lfs init` now
+        writes anchored exclusions through the managed block in the CLI, so
+        initialize_repo() must not create or modify .gitignore in the cwd."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
             original_cwd = os.getcwd()
             try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
+                os.chdir(temp_dir)
+                self.assertFalse(Path(".gitignore").exists())
 
-                # Ensure .gitignore doesn't exist
-                if gitignore_path.exists():
-                    gitignore_path.unlink()
+                self.versioner.initialize_repo()
 
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    self.assertTrue(gitignore_path.exists())
-
-                    with open(gitignore_path, "r") as f:
-                        content = f.read()
-
-                    self.assertIn("*_cache.json", content)
-                    self.assertIn(".s3lfs_temp/", content)
-                    self.assertIn("*.s3lfs.lock", content)
-                    self.assertIn("S3LFS cache and temporary files", content)
-
-                    # Should print the creation message
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    create_calls = [
-                        call
-                        for call in calls
-                        if "Updated .gitignore to exclude S3LFS" in call
-                    ]
-                    self.assertTrue(len(create_calls) > 0)
+                self.assertFalse(Path(".gitignore").exists())
             finally:
                 os.chdir(original_cwd)
 
-    def test_update_gitignore_existing_s3lfs_section(self):
-        """Test _update_gitignore when S3LFS section already exists."""
-        # Use a temporary directory for this test to avoid polluting git root
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "",
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                    "# Additional content",
-                    "*.tmp",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Should print the "already contains" message
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_partial_patterns(self):
-        """Test _update_gitignore when some patterns are missing."""
-        # Use a temporary directory for this test to avoid polluting git root
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            # Change working directory to temp dir for this test
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                gitignore_content = [
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    # Missing .s3lfs_temp/ and *.s3lfs.lock
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Verify patterns were added
-                    with open(gitignore_path, "r") as f:
-                        updated_content = f.read()
-
-                    self.assertIn(".s3lfs_temp/", updated_content)
-                    self.assertIn("*.s3lfs.lock", updated_content)
-
-                    # Should print message about adding missing patterns
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    missing_calls = [
-                        call for call in calls if "missing S3LFS patterns" in call
-                    ]
-                    self.assertTrue(len(missing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_no_missing_patterns_with_header(self):
-        """Test _update_gitignore when S3LFS section exists but no patterns are missing."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                # Create gitignore with S3LFS section but missing header patterns
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "# S3LFS cache and temporary files - should not be version controlled",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Should print the "already contains" message since no missing patterns
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-            finally:
-                os.chdir(original_cwd)
-
-    def test_update_gitignore_existing_without_s3lfs_section_but_has_patterns(self):
-        """Test _update_gitignore when patterns exist but no S3LFS section header."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-
-            original_cwd = os.getcwd()
-            try:
-                os.chdir(temp_path)
-                gitignore_path = Path(".gitignore")
-
-                # Create gitignore with patterns but no S3LFS header
-                gitignore_content = [
-                    "# Existing content",
-                    "*.log",
-                    "*_cache.json",
-                    "*_cache.yaml",
-                    ".s3lfs_temp/",
-                    "*.s3lfs.lock",
-                ]
-
-                with open(gitignore_path, "w") as f:
-                    f.write("\n".join(gitignore_content))
-
-                with patch("builtins.print") as mock_print:
-                    self.versioner._update_gitignore()
-
-                    # Since all patterns already exist, should print "already contains" message
-                    # The method checks if patterns exist, not if the header exists
-                    calls = [str(call_args) for call_args in mock_print.call_args_list]
-                    existing_calls = [
-                        call for call in calls if "already contains S3LFS" in call
-                    ]
-                    self.assertTrue(len(existing_calls) > 0)
-
-                    # Content should remain the same since all patterns exist
-                    with open(gitignore_path, "r") as f:
-                        updated_content = f.read()
-
-                    # Original patterns should still be there
-                    self.assertIn("*_cache.json", updated_content)
-                    self.assertIn(".s3lfs_temp/", updated_content)
-                    self.assertIn("*.s3lfs.lock", updated_content)
-            finally:
-                os.chdir(original_cwd)
+    def test_update_gitignore_is_removed(self):
+        """The old writer appended unanchored `*_cache.yaml` / `*_cache.json`
+        patterns matching repo-wide; it must be gone, not shadowed."""
+        self.assertFalse(hasattr(self.versioner, "_update_gitignore"))
 
     # Enhanced Cache Management Tests
     def test_cleanup_stale_cache_no_stale_entries(self):
@@ -822,13 +621,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
         self.assertIn("Unsupported hashing method", str(cm.exception))
 
-    def test_md5_file_unsupported_method(self):
-        """Test md5_file with unsupported method."""
-        with self.assertRaises(ValueError) as cm:
-            self.versioner.md5_file(self.test_file, method="unsupported")
-
-        self.assertIn("Unsupported MD5 hashing method", str(cm.exception))
-
     def test_compress_file_unsupported_method(self):
         """Test compress_file with unsupported method."""
         with self.assertRaises(ValueError) as cm:
@@ -867,34 +659,6 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
                 result,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
-
-    def test_md5_file_auto_selection_linux(self):
-        """Test MD5 auto selection on Linux."""
-        with (
-            patch("sys.platform", "linux"),
-            patch("shutil.which", return_value="/usr/bin/md5sum"),
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
-
-    def test_md5_file_auto_selection_macos(self):
-        """Test MD5 auto selection on macOS."""
-        with (
-            patch("sys.platform", "darwin"),
-            patch("shutil.which", return_value="/usr/bin/md5"),
-            patch("subprocess.run") as mock_run,
-        ):
-            mock_run.return_value.stdout = (
-                "d85b1213473c2fd7c2045020a6b9c62b /path/to/file\n"
-            )
-
-            result = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(result, "d85b1213473c2fd7c2045020a6b9c62b")
 
     def test_compress_file_auto_selection_cli(self):
         """Test automatic selection of CLI compression method."""

@@ -61,7 +61,7 @@ class SparseRepoTestCase(unittest.TestCase):
     def _write(self, rel_path, content):
         path = Path(self.temp_dir) / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def _track_both_dirs(self):
@@ -177,7 +177,7 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
-        self.assertEqual(Path("keep/in.bin").read_text(), "keep-v2")
+        self.assertEqual(Path("keep/in.bin").read_text(encoding="utf-8"), "keep-v2")
         self.assertFalse(
             Path("drop/out.bin").exists(),
             "sync refilled a file outside the sparse profile",
@@ -204,7 +204,9 @@ class TestSyncRespectsSparseProfile(SparseRepoTestCase):
         self.assertEqual(result.exit_code, 0, msg=result.output)
 
         self.assertTrue(Path("drop/out.bin").exists())
-        self.assertEqual(Path("drop/out.bin").read_text(), "unsaved local work")
+        self.assertEqual(
+            Path("drop/out.bin").read_text(encoding="utf-8"), "unsaved local work"
+        )
         self.assertIn("not in S3", result.output)
 
     def test_sync_no_prune_keeps_out_of_profile_files(self):
@@ -370,7 +372,11 @@ class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
     def _tracked(self):
         import yaml as _yaml
 
-        return sorted(_yaml.safe_load(Path(".s3_manifest.yaml").read_text())["files"])
+        return sorted(
+            _yaml.safe_load(Path(".s3_manifest.yaml").read_text(encoding="utf-8"))[
+                "files"
+            ]
+        )
 
     def test_narrowing_then_tracking_keeps_out_of_profile_entries(self):
         self._track_both_dirs()
@@ -398,6 +404,83 @@ class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
 
         self.assertEqual(result.exit_code, 0, msg=result.output)
         self.assertEqual(self._tracked(), ["drop/out.bin"])
+
+
+class TestNonAsciiShardDirsInCone(SparseRepoTestCase):
+    """A top-level directory with a non-ASCII name (en dash here) must
+    keep its tracked entries visible in a cone sparse checkout. The
+    hand-rolled shard-name codec mangled such names on decode, so the
+    intersection of shard_names() with the cone dropped the shard and
+    every entry under that directory vanished silently."""
+
+    def test_cone_sparse_keeps_entries_of_non_ascii_directory(self):
+        self._write("keep/g.bin", "g")
+        self._write("report\u2013q3/f.bin", "f")
+        for p in ("keep/g.bin", "report\u2013q3/f.bin"):
+            result = self.runner.invoke(cli, ["track", p])
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("track and shard")
+
+        self._enable_sparse("report\u2013q3")
+
+        # `status` is the command that takes the shard_names() x cone
+        # intersection: an unresolvable shard name drops the directory's
+        # entries from the expected set, exactly as `ls`, `checkout
+        # --all` and the pre-commit scan do through _manifest_files.
+        out = self.runner.invoke(cli, ["status", "--all", "--porcelain"]).output
+        self.assertIn("report\u2013q3/f.bin", out)
+        self.assertNotIn("keep/g.bin", out)
+
+        from s3lfs.core import S3LFS
+
+        s3lfs = S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+        self.assertIn("report\u2013q3", set(s3lfs.shard_names()))
+
+
+class TestShardsFromTheOldCodec(SparseRepoTestCase):
+    """A working copy sharded before the codec fix keeps the shard file
+    name the old codec wrote -- for a directory of code points above
+    U+00FF that name is the corrupted one. Reading it is the
+    compatibility contract: those entries must not disappear."""
+
+    def _s3lfs(self):
+        from s3lfs.core import S3LFS
+
+        return S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+
+    def test_legacy_shard_name_is_read_and_migrated(self):
+        # str.isalnum() is True for CJK, so the old codec left this
+        # directory name literal in the shard file name.
+        legacy_name = "\u6570\u636e.yaml"
+        self._write("\u6570\u636e/model.bin", "v1")
+        self.assertEqual(
+            self.runner.invoke(cli, ["track", "\u6570\u636e/model.bin"]).exit_code, 0
+        )
+        self.runner.invoke(cli, ["shard", "--force"])
+
+        shard_dir = Path(".s3lfs_manifest")
+        current = next(p for p in shard_dir.glob("*.yaml") if p.name != legacy_name)
+        current.rename(shard_dir / legacy_name)  # the pre-fix disk state
+
+        s3lfs = self._s3lfs()
+        self.assertIn("\u6570\u636e/model.bin", dict(s3lfs.manifest["files"]))
+        self.assertIn("\u6570\u636e", set(s3lfs.shard_names()))
+
+        s3lfs.manifest["files"]["\u6570\u636e/model.bin"] = "1" * 64
+        s3lfs.save_manifest()
+        self.assertFalse((shard_dir / legacy_name).exists())
+        self.assertEqual(
+            self._s3lfs().manifest["files"]["\u6570\u636e/model.bin"], "1" * 64
+        )
 
 
 class TestShardsStayVisible(SparseRepoTestCase):

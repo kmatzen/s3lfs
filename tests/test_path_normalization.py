@@ -80,6 +80,9 @@ class TestRemoveFilePathNormalization(unittest.TestCase):
             client.delete_object.side_effect = lambda Bucket=None, Key=None, **kw: (
                 deleted.append(Key)
             )
+            client.delete_objects.side_effect = lambda Bucket=None, Delete=None, **kw: (
+                deleted.extend(o["Key"] for o in Delete["Objects"])
+            )
             return client
 
         with patch("boto3.client"):
