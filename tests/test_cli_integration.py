@@ -1,5 +1,9 @@
+import io
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +22,19 @@ TEST_BUCKET = "test-bucket-s3lfs"
 @mock_s3
 class TestS3LFSCLIInProcess(unittest.TestCase):
     def setUp(self):
+        # Run in a throwaway directory: these tests drive the CLI in the CWD,
+        # which writes .s3_manifest.yaml and a .gitignore block there -- run
+        # from a checkout, this class deleted that repository's manifest.
+        self._original_cwd = os.getcwd()
+        self._work_dir = os.path.realpath(tempfile.mkdtemp())
+        os.chdir(self._work_dir)
+        # init resolves the repository root, so it needs one to resolve.
+        subprocess.run(["git", "init"], capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"], capture_output=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], capture_output=True)
+
         # Create a mock S3 bucket
         self.s3 = boto3.client("s3", region_name="us-east-1")
         self.s3.create_bucket(Bucket=TEST_BUCKET)
@@ -27,25 +44,22 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         with open(self.test_file, "w") as f:
             f.write("Hello In-Process Test")
 
-        # Remove any leftover manifest
         # Check for both YAML (new default) and JSON (backward compat)
         self.yaml_manifest_path = Path(".s3_manifest.yaml")
         self.json_manifest_path = Path(".s3_manifest.json")
         self.manifest_path = self.yaml_manifest_path  # Default to YAML
 
-        if self.yaml_manifest_path.exists():
-            self.yaml_manifest_path.unlink()
-        if self.json_manifest_path.exists():
-            self.json_manifest_path.unlink()
-
     def tearDown(self):
-        # Clean up the test file and manifest
-        if os.path.exists(self.test_file):
-            os.remove(self.test_file)
-        if self.yaml_manifest_path.exists():
-            self.yaml_manifest_path.unlink()
-        if self.json_manifest_path.exists():
-            self.json_manifest_path.unlink()
+        try:
+            if os.path.exists(self.test_file):
+                os.remove(self.test_file)
+            if self.yaml_manifest_path.exists():
+                self.yaml_manifest_path.unlink()
+            if self.json_manifest_path.exists():
+                self.json_manifest_path.unlink()
+        finally:
+            os.chdir(self._original_cwd)
+            shutil.rmtree(self._work_dir, ignore_errors=True)
 
     def test_init_command(self):
         """Test the init command."""
@@ -628,6 +642,44 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         self.assertEqual(
             result.exit_code, 0, "Cleanup command with transfer acceleration failed"
         )
+
+
+class TestCLIInProcessStaysOutOfItsCheckout(unittest.TestCase):
+    """Running the in-process CLI tests must not touch the working directory.
+
+    The class under test drives the CLI in the CWD, where the CLI writes
+    .s3_manifest.yaml, and its setUp used to unlink one. Running `pytest` in
+    a real working copy therefore deleted that repository's manifest -- a
+    tracked file, in the repositories this tool exists to manage.
+    """
+
+    MANIFEST = "bucket_name: repo-owned-bucket\nrepo_prefix: repo-owned\nfiles: {}\n"
+
+    def setUp(self):
+        self._original_cwd = os.getcwd()
+        self._work_dir = os.path.realpath(tempfile.mkdtemp())
+        os.chdir(self._work_dir)
+        # A real victim is a working copy: git-tracked manifest and all.
+        subprocess.run(["git", "init"], capture_output=True, check=True)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.chdir(self._original_cwd)
+        shutil.rmtree(self._work_dir, ignore_errors=True)
+
+    def test_a_real_cli_test_leaves_the_working_directory_untouched(self):
+        Path(".s3_manifest.yaml").write_text(self.MANIFEST)
+        Path("test_cli_file.txt").write_text("repo-owned\n")
+
+        suite = unittest.TestLoader().loadTestsFromName(
+            "test_init_command", TestS3LFSCLIInProcess
+        )
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+
+        self.assertTrue(result.wasSuccessful(), "the CLI test itself broke")
+        self.assertEqual(Path(".s3_manifest.yaml").read_text(), self.MANIFEST)
+        self.assertEqual(Path("test_cli_file.txt").read_text(), "repo-owned\n")
+        self.assertEqual(Path.cwd().resolve(), Path(self._work_dir).resolve())
 
 
 if __name__ == "__main__":
