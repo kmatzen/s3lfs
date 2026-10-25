@@ -47,6 +47,11 @@
   `${{ inputs.checkout }}` and friends were substituted as text into the
   `run:` script, so an input containing shell metacharacters executed as
   code on the runner. Inputs are passed as `env:` variables.
+- **Running the test suite no longer deletes the repository's manifest.**
+  `tests/test_cli_integration.py`'s in-process CLI class ran in the current
+  working directory and unlinked `.s3_manifest.yaml` in `setUp` and
+  `tearDown`, so `pytest` inside a working copy removed that repository's
+  tracked manifest. It now runs in a throwaway directory.
 - **`ls --verbose` reports sizes when run from a subdirectory**, and never
   reads file contents to do it.
 
