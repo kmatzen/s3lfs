@@ -1,13 +1,14 @@
-import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from concurrent.futures import CancelledError
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -245,8 +246,11 @@ class TestS3LFS(unittest.TestCase):
         del self.versioner.manifest["files"][self.test_file]
         self.versioner.save_manifest()
 
-        # Cleanup should remove it from S3
-        self.versioner.cleanup_s3(force=True)
+        # Cleanup should remove it from S3. The object was uploaded moments
+        # ago, so it sits inside the 24h upload grace period that protects
+        # in-flight uploads; zero the grace period to exercise the GC itself.
+        with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+            self.versioner.cleanup_s3(force=True)
 
         s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
@@ -269,8 +273,10 @@ class TestS3LFS(unittest.TestCase):
             del self.versioner.manifest["files"][self.test_file]
             self.versioner.save_manifest()
 
-            # Cleanup should remove it from S3
-            self.versioner.cleanup_s3(force=True)
+            # Cleanup should remove it from S3 (grace period zeroed: the
+            # chunks were uploaded moments ago, see test_cleanup_s3).
+            with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+                self.versioner.cleanup_s3(force=True)
 
             s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
             response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
@@ -382,51 +388,6 @@ class TestS3LFS(unittest.TestCase):
         # There's only one object with that key in S3
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
         self.assertEqual(len(response["Contents"]), 1)
-
-    # -------------------------------------------------
-    # 11. Automatic Tracking of Modified Files
-    # -------------------------------------------------
-    def test_track_modified_files(self):
-        third_file = "third_file.txt"
-        with open(third_file, "w") as f:
-            f.write("Third file content")
-
-        fourth_file = "fourth_file.txt"
-        with open(fourth_file, "w") as f:
-            f.write("Fourth file content")
-
-        self.versioner.upload(third_file)
-        self.versioner.upload(fourth_file)
-
-        # Write two new files and pretend they're both modified
-        with open(third_file, "w") as f:
-            f.write("Third file content new")
-        fourth_file = "fourth_file.txt"
-        with open(fourth_file, "w") as f:
-            f.write("Fourth file content new")
-
-        self.versioner.track_modified_files()
-
-        # Both should now be in S3
-        file_hash_3 = self.versioner.hash_file(third_file)
-        file_hash_4 = self.versioner.hash_file(fourth_file)
-
-        # Adaptive compression stores small text raw (gzip would inflate
-        # it), so assert on the stem: either <stem> or <stem>.gz must exist.
-        s3_key_3 = f"s3lfs/assets/{file_hash_3}/{third_file}"
-        s3_key_4 = f"s3lfs/assets/{file_hash_4}/{fourth_file}"
-
-        resp3 = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key_3)
-        resp4 = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key_4)
-
-        self.assertTrue("Contents" in resp3 and len(resp3["Contents"]) == 1)
-        self.assertTrue("Contents" in resp4 and len(resp4["Contents"]) == 1)
-
-        # Clean up the extra test files
-        if os.path.exists(third_file):
-            os.remove(third_file)
-        if os.path.exists(fourth_file):
-            os.remove(fourth_file)
 
     def test_remove_file_updates_manifest(self):
         self.versioner.remove_file(self.test_file, keep_in_s3=True)
@@ -1041,6 +1002,86 @@ class TestS3LFS(unittest.TestCase):
                 except OSError:
                     pass
 
+    def test_track_interleaved_failure_keeps_completed_uploads(self):
+        """A per-file upload failure must not throw away the manifest entries
+        for uploads that already completed; only the failed file stays out."""
+        good = "itr_fail_good.txt"
+        bad = "itr_fail_bad.txt"
+        for fname in (good, bad):
+            with open(fname, "w") as f:
+                f.write(f"content for {fname}")
+
+        versioner = S3LFS(bucket_name=self.bucket_name, workers=2)
+        real_upload = S3LFS.upload
+        good_done = threading.Event()
+
+        def flaky_upload(s3lfs_self, file_path, *args, **kwargs):
+            if str(file_path).endswith(bad):
+                # Fail only after the good upload has fully completed, so the
+                # good file's result is processed before the raise.
+                self.assertTrue(good_done.wait(timeout=30))
+                raise RuntimeError("simulated upload failure")
+            result = real_upload(s3lfs_self, file_path, *args, **kwargs)
+            good_done.set()
+            return result
+
+        try:
+            with patch.object(S3LFS, "upload", autospec=True, side_effect=flaky_upload):
+                with self.assertRaises(RuntimeError):
+                    versioner.track_interleaved("itr_fail_*.txt")
+
+            versioner.load_manifest()
+            self.assertIn(
+                good,
+                versioner.manifest["files"],
+                "completed upload was not recorded after a per-file failure",
+            )
+            self.assertNotIn(bad, versioner.manifest["files"])
+        finally:
+            for fname in (good, bad):
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+    def test_track_interleaved_shutdown_keeps_completed_uploads(self):
+        """The shutdown return path (Ctrl-C) must still record the uploads
+        that finished before the flag was set."""
+        good = "itr_shutdown_good.txt"
+        slow = "itr_shutdown_slow.txt"
+        for fname in (good, slow):
+            with open(fname, "w") as f:
+                f.write(f"content for {fname}")
+
+        versioner = S3LFS(bucket_name=self.bucket_name, workers=2)
+        real_upload = S3LFS.upload
+
+        def slow_then_shutdown(s3lfs_self, file_path, *args, **kwargs):
+            if str(file_path).endswith(slow):
+                # Set the shutdown flag while the main loop is waiting for
+                # more results; the good upload completed long before this.
+                time.sleep(1.0)
+                versioner._shutdown_requested = True
+            return real_upload(s3lfs_self, file_path, *args, **kwargs)
+
+        try:
+            with patch.object(
+                S3LFS, "upload", autospec=True, side_effect=slow_then_shutdown
+            ):
+                # The shutdown path returns; it does not raise.
+                versioner.track_interleaved("itr_shutdown_*.txt")
+
+            versioner.load_manifest()
+            self.assertIn(
+                good,
+                versioner.manifest["files"],
+                "completed upload was discarded by the shutdown return",
+            )
+            # The result that landed after the flag was set is not processed.
+            self.assertNotIn(slow, versioner.manifest["files"])
+        finally:
+            for fname in (good, slow):
+                if os.path.exists(fname):
+                    os.remove(fname)
+
     def test_checkout_interleaved(self):
         """Test that interleaved checkout works correctly."""
         # First upload some files
@@ -1537,99 +1578,6 @@ class TestS3LFS(unittest.TestCase):
                 )
 
     # -------------------------------------------------
-    # 17. MD5 Hashing Tests
-    # -------------------------------------------------
-    def test_md5_file_methods(self):
-        """Test all MD5 hashing methods produce the same result."""
-        # Test with the existing test file
-        md5_auto = self.versioner.md5_file(self.test_file, method="auto")
-        md5_mmap = self.versioner.md5_file(self.test_file, method="mmap")
-        md5_iter = self.versioner.md5_file(self.test_file, method="iter")
-
-        # All methods should produce the same hash
-        self.assertEqual(md5_auto, md5_mmap)
-        self.assertEqual(md5_auto, md5_iter)
-
-        # Test with known MD5 values (actual MD5 of "test content")
-        expected_md5 = "3de8f8b0dc94b8c2230fab9ec0ba0506"  # MD5 of "test content"
-        self.assertEqual(md5_auto, expected_md5)
-
-    def test_md5_cli_method(self):
-        """Test MD5 CLI method if available."""
-        # Test CLI method if available
-        if sys.platform.startswith("darwin") and shutil.which("md5"):
-            md5_cli = self.versioner.md5_file(self.test_file, method="cli")
-            md5_auto = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(md5_cli, md5_auto)
-        elif sys.platform.startswith("linux") and shutil.which("md5sum"):
-            md5_cli = self.versioner.md5_file(self.test_file, method="cli")
-            md5_auto = self.versioner.md5_file(self.test_file, method="auto")
-            self.assertEqual(md5_cli, md5_auto)
-        else:
-            # Test that CLI method raises error when not available
-            with self.assertRaises(RuntimeError):
-                self.versioner.md5_file(self.test_file, method="cli")
-
-    def test_md5_empty_file(self):
-        """Test MD5 hashing of empty files."""
-        empty_file = "empty_test.txt"
-        try:
-            # Create empty file
-            with open(empty_file, "w") as _:
-                pass
-
-            md5_hash = self.versioner.md5_file(empty_file)
-            # MD5 of empty file
-            self.assertEqual(md5_hash, "d41d8cd98f00b204e9800998ecf8427e")
-        finally:
-            if os.path.exists(empty_file):
-                os.remove(empty_file)
-
-    def test_md5_vs_sha256(self):
-        """Test that MD5 and SHA256 produce different hashes for the same file."""
-        md5_hash = self.versioner.md5_file(self.test_file)
-        sha256_hash = self.versioner.hash_file(self.test_file)
-
-        # They should be different
-        self.assertNotEqual(md5_hash, sha256_hash)
-
-        # But both should be consistent
-        self.assertEqual(md5_hash, self.versioner.md5_file(self.test_file))
-        self.assertEqual(sha256_hash, self.versioner.hash_file(self.test_file))
-
-    def test_md5_nonexistent_file(self):
-        """Test MD5 hashing of non-existent file."""
-        with self.assertRaises(FileNotFoundError):
-            self.versioner.md5_file("nonexistent_file.txt")
-
-    def test_md5_invalid_method(self):
-        """Test MD5 hashing with invalid method."""
-        with self.assertRaises(ValueError):
-            self.versioner.md5_file(self.test_file, method="invalid_method")
-
-    def test_md5_large_file_chunks(self):
-        """Test MD5 hashing with custom chunk size."""
-        # Create a larger file for testing
-        large_file = "large_test.txt"
-        try:
-            with open(large_file, "w") as f:
-                f.write("Large file content for testing chunked MD5 hashing.\n" * 1000)
-
-            # Test with different chunk sizes
-            md5_default = self.versioner._md5_file_iter(large_file)
-            md5_small_chunks = self.versioner._md5_file_iter(large_file, chunk_size=64)
-            md5_large_chunks = self.versioner._md5_file_iter(
-                large_file, chunk_size=8192
-            )
-
-            # All should produce the same result
-            self.assertEqual(md5_default, md5_small_chunks)
-            self.assertEqual(md5_default, md5_large_chunks)
-        finally:
-            if os.path.exists(large_file):
-                os.remove(large_file)
-
-    # -------------------------------------------------
     # 18. Error Handling and Edge Cases Tests
     # -------------------------------------------------
     def test_save_manifest_error_handling(self):
@@ -2034,12 +1982,6 @@ class TestS3LFS(unittest.TestCase):
         hash_result = self.versioner.hash_file(self.test_file, method="auto")
         self.assertIsInstance(hash_result, str)
         self.assertEqual(len(hash_result), 64)  # SHA256 hex length
-
-        # Test md5_file auto method selection
-        md5_result = self.versioner.md5_file(self.test_file, method="auto")
-        self.assertIsInstance(md5_result, str)
-        self.assertEqual(len(md5_result), 32)  # MD5 hex length
-
         # Test compress_file auto method selection
         compressed_path = self.versioner.compress_file(self.test_file, method="auto")
         try:
@@ -2063,11 +2005,6 @@ class TestS3LFS(unittest.TestCase):
                 hash_result,
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             )
-
-            # Test MD5 of empty file
-            md5_result = self.versioner.md5_file(empty_file)
-            self.assertEqual(md5_result, "d41d8cd98f00b204e9800998ecf8427e")
-
             # Test compressing empty file
             compressed_path = self.versioner.compress_file(empty_file)
             try:
@@ -2101,16 +2038,6 @@ class TestS3LFS(unittest.TestCase):
             self.assertIsInstance(result, str)
             self.assertEqual(len(result), 64)
 
-        # Test MD5 CLI method availability
-        if sys.platform.startswith("darwin") and shutil.which("md5"):
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertIsInstance(result, str)
-            self.assertEqual(len(result), 32)
-        elif sys.platform.startswith("linux") and shutil.which("md5sum"):
-            result = self.versioner.md5_file(self.test_file, method="cli")
-            self.assertIsInstance(result, str)
-            self.assertEqual(len(result), 32)
-
     # -------------------------------------------------
     # 19. Additional Edge Cases for Better Coverage
     # -------------------------------------------------
@@ -2137,17 +2064,6 @@ class TestS3LFS(unittest.TestCase):
             # Test with non-existent file should raise CalledProcessError
             with self.assertRaises(subprocess.CalledProcessError):
                 self.versioner._hash_file_cli("nonexistent_file.txt")
-
-    def test_md5_file_cli_error_handling(self):
-        """Test MD5 CLI error handling."""
-        if sys.platform.startswith("darwin") and shutil.which("md5"):
-            # Test with non-existent file should raise CalledProcessError
-            with self.assertRaises(subprocess.CalledProcessError):
-                self.versioner._md5_file_cli("nonexistent_file.txt")
-        elif sys.platform.startswith("linux") and shutil.which("md5sum"):
-            # Test with non-existent file should raise CalledProcessError
-            with self.assertRaises(subprocess.CalledProcessError):
-                self.versioner._md5_file_cli("nonexistent_file.txt")
 
     def test_compress_file_cli_error_handling(self):
         """Test CLI compression error handling."""
@@ -2317,12 +2233,6 @@ class TestS3LFS(unittest.TestCase):
         self.assertEqual(file_path, self.test_file)
         self.assertTrue(downloaded)
         self.assertGreater(bytes_transferred, 0)
-
-    def test_md5_file_iter_basic(self):
-        """Test _md5_file_iter method."""
-        md5_hash = self.versioner._md5_file_iter(self.test_file)
-        self.assertIsInstance(md5_hash, str)
-        self.assertEqual(len(md5_hash), 32)  # MD5 length
 
     def test_hash_with_progress_basic(self):
         """Test _hash_with_progress method."""
@@ -2568,20 +2478,6 @@ class TestS3LFS(unittest.TestCase):
         self.assertIsInstance(hash_result, str)
         self.assertEqual(len(hash_result), 64)  # SHA256 length
 
-    def test_md5_file_mmap_method(self):
-        """Test md5_file with mmap method specifically."""
-        md5_result = self.versioner.md5_file(self.test_file, method="mmap")
-        self.assertIsInstance(md5_result, str)
-        self.assertEqual(len(md5_result), 32)  # MD5 length
-
-    def test_md5_cli_method_missing_utility(self):
-        """Test MD5 CLI method when utility is not available."""
-        # Test the error case when no CLI utility is found
-        with patch("sys.platform", "unknown"), patch("shutil.which", return_value=None):
-            with self.assertRaises(RuntimeError) as cm:
-                self.versioner._md5_file_cli(self.test_file)
-            self.assertIn("No suitable MD5 CLI utility found", str(cm.exception))
-
     def test_compress_file_cli_method(self):
         """Test compress_file with CLI method if available."""
         if sys.platform.startswith("linux") and shutil.which("gzip"):
@@ -2619,15 +2515,18 @@ class TestS3LFS(unittest.TestCase):
                     os.remove("decompressed_cli_test.txt")
 
     def test_decompress_file_cli_failure(self):
-        """Test CLI decompression failure handling."""
+        """Test CLI decompression failure handling.
+
+        The unreachable `returncode != 0` branch behind `check=True` was
+        removed; the CLI's CalledProcessError propagates instead.
+        """
         if sys.platform.startswith("linux") and shutil.which("gzip"):
             # Mock subprocess to simulate failure
             with patch("subprocess.run") as mock_run:
-                mock_run.return_value.returncode = 1  # Non-zero return code
+                mock_run.side_effect = subprocess.CalledProcessError(1, ["gzip"])
 
-                with self.assertRaises(RuntimeError) as cm:
+                with self.assertRaises(subprocess.CalledProcessError):
                     self.versioner._decompress_file_cli("fake.gz", "output.txt")
-                self.assertIn("Failed to decompress file", str(cm.exception))
 
     def test_decompress_file_string_chunk_handling(self):
         """Test decompression with string chunk handling."""
@@ -2698,51 +2597,60 @@ class TestS3LFS(unittest.TestCase):
             if os.path.exists(large_file):
                 os.remove(large_file)
 
-    def test_upload_md5_mismatch_scenario(self):
-        """Test upload when MD5 mismatch occurs."""
-        # Upload file first
+    def test_upload_reuploads_on_size_mismatch(self):
+        """An object at the key whose ContentLength differs from the local
+        staged size must be re-uploaded. The dedup test is key + size."""
         self.versioner.upload(self.test_file)
 
-        # Mock head_object to return different ETag
-        with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
-            mock_head.return_value = {"ETag": '"different_md5_hash"'}
+        stored_size = self.s3.head_object(
+            Bucket=self.bucket_name,
+            Key=self.s3.list_objects_v2(Bucket=self.bucket_name)["Contents"][0]["Key"],
+        )["ContentLength"]
 
-            # Upload again - should detect mismatch and re-upload
+        # head_object reports the key occupied by a different size.
+        with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
+            mock_head.return_value = {"ContentLength": stored_size + 1}
+
+            # Upload again - should detect the size mismatch and re-upload
             with patch.object(
                 self.versioner._get_s3_client(), "upload_fileobj"
             ) as mock_upload:
                 self.versioner.upload(self.test_file)
-                # Should have called upload_fileobj due to MD5 mismatch
-                self.assertTrue(mock_upload.called)
+                self.assertTrue(
+                    mock_upload.called, "size mismatch must trigger a re-upload"
+                )
 
-    def test_upload_s3_skip_existing_file(self):
-        """Test upload skipping when file already exists with same MD5."""
-        # Upload file first
+    def test_upload_skips_on_size_match(self):
+        """An unchanged object already in S3 with the right size is skipped.
+
+        The skip decision is head_object's ContentLength vs the local size;
+        the ETag is irrelevant (for multipart uploads it is not an MD5, so
+        an ETag comparison can never match a chunked object). The
+        multipart-style ETag here makes the old MD5-vs-ETag rule fail,
+        proving the decision is made on size alone.
+        """
         self.versioner.upload(self.test_file)
 
-        # Calculate the MD5 of the form upload will actually stage:
-        # adaptive compression stores this tiny file raw.
-        if self.versioner._should_compress(self.test_file):
-            compressed = self.versioner.compress_file(self.test_file)
-            try:
-                staged_bytes = compressed.read_bytes()
-            finally:
-                compressed.unlink()
-        else:
-            staged_bytes = Path(self.test_file).read_bytes()
-        actual_md5 = hashlib.md5(staged_bytes).hexdigest()
+        stored_size = self.s3.head_object(
+            Bucket=self.bucket_name,
+            Key=self.s3.list_objects_v2(Bucket=self.bucket_name)["Contents"][0]["Key"],
+        )["ContentLength"]
 
-        # Mock head_object to return same ETag
         with patch.object(self.versioner._get_s3_client(), "head_object") as mock_head:
-            mock_head.return_value = {"ETag": f'"{actual_md5}"'}
+            mock_head.return_value = {
+                "ETag": '"0123456789abcdef0123456789abcdef-4"',  # multipart form
+                "ContentLength": stored_size,
+            }
 
-            # Upload again - should skip
+            # Upload again - should skip on the matching size
             with patch.object(
                 self.versioner._get_s3_client(), "upload_fileobj"
             ) as mock_upload:
                 self.versioner.upload(self.test_file)
-                # Should NOT have called upload_fileobj due to matching MD5
-                self.assertFalse(mock_upload.called)
+                self.assertFalse(
+                    mock_upload.called,
+                    "object with matching size must not be re-uploaded",
+                )
 
     def test_upload_cleanup_on_os_error(self):
         """Test upload cleanup when OSError occurs during file removal."""
@@ -2812,22 +2720,13 @@ class TestS3LFS(unittest.TestCase):
                 return_value=mock_paginator,
             ),
             patch.object(
-                self.versioner._get_s3_client(), "delete_object"
+                self.versioner._get_s3_client(), "delete_objects"
             ) as mock_delete,
         ):
             self.versioner.cleanup_s3(force=True)
             # Should only try to delete the valid key, not the short one
             mock_delete.assert_called_once()
-
-    def test_track_modified_files_missing_file(self):
-        """Test track_modified_files when a file goes missing."""
-        # Add file to manifest
-        self.versioner.manifest["files"]["missing_file.txt"] = "old_hash"
-
-        # track_modified_files should handle missing files gracefully
-        # This will raise an exception currently - the method doesn't handle missing files
-        with self.assertRaises(FileNotFoundError):
-            self.versioner.track_modified_files()
+            self.assertEqual(len(mock_delete.call_args.kwargs["Delete"]["Objects"]), 1)
 
     def test_parallel_upload_with_shutdown_signal(self):
         """Test parallel_upload handling shutdown signal."""
@@ -3097,39 +2996,6 @@ class TestS3LFS(unittest.TestCase):
             # Should report no files found
             self.versioner.cleanup_s3(force=True)
 
-    def test_track_modified_files_with_changes(self):
-        """Test track_modified_files when files have actually changed."""
-        # Upload file first
-        self.versioner.upload(self.test_file)
-
-        # Modify the file
-        with open(self.test_file, "a") as f:
-            f.write("\nModified content")
-
-        # Mock parallel_upload to avoid actual upload
-        with patch.object(self.versioner, "parallel_upload") as mock_upload:
-            self.versioner.track_modified_files()
-            # Should have called parallel_upload
-            self.assertTrue(mock_upload.called)
-
-    def test_track_modified_files_no_changes(self):
-        """Test track_modified_files when no files have changed."""
-        # Upload file first
-        self.versioner.upload(self.test_file)
-
-        # Get the current hash and ensure manifest is correct
-        current_hash = self.versioner.hash_file(self.test_file)
-        # The bug is in track_modified_files line 763 - it uses manifest.get(file) instead of manifest["files"].get(file)
-        # So we need to also set the hash at the top level for this test
-        # Note: This is testing a bug that has been fixed, but keeping the test structure
-        self.versioner.manifest["files"][self.test_file] = current_hash
-
-        # Mock parallel_upload to verify it's not called
-        with patch.object(self.versioner, "parallel_upload") as mock_upload:
-            self.versioner.track_modified_files()
-            # Should NOT have called parallel_upload
-            self.assertFalse(mock_upload.called)
-
     def test_parallel_upload_exception_handling(self):
         """Test parallel_upload exception handling."""
         # Mock upload to raise an exception
@@ -3170,12 +3036,6 @@ class TestS3LFS(unittest.TestCase):
             self.versioner.hash_file(self.test_file, method="unsupported")
         self.assertIn("Unsupported hashing method", str(cm.exception))
 
-    def test_md5_file_unsupported_method(self):
-        """Test md5_file with unsupported method."""
-        with self.assertRaises(ValueError) as cm:
-            self.versioner.md5_file(self.test_file, method="unsupported")
-        self.assertIn("Unsupported MD5 hashing method", str(cm.exception))
-
     def test_compress_file_unsupported_method(self):
         """Test compress_file with unsupported method."""
         with self.assertRaises(ValueError) as cm:
@@ -3197,12 +3057,6 @@ class TestS3LFS(unittest.TestCase):
         """Test hash_file with nonexistent file."""
         with self.assertRaises(FileNotFoundError) as cm:
             self.versioner.hash_file("nonexistent_file.txt")
-        self.assertIn("File not found", str(cm.exception))
-
-    def test_md5_file_nonexistent_file(self):
-        """Test md5_file with nonexistent file."""
-        with self.assertRaises(FileNotFoundError) as cm:
-            self.versioner.md5_file("nonexistent_file.txt")
         self.assertIn("File not found", str(cm.exception))
 
     def test_compress_file_nonexistent_file(self):

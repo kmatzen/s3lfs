@@ -27,28 +27,34 @@ runs:
   steps:
     - name: Install s3lfs
       shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
       run: |
-        if [ "${{ inputs.version }}" = "latest" ]; then
+        if [ "$VERSION" = "latest" ]; then
           pip install s3lfs
         else
-          pip install "s3lfs==${{ inputs.version }}"
+          pip install "s3lfs==$VERSION"
         fi
         echo "s3lfs $(s3lfs --version 2>/dev/null || echo 'installed')"
 
     - name: Checkout s3lfs files
       if: inputs.checkout != 'none'
       shell: bash
+      env:
+        CHECKOUT: ${{ inputs.checkout }}
+        NO_SIGN: ${{ inputs.no-sign-request }}
+        ACCEL: ${{ inputs.use-acceleration }}
       run: |
         FLAGS=""
-        if [ "${{ inputs.no-sign-request }}" = "true" ]; then
+        if [ "$NO_SIGN" = "true" ]; then
           FLAGS="$FLAGS --no-sign-request"
         fi
-        if [ "${{ inputs.use-acceleration }}" = "true" ]; then
+        if [ "$ACCEL" = "true" ]; then
           FLAGS="$FLAGS --use-acceleration"
         fi
 
-        if [ "${{ inputs.checkout }}" = "all" ]; then
+        if [ "$CHECKOUT" = "all" ]; then
           s3lfs checkout --all $FLAGS
         else
-          s3lfs checkout "${{ inputs.checkout }}" $FLAGS
+          s3lfs checkout "$CHECKOUT" $FLAGS
         fi

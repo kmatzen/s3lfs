@@ -65,6 +65,13 @@ class TestGCInflightRegistry(unittest.TestCase):
             client.delete_object.side_effect = lambda Bucket=None, Key=None, **kw: (
                 store.pop(Key, None)
             )
+
+            def delete_objects(Bucket=None, Delete=None, **kw):
+                for obj in Delete["Objects"]:
+                    store.pop(obj["Key"], None)
+                return {"Deleted": [{"Key": o["Key"]} for o in Delete["Objects"]]}
+
+            client.delete_objects.side_effect = delete_objects
             return client
 
         with patch("boto3.client"):

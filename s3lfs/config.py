@@ -50,7 +50,7 @@ def load_config(git_root):
     path = find_config(git_root)
     if path is None:
         return {}
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
     unknown = sorted(set(data) - set(DEFAULTS))
@@ -61,21 +61,3 @@ def load_config(git_root):
         )
 
     return {k: data[k] for k in DEFAULTS if k in data}
-
-
-def apply_config(config, cli_kwargs):
-    """Merge *config* (from file) with *cli_kwargs* (from CLI flags).
-
-    CLI flags take precedence.  For boolean flags Click always supplies a
-    value (True/False), so we treat ``False`` the same as "not supplied"
-    — only an explicit ``True`` from the CLI overrides the config.
-
-    Returns a new dict suitable for passing to ``S3LFS()``.
-    """
-    merged = dict(DEFAULTS)
-    merged.update(config)
-    for key in DEFAULTS:
-        cli_val = cli_kwargs.get(key)
-        if cli_val:
-            merged[key] = cli_val
-    return merged

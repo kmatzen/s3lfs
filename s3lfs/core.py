@@ -18,8 +18,10 @@ import time
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional, Union
+from urllib.parse import quote, unquote
 from uuid import uuid4
 
 import portalocker
@@ -43,10 +45,52 @@ DEFAULT_THREAD_POOL_SIZE = 8  # Fallback when os.cpu_count() is unavailable
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 
+# cleanup_s3 leaves unreferenced objects alone while their LastModified is
+# within this window. The lock file and the in-flight registry live in the
+# local working copy, so they give no protection against a cleanup run on
+# another machine, and a collaborator's chunked upload is unreferenced (the
+# manifest entry is published last) for as long as the transfer takes. Age
+# is the only cross-machine signal that a large object may still be landing.
+CLEANUP_GRACE_PERIOD = timedelta(hours=24)
+
 # Sharded manifests keep entries in per-directory files under this directory,
 # beside the root manifest.
 MANIFEST_SHARD_DIR = ".s3lfs_manifest"
 MANIFEST_ROOT_SHARD = "_root"
+
+# Characters S3LFS._shard_path leaves literal in a shard file name:
+# everything str.isalnum() (the set the original codec kept literal, so
+# shard files already on disk keep their names) plus "-_.". Used as
+# quote()'s safe set for names with code points above U+00FF; "~" is
+# not in the set -- the original codec escaped it -- and is re-escaped
+# by hand because quote() treats it as always-safe.
+_SHARD_NAME_SAFE = "-_." + "".join(
+    ch for ch in map(chr, range(0x30000)) if ch.isalnum()
+)
+# Characters the original codec escaped in a name encodable as latin-1:
+# everything that is not alphanumeric (\w is isalnum plus "_") and not
+# one of "-" or ".".
+_SHARD_LEGACY_ESCAPE = re.compile(r"[^\w\-.]")
+# quote() emits UTF-8 percent-escapes in uppercase hex; the latin-1
+# encoding used for names <= U+00FF is emitted lowercase, so one
+# uppercase escape is enough to identify a UTF-8 encoded shard name.
+_SHARD_UTF8_ESCAPE = re.compile(r"%(?:[A-F][0-9A-F]|[0-9A-F][A-F])")
+
+
+def _shard_stem_legacy(shard):
+    """The shard file name written by s3lfs up to 0.6.3.
+
+    Kept verbatim so an existing working copy can still find its shards.
+    `_shard_path` now encodes names that codec corrupted -- a code point
+    above U+00FF escaped in two hex digits -- so those repositories have
+    the old name on disk and the new name nowhere. Encoding is
+    deterministic, so the old name is reproduced from the directory name
+    directly; no decoding, and so no ambiguity, is involved.
+    """
+    return "".join(
+        ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
+    )
+
 
 # Bulk-absence guard for deletion detection: more than this many missing
 # files, and more than this fraction of those checked, reads as a wiped
@@ -171,14 +215,12 @@ class ShardedFiles(MutableMapping):
                 self._owner._write_atomic(path, entries)
             else:
                 path.unlink(missing_ok=True)
+            # Retire the pre-codec-fix name; a leftover would keep a stale
+            # second copy of these entries in git history.
+            legacy = self._owner._shard_path_legacy(shard)
+            if legacy != path and legacy.is_file():
+                legacy.unlink()
         self._dirty.clear()
-
-    def as_dict(self):
-        self._ensure_all()
-        merged: dict = {}
-        for entries in self._loaded.values():
-            merged.update(entries)
-        return merged
 
 
 class _HashingWriter:
@@ -570,7 +612,9 @@ class S3LFS:
         """
         Context manager for acquiring and releasing the file-based lock using portalocker.
         """
-        lock = open(self._lock_file, "w")  # Open the lock file in write mode
+        lock = open(
+            self._lock_file, "w", encoding="utf-8"
+        )  # Open the lock file in write mode
         try:
             portalocker.lock(lock, portalocker.LOCK_EX)  # Acquire an exclusive lock
             yield lock  # Provide the lock to the context
@@ -588,7 +632,7 @@ class S3LFS:
         if not self._inflight_file.exists():
             return {}
         try:
-            with open(self._inflight_file, "r") as f:
+            with open(self._inflight_file, "r", encoding="utf-8") as f:
                 data = yaml_load(f) or {}
             claims = data.get("claims", {})
             return claims if isinstance(claims, dict) else {}
@@ -606,7 +650,7 @@ class S3LFS:
         temp_file = self._inflight_file.with_name(
             f"{self._inflight_file.name}.{uuid4().hex}.tmp"
         )
-        with open(temp_file, "w") as f:
+        with open(temp_file, "w", encoding="utf-8") as f:
             yaml_dump({"claims": claims}, f)
         temp_file.replace(self._inflight_file)
 
@@ -735,6 +779,198 @@ class S3LFS:
             client.delete_object(Bucket=self.bucket_name, Key=key)
             print(f"File removed from S3: s3://{self.bucket_name}/{key}")
 
+    # Probe outcome codes for _probe_object_readable.
+    RESTORE_STATUS_READABLE = "readable"
+    RESTORE_STATUS_ARCHIVED = "archived"
+    RESTORE_STATUS_MISSING = "missing"
+
+    def _probe_object_readable(self, key):
+        """Can this object serve a ranged GET right now?
+
+        Returns one of the RESTORE_STATUS_* codes. A ranged read of one
+        byte is used because it answers the question -- can the object be
+        read -- without transferring it, and S3 refuses it with
+        InvalidObjectState while the object sits in an archive tier of
+        S3 Intelligent-Tiering.
+        """
+        from botocore.exceptions import ClientError
+
+        client = self._get_s3_client()
+        try:
+            client.get_object(Bucket=self.bucket_name, Key=key, Range="bytes=0-0")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "InvalidObjectState":
+                return self.RESTORE_STATUS_ARCHIVED
+            if code == "NoSuchKey":
+                return self.RESTORE_STATUS_MISSING
+            raise
+        return self.RESTORE_STATUS_READABLE
+
+    def _request_restore(self, key):
+        """Ask S3 to restore one archived object.
+
+        Returns True when the object is already readable, a restore is
+        in flight (whether ours or a concurrent one), or one was
+        requested. Raises for a missing object.
+        """
+        from botocore.exceptions import ClientError
+
+        client = self._get_s3_client()
+        status = self._probe_object_readable(key)
+        if status == self.RESTORE_STATUS_READABLE:
+            return True
+        if status == self.RESTORE_STATUS_MISSING:
+            raise RuntimeError(f"Object not found in S3: {key}")
+        try:
+            client.restore_object(
+                Bucket=self.bucket_name,
+                Key=key,
+                RestoreRequest={"GlacierJobParameters": {"Tier": "Standard"}},
+            )
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("InvalidArgument", "RestoreAlreadyInProgress"):
+                # A restore is already in progress, either ours or a
+                # concurrent caller's. S3 reports this as InvalidArgument
+                # on some tiers and as RestoreAlreadyInProgress on
+                # Intelligent-Tiering archive tiers; either way the object
+                # is already queued, so poll for readability as normal.
+                print(f"Restore already in progress: {key}")
+                return True
+            raise
+        return True
+
+    def restore(self, files, timeout=None, interval=20):
+        """Restore stored objects that have aged into archive tiers.
+
+        :param files: dict of manifest_key -> file_hash, or iterable of
+            (manifest_key, file_hash) pairs, as in find_missing_assets.
+        :param timeout: seconds to keep polling before giving up; None
+            means wait indefinitely. Deep Archive restores take roughly
+            12 hours, so the default deliberately does not give up.
+        :param interval: seconds between polls.
+        :return: number of objects that were never readable (missing or
+            still archived when the timeout was hit), or a negative count
+            when interrupted.
+
+        Every chunk of a chunked object is probed and restored separately,
+        because each is its own S3 object with its own state.
+        """
+        items = list(files.items()) if hasattr(files, "items") else list(files)
+        if not items:
+            print("Nothing to restore.")
+            return 0
+
+        # Resolve every manifest entry to its stored object(s) first: a
+        # missing or incomplete object is a failure either way, and it is
+        # not one a restore can fix. `targets` is a dict keyed by
+        # (manifest_key, key) and `missing` a set so the polling loop is
+        # linear: a list `.remove` / `in` scan per resolved object is
+        # quadratic, and Deep Archive restores run it every poll interval
+        # over tens of thousands of objects.
+        targets: dict = {}  # (manifest_key, key) -> None
+        problems: list = []
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._discover_chunks_for_file, mk, fh): (mk, fh)
+                for mk, fh in items
+            }
+            for future in as_completed(futures):
+                mk, fh = futures[future]
+                try:
+                    chunks = future.result()
+                except Exception as e:
+                    print(f"Error resolving {mk}: {e}")
+                    problems.append(mk)
+                    continue
+                targets.update({(mk, c["s3_key"]): None for c in chunks})
+
+        if not targets:
+            if problems:
+                print(f"Error: no stored objects found for {len(problems)} file(s).")
+            return len(problems)
+
+        print(f"Probing readability of {len(targets)} object(s)...")
+        missing = set()
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._probe_object_readable, key): (mk, key)
+                for mk, key in targets
+            }
+            for future in as_completed(futures):
+                mk, key = futures[future]
+                try:
+                    status = future.result()
+                except Exception as e:
+                    print(f"Error probing {key}: {e}")
+                    status = self.RESTORE_STATUS_ARCHIVED  # re-probe in the loop
+                if status == self.RESTORE_STATUS_READABLE:
+                    print(f"Already readable: {mk}")
+                    targets.pop((mk, key), None)
+                elif status == self.RESTORE_STATUS_MISSING:
+                    print(f"Missing from S3: {mk} ({key})")
+                    missing.add(mk)
+                    targets.pop((mk, key), None)
+
+        if not targets:
+            if missing:
+                print(
+                    f"Error: {len(missing)} of {len(items)} file(s) have no readable object in S3."
+                )
+            return len(missing)
+
+        print(f"Requesting restore of {len(targets)} archived object(s)...")
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {
+                pool.submit(self._request_restore, key): (mk, key)
+                for mk, key in targets
+            }
+            for future in as_completed(futures):
+                mk, key = futures[future]
+                try:
+                    future.result()
+                    print(f"Restore requested: {mk}")
+                except Exception as e:
+                    print(f"Error restoring {key}: {e}")
+                    missing.add(mk)
+                    targets.pop((mk, key), None)
+
+        if not targets:
+            if missing:
+                print(f"Error: {len(missing)} file(s) could not be restored.")
+            return len(missing)
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            still = []
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = {
+                    pool.submit(self._probe_object_readable, key): (mk, key)
+                    for mk, key in targets
+                }
+                for future in as_completed(futures):
+                    mk, key = futures[future]
+                    try:
+                        if future.result() != self.RESTORE_STATUS_READABLE:
+                            still.append((mk, key))
+                    except Exception as e:
+                        print(f"Error probing {key}: {e}")
+                        still.append((mk, key))  # transient; try again
+            if not still:
+                print(f"All {len(targets)} object(s) are readable again.")
+                return len(missing)
+            if deadline is not None and time.monotonic() >= deadline:
+                for mk, key in still:
+                    missing.add(mk)
+                print(
+                    f"Error: timeout after {timeout}s with {len(still)} object(s) "
+                    "still archived."
+                )
+                return len(missing)
+            print(f"{len(still)} object(s) still archived; waiting {interval}s...")
+            time.sleep(interval)
+
     def _live_asset_keys(self):
         """Base keys reachable from the manifest. Caller must hold the lock."""
         return {
@@ -838,7 +1074,6 @@ class S3LFS:
     def initialize_repo(self):
         """
         Initialize the repository with a bucket name and a repo-specific prefix.
-        Also updates .gitignore to exclude S3LFS cache files.
 
         :param bucket_name: Name of the S3 bucket to use
         :param repo_prefix: A unique prefix for this repository in the bucket
@@ -853,73 +1088,12 @@ class S3LFS:
                 self.manifest["endpoint_url"] = str(self.endpoint_url)
             self.save_manifest()
 
-        # Update .gitignore to exclude cache files
-        self._update_gitignore()
-
         print("Successfully initialized S3LFS with:")
         print(f"   Bucket Name: {self.bucket_name}")
         print(f"   Repo Prefix: {self.repo_prefix}")
         if self.endpoint_url:
             print(f"   Endpoint URL: {self.endpoint_url}")
         print(f"Manifest file saved as {self.manifest_file.name}")
-
-    def _update_gitignore(self):
-        """
-        Update .gitignore to exclude S3LFS cache files and temporary directories.
-        Creates .gitignore if it doesn't exist, or appends to existing one.
-        """
-        gitignore_path = Path(".gitignore")
-
-        # S3LFS patterns to add
-        s3lfs_patterns = [
-            "",  # Empty line for separation
-            "# S3LFS cache and temporary files - should not be version controlled",
-            "*_cache.json",
-            "*_cache.yaml",
-            ".s3lfs_temp/",
-            "*.s3lfs.lock",
-        ]
-
-        # Check if .gitignore exists and read current content
-        existing_content = []
-        if gitignore_path.exists():
-            with open(gitignore_path, "r") as f:
-                existing_content = [line.rstrip() for line in f.readlines()]
-
-        # Check which patterns are already present
-        patterns_to_add = []
-        for pattern in s3lfs_patterns:
-            if pattern.startswith("#") or pattern == "":
-                # Always add comments and empty lines for structure
-                patterns_to_add.append(pattern)
-            elif pattern not in existing_content:
-                patterns_to_add.append(pattern)
-
-        # Only update if we have patterns to add
-        if any(p for p in patterns_to_add if not p.startswith("#") and p != ""):
-            # Check if we already have S3LFS section
-            has_s3lfs_section = any("S3LFS" in line for line in existing_content)
-
-            if not has_s3lfs_section:
-                # Add all patterns including header
-                with open(gitignore_path, "a") as f:
-                    for pattern in patterns_to_add:
-                        f.write(f"{pattern}\n")
-                print("Updated .gitignore to exclude S3LFS cache files")
-            else:
-                # Only add missing patterns (without header)
-                missing_patterns = [
-                    p for p in patterns_to_add if not p.startswith("#") and p != ""
-                ]
-                if missing_patterns:
-                    with open(gitignore_path, "a") as f:
-                        for pattern in missing_patterns:
-                            f.write(f"{pattern}\n")
-                    print(
-                        f"Added {len(missing_patterns)} missing S3LFS patterns to .gitignore"
-                    )
-        else:
-            print(".gitignore already contains S3LFS cache exclusions")
 
     @property
     def shard_dir(self):
@@ -942,29 +1116,52 @@ class S3LFS:
         # Shard names come from path components, so they can contain
         # anything a directory name can. Percent-encode everything outside
         # a conservative set rather than trusting them as filenames.
-        safe = "".join(
-            ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
-        )
-        return self.shard_dir / f"{safe}.yaml"
+        #
+        # Names encodable as latin-1 keep the original codec's exact
+        # bytes: every escaped character is '%' + the lowercase hex of
+        # its code point, one byte for code points <= U+00FF, so shard
+        # files already on disk for ASCII and Latin-1 directories keep
+        # the name they have always had. A name with a code point above
+        # U+00FF -- which that codec truncated to two hex digits,
+        # corrupting the name it encoded -- is percent-encoded as UTF-8
+        # instead; quote() emits those escapes in uppercase, which is
+        # how shard_names() tells the two encodings apart.
+        try:
+            shard.encode("latin-1")
+        except UnicodeEncodeError:
+            stem = quote(shard, safe=_SHARD_NAME_SAFE).replace("~", "%7e")
+        else:
+            stem = _SHARD_LEGACY_ESCAPE.sub(lambda m: f"%{ord(m.group(0)):02x}", shard)
+        return self.shard_dir / f"{stem}.yaml"
 
-    def _load_shards(self):
-        """Merge every shard into one files mapping (eager; tests use it)."""
-        files: dict = {}
-        for shard in self.shard_names():
-            files.update(self._read_shard(shard))
-        return files
+    def _shard_path_legacy(self, shard):
+        """Where s3lfs up to 0.6.3 wrote this shard.
+
+        A read-only fallback for repositories sharded before the codec fix.
+        For the names that fix changed the old name cannot be recovered by
+        decoding -- that is what made those entries vanish -- so it is
+        re-encoded here.
+        """
+        return self.shard_dir / f"{_shard_stem_legacy(shard)}.yaml"
 
     def _read_shard(self, shard):
         """Parse one shard file. Missing reads as empty."""
         path = self._shard_path(shard)
         if not path.is_file():
-            return {}
+            legacy = self._shard_path_legacy(shard)
+            if legacy == path or not legacy.is_file():
+                return {}
+            path = legacy
+        return self._read_shard_file(path)
+
+    def _read_shard_file(self, path):
+        """Parse the shard file at this path."""
         try:
-            with open(path, "r") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = yaml_load(f) or {}
         except yaml.YAMLError as e:
             hint = ""
-            if "<<<<<<<" in path.read_text(errors="replace"):
+            if "<<<<<<<" in path.read_text(encoding="utf-8", errors="replace"):
                 hint = (
                     " It contains merge conflict markers -- resolve the "
                     "conflict, or run 's3lfs install' to register the "
@@ -984,36 +1181,29 @@ class S3LFS:
         names = []
         for path in sorted(self.shard_dir.glob("*.yaml")):
             stem = path.stem
-            # Reverse the percent-encoding applied by _shard_path.
-            out, i = [], 0
-            while i < len(stem):
-                if stem[i] == "%" and i + 2 < len(stem) + 1:
-                    try:
-                        out.append(chr(int(stem[i + 1 : i + 3], 16)))
-                        i += 3
-                        continue
-                    except ValueError:
-                        pass
-                out.append(stem[i])
-                i += 1
-            names.append("".join(out))
+            # Reverse the percent-encoding applied by _shard_path. An
+            # uppercase-hex escape marks the UTF-8 encoding used for code
+            # points above U+00FF; every other stem -- including every
+            # name the original codec wrote -- is latin-1 code-point
+            # escapes, and decodes to the name it has always decoded to.
+            if _SHARD_UTF8_ESCAPE.search(stem):
+                names.append(unquote(stem))
+            else:
+                names.append(unquote(stem, encoding="latin-1"))
         return names
-
-    def files_in_shards(self, shards):
-        """Entries from just these shards, leaving the rest unread."""
-        files = {}
-        for shard in shards:
-            files.update(self._read_shard(shard))
-        return files
 
     def _write_atomic(self, path, data):
         temp_file = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         try:
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 yaml_dump(data, f, default_flow_style=False, sort_keys=True)
             temp_file.replace(path)
         except Exception as e:
-            print(f"Failed to write {path}: {e}")
+            # Propagate: a manifest/shard write that silently failed leaves
+            # S3 and the index out of sync (the objects become unreferenced
+            # garbage to the next cleanup, and the command exits 0).
+            raise RuntimeError(f"Failed to write {path}: {e}") from e
+        finally:
             if temp_file.exists():
                 temp_file.unlink()
 
@@ -1026,7 +1216,7 @@ class S3LFS:
         self._loaded_shards = {}
         if self.manifest_file.exists():
             try:
-                with open(self.manifest_file, "r") as f:
+                with open(self.manifest_file, "r", encoding="utf-8") as f:
                     # Detect format based on extension
                     if self.manifest_file.suffix in [".yaml", ".yml"]:
                         self.manifest = yaml_load(f) or {"files": {}}
@@ -1037,7 +1227,9 @@ class S3LFS:
                 # teammate who has not run 's3lfs install' will hit. A bare
                 # parser traceback does not tell them that.
                 hint = ""
-                if "<<<<<<<" in self.manifest_file.read_text(errors="replace"):
+                if "<<<<<<<" in self.manifest_file.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
                     hint = (
                         " It contains merge conflict markers -- resolve the "
                         "conflict, or run 's3lfs install' to register the "
@@ -1086,7 +1278,7 @@ class S3LFS:
         )
         try:
             # Write the manifest to a temporary file
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 # Detect format based on extension
                 if self.manifest_file.suffix in [".yaml", ".yml"]:
                     yaml_dump(
@@ -1098,7 +1290,10 @@ class S3LFS:
             # Atomically move the temporary file to the target location
             temp_file.replace(self.manifest_file)
         except Exception as e:
-            print(f"Failed to save manifest: {e}")
+            # Propagate: the caller (track, checkout, ...) must not exit 0
+            # with bytes in S3 and an unchanged index. See _write_atomic.
+            raise RuntimeError(f"Failed to save manifest: {e}") from e
+        finally:
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
@@ -1132,7 +1327,7 @@ class S3LFS:
             return
 
         try:
-            with open(self.cache_file, "r") as f:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
                     self.hash_cache = yaml_load(f) or {}
                 else:
@@ -1158,7 +1353,7 @@ class S3LFS:
             f"{self.cache_file.name}.{uuid4().hex}.tmp"
         )
         try:
-            with open(temp_file, "w") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 if self.cache_file.suffix in [".yaml", ".yml"]:
                     yaml_dump(
                         self.hash_cache, f, default_flow_style=False, sort_keys=True
@@ -1257,6 +1452,21 @@ class S3LFS:
             return True
         return (written_at - mtime) < self.MTIME_GRANULARITY_SECONDS
 
+    def _cache_key(self, file_path: Union[str, Path]) -> str:
+        """Canonical hash-cache key for a file path.
+
+        Every producer and consumer of the hash cache speaks manifest keys;
+        keying some entries by filesystem path made every cross-command
+        lookup miss (a checkout-style writer stored /abs/repo/data.txt,
+        a status-style reader looked up data.txt) and stored the same file
+        under two keys forever. Paths outside the repository have no
+        manifest key and keep their posix path.
+        """
+        try:
+            return self._get_manifest_key(file_path)
+        except ValueError:
+            return str(Path(file_path).as_posix())
+
     def hash_file_cached(
         self, file_path: Union[str, Path], method: str = "auto"
     ) -> str:
@@ -1270,7 +1480,7 @@ class S3LFS:
         :return: The computed SHA-256 hash as a hexadecimal string.
         """
         file_path = Path(file_path)
-        file_path_str = str(file_path.as_posix())
+        file_path_str = self._cache_key(file_path)
 
         # Ensure the file exists
         if not file_path.exists():
@@ -1359,12 +1569,19 @@ class S3LFS:
         :return: Dictionary with file status information.
         """
         file_path = Path(file_path)
-        file_path_str = str(file_path.as_posix())
+        file_path_str = self._cache_key(file_path)
 
-        if not file_path.exists():
+        # A manifest key is repo-relative, so a bare Path() resolves it
+        # against the CWD: from a subdirectory every file looked missing.
+        filesystem_path = (
+            file_path
+            if file_path.is_absolute()
+            else self.path_resolver.to_filesystem_path(str(file_path))
+        )
+        if not filesystem_path.exists():
             return {"exists": False, "cached": False}
 
-        stat = file_path.stat()
+        stat = filesystem_path.stat()
         current_metadata = {
             "size": stat.st_size,
             "mtime": stat.st_mtime,
@@ -1415,7 +1632,7 @@ class S3LFS:
                 print("Cleared all hash cache entries.")
             else:
                 # Clear cache for specific file
-                file_path_str = str(Path(file_path).as_posix())
+                file_path_str = self._cache_key(file_path)
                 if file_path_str in self.hash_cache:
                     del self.hash_cache[file_path_str]
                     self._cache_dirty = True
@@ -1429,6 +1646,7 @@ class S3LFS:
         This method is multi-process safe using file-based locking.
 
         :param max_age_days: Remove cache entries older than this many days.
+        :return: Number of entries dropped.
         """
         with self._lock_context():
             self.load_cache()  # Get latest state
@@ -1439,8 +1657,16 @@ class S3LFS:
             stale_entries = []
 
             for file_path_str, cached_data in self.hash_cache.items():
-                # Check if file still exists
-                if not Path(file_path_str).exists():
+                # Entries are manifest keys (repo-relative), so resolve
+                # them through the path resolver; Path(key).exists() would
+                # judge every entry missing when run from a subdirectory
+                # and wipe the cache.
+                try:
+                    fs_path = self.path_resolver.to_filesystem_path(file_path_str)
+                except ValueError:
+                    # Legacy entry keyed by an absolute filesystem path.
+                    fs_path = Path(file_path_str)
+                if not fs_path.exists():
                     stale_entries.append(file_path_str)
                     continue
 
@@ -1457,6 +1683,8 @@ class S3LFS:
             if stale_entries:
                 print(f"Cleaned up {len(stale_entries)} stale cache entries.")
                 self.save_cache()
+
+            return len(stale_entries)
 
     def _check_cache_hit(self, file_path_str, current_metadata):
         """Check if the in-memory cache has a valid entry for this file.
@@ -1816,6 +2044,7 @@ class S3LFS:
             capture_output=True,
             text=True,
             check=True,
+            encoding="utf-8",
         )
         # GNU coreutils prefixes the whole line with a backslash when the
         # filename needed escaping -- which every Windows path does, since
@@ -1827,95 +2056,6 @@ class S3LFS:
             # Unparseable tool output must not become an object key.
             return self._hash_file_mmap(file_path)
         return digest
-
-    def md5_file(self, file_path: Union[str, Path], method: str = "auto") -> str:
-        """
-        Compute an MD5 hash of the file using its content.
-        Supports multiple hashing methods for performance optimization.
-
-        :param file_path: Path to the file to hash.
-        :param method: Hashing method to use. Options are:
-                    - "auto": Automatically select the best method.
-                    - "mmap": Use memory-mapped files (default for non-empty files).
-                    - "iter": Use an iterative read approach (fallback for empty files).
-                    - "cli": Use the `md5sum` CLI utility (POSIX only).
-        :return: The computed MD5 hash as a hexadecimal string.
-        """
-        file_path = Path(file_path)
-
-        # Ensure the file exists
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        # Automatically select the best method if "auto" is specified
-        if method == "auto":
-            if file_path.stat().st_size == 0:  # Empty file
-                method = "iter"
-            elif sys.platform.startswith("linux") and shutil.which("md5sum"):
-                method = "cli"
-            elif sys.platform.startswith("darwin") and shutil.which("md5"):
-                method = "cli"
-            else:
-                method = "mmap"
-
-        # Use the selected hashing method
-        if method == "mmap":
-            return self._md5_file_mmap(file_path)
-        elif method == "iter":
-            return self._md5_file_iter(file_path)
-        elif method == "cli":
-            return self._md5_file_cli(file_path)
-        else:
-            raise ValueError(f"Unsupported MD5 hashing method: {method}")
-
-    def _md5_file_mmap(self, file_path):
-        """
-        Compute the MD5 hash using memory-mapped files.
-        """
-        hasher = hashlib.md5()
-        with open(file_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                hasher.update(mm)
-        return hasher.hexdigest()
-
-    def _md5_file_iter(self, file_path, chunk_size=DEFAULT_BUFFER_SIZE):
-        """
-        Compute the MD5 hash by iteratively reading the file in chunks.
-        """
-        hasher = hashlib.md5()
-        with open(file_path, "rb") as f:
-            while chunk := f.read(chunk_size):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-
-    def _md5_file_cli(self, file_path):
-        """
-        Compute the MD5 hash using the appropriate CLI utility (md5sum on Linux, md5 on macOS).
-        """
-        if sys.platform.startswith("linux") and shutil.which("md5sum"):
-            # Linux: use md5sum
-            result = subprocess.run(
-                ["md5sum", str(file_path)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            # Same coreutils backslash-escape prefix as sha256sum.
-            digest = result.stdout.split()[0].lstrip("\\").lower()
-            if len(digest) != 32 or any(c not in "0123456789abcdef" for c in digest):
-                return self._md5_file_mmap(file_path)
-            return digest
-        elif sys.platform.startswith("darwin") and shutil.which("md5"):
-            # macOS: use md5 -r (for raw output similar to md5sum)
-            result = subprocess.run(
-                ["md5", "-r", str(file_path)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return result.stdout.split()[0]  # Extract the hash from the output
-        else:
-            raise RuntimeError("No suitable MD5 CLI utility found (md5sum or md5)")
 
     def compress_file(self, file_path, method="auto"):
         """
@@ -2069,15 +2209,11 @@ class S3LFS:
         """
         Decompress the file using the `gzip` CLI utility and save it to the output path.
         """
-        result = subprocess.run(
-            ["gzip", "-d", "-c", str(compressed_path)],
-            stdout=open(output_path, "wb"),
-            check=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to decompress file using gzip CLI: {compressed_path}"
+        with open(output_path, "wb") as f_out:
+            subprocess.run(
+                ["gzip", "-d", "-c", str(compressed_path)],
+                stdout=f_out,
+                check=True,
             )
 
         return output_path
@@ -2086,15 +2222,11 @@ class S3LFS:
         """
         Decompress the file using pigz (parallel gzip) and save it to the output path.
         """
-        result = subprocess.run(
-            ["pigz", "-d", "-c", str(compressed_path)],
-            stdout=open(output_path, "wb"),
-            check=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to decompress file using pigz: {compressed_path}"
+        with open(output_path, "wb") as f_out:
+            subprocess.run(
+                ["pigz", "-d", "-c", str(compressed_path)],
+                stdout=f_out,
+                check=True,
             )
 
         return output_path
@@ -2185,24 +2317,18 @@ class S3LFS:
                 with context_manager:
                     upload_key = s3_key if not chunked else f"{s3_key}.chunk{chunk_idx}"
 
-                    # Compute the local MD5 checksum (streaming)
-                    md5_hash = hashlib.md5()
-                    with open(path, "rb") as f:
-                        while True:
-                            block = f.read(DEFAULT_BUFFER_SIZE)
-                            if not block:
-                                break
-                            md5_hash.update(block)
-                    local_md5 = md5_hash.hexdigest()
-
-                    # Check if the file already exists in S3
+                    # Check if the file already exists in S3. The key
+                    # already embeds the content SHA-256, so "this key
+                    # exists with this size" is the whole dedup test.
+                    # (A full MD5 pass to compare against the ETag read
+                    # every upload a second time and can never match a
+                    # multipart upload, whose ETag is not an MD5.)
                     try:
                         s3_object = self._get_s3_client().head_object(
                             Bucket=self.bucket_name,
                             Key=upload_key,
                         )
-                        s3_etag = s3_object["ETag"].strip('"')
-                        if local_md5 == s3_etag:
+                        if s3_object["ContentLength"] == file_size:
                             if not silence:
                                 print(
                                     f"Skipping upload for {path}, "
@@ -2323,6 +2449,8 @@ class S3LFS:
         )
 
         unreferenced_files = []
+        grace_skipped = 0
+        cutoff = datetime.now(timezone.utc) - CLEANUP_GRACE_PERIOD
 
         for page in pages:
             if "Contents" in page:
@@ -2333,7 +2461,21 @@ class S3LFS:
 
                     # Collect unreferenced files
                     if not self._key_covered_by(key, live_keys):
+                        last_modified = obj.get("LastModified")
+                        if last_modified is not None and last_modified > cutoff:
+                            # Recent objects may be a collaborator's
+                            # in-progress upload; the local lock and registry
+                            # cannot see it. See CLEANUP_GRACE_PERIOD.
+                            grace_skipped += 1
+                            continue
                         unreferenced_files.append(key)
+
+        if grace_skipped:
+            hours = CLEANUP_GRACE_PERIOD.total_seconds() / 3600
+            print(
+                f"Skipped {grace_skipped} unreferenced object(s) modified in "
+                f"the last {hours:g}h (upload grace period)."
+            )
 
         if not unreferenced_files:
             print("No unreferenced files found in S3.")
@@ -2348,61 +2490,37 @@ class S3LFS:
                 print("Cleanup aborted. No files were deleted.")
                 return
 
-        # Re-check under the lock immediately before deleting. Listing S3 and
-        # waiting for confirmation both take unbounded time, during which an
-        # upload may have claimed or published any of these keys.
+        # Re-check under the lock immediately before deleting, and delete
+        # while STILL holding it. Releasing between the re-check and the
+        # delete loop would let a local upload claim or publish a key in the
+        # gap and have it deleted anyway. (Collaborator uploads on other
+        # machines are covered by the grace period above; the lock is only
+        # per working copy.)
         with self._lock_context():
             self.load_manifest()
             live_now = self._live_asset_keys() | self._live_inflight_keys()
-
-        to_delete = []
-        for key in unreferenced_files:
-            if self._key_covered_by(key, live_now):
-                print(f"Skipping {key} (became referenced during cleanup)")
-                continue
-            to_delete.append(key)
-
-        # Proceed with deletion
-        for key in to_delete:
-            self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
-            print(f"Deleted {key}")
+            to_delete = [
+                key
+                for key in unreferenced_files
+                if not self._key_covered_by(key, live_now)
+            ]
+            spared = len(unreferenced_files) - len(to_delete)
+            if spared:
+                print(
+                    f"Skipping {spared} object(s) that became referenced "
+                    "during cleanup"
+                )
+            # Batched inside the lock -- every other command in this working
+            # copy blocks on it, and delete_objects carries 1000 keys/request.
+            for i in range(0, len(to_delete), 1000):
+                batch = to_delete[i : i + 1000]
+                self._get_s3_client().delete_objects(
+                    Bucket=self.bucket_name,
+                    Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+                )
+                print(f"Deleted {len(batch)} object(s)")
 
         print("S3 cleanup completed.")
-
-    def track_modified_files(self, silence=True):
-        """Check manifest for outdated hashes and upload changed files in parallel."""
-
-        files_to_upload = []
-        with self._lock_context():
-            files_to_check = list(
-                self.manifest["files"].keys()
-            )  # Files listed in the manifest
-
-        # Compute hashes in parallel
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            results = zip(files_to_check, executor.map(self.hash_file, files_to_check))
-
-        # Process results
-        for file, current_hash in results:
-            with self._lock_context():
-                stored_hash = self.manifest["files"].get(file)
-
-            if current_hash is None:
-                print(f"Warning: File {file} is missing. Skipping.")
-                continue
-
-            if current_hash != stored_hash:
-                print(f"File {file} has changed. Marking for upload.")
-                files_to_upload.append(file)
-
-        # Upload files in parallel if needed
-        if files_to_upload:
-            print(f"Uploading {len(files_to_upload)} modified file(s) in parallel...")
-            # parallel_upload_chunked commits the manifest itself; see the
-            # note in track_modified_files_cached.
-            self.parallel_upload(files_to_upload, silence=silence)
-        else:
-            print("No modified files needing upload.")
 
     def parallel_upload(self, files, silence=True):
         """Upload multiple files with block-level parallelism."""
@@ -2666,42 +2784,42 @@ class S3LFS:
         except KeyboardInterrupt:
             print("\nUpload interrupted by user.")
         finally:
-            if manifest_updates:
-                with self._lock_context():
-                    self.load_manifest()
-                    self.manifest["files"].update(manifest_updates)
-                    self.save_manifest()
+            try:
+                if manifest_updates:
+                    with self._lock_context():
+                        self.load_manifest()
+                        self.manifest["files"].update(manifest_updates)
+                        self.save_manifest()
 
-            # Strictly after the manifest is published. Releasing first would
-            # reopen the window the registry exists to close: the hash would be
-            # in neither the manifest nor the registry, and a sweep running in
-            # between would delete the objects.
-            self._release_inflight(claimed)
-
-            # Files whose chunks did not all land are deliberately absent from
-            # the manifest. Recording them would leave an entry pointing at an
-            # incomplete object, and checkout infers the chunk count from the
-            # objects that exist -- so a missing tail reassembles into a
-            # truncated file with no error raised anywhere.
-            incomplete = sorted(
-                key for key, v in pending.items() if v["done"] != v["expected"]
-            )
-            if incomplete:
-                print(
-                    f"WARNING: {len(incomplete)} file(s) did not upload "
-                    f"completely and were NOT added to the manifest:"
+                # After the manifest is published: releasing first would let a
+                # sweep delete objects that are in neither place. On a failed
+                # write the claims stay, keeping unpublished objects alive for
+                # a retry.
+                self._release_inflight(claimed)
+            finally:
+                # Files whose chunks did not all land are absent from the
+                # manifest on purpose (a partial object reassembles as a
+                # truncated file). This reports in every case, including a
+                # failed manifest write.
+                incomplete = sorted(
+                    key for key, v in pending.items() if v["done"] != v["expected"]
                 )
-                for key in incomplete[:10]:
-                    v = pending[key]
-                    print(f"  {key} ({v['done']}/{v['expected']} chunks)")
-                if len(incomplete) > 10:
-                    print(f"  ... and {len(incomplete) - 10} more")
+                if incomplete:
+                    print(
+                        f"WARNING: {len(incomplete)} file(s) did not upload "
+                        f"completely and were NOT added to the manifest:"
+                    )
+                    for key in incomplete[:10]:
+                        v = pending[key]
+                        print(f"  {key} ({v['done']}/{v['expected']} chunks)")
+                    if len(incomplete) > 10:
+                        print(f"  ... and {len(incomplete) - 10} more")
 
-            print(
-                f"Uploaded {len(manifest_updates)} file(s) "
-                f"({chunks_done} chunks, "
-                f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
-            )
+                print(
+                    f"Uploaded {len(manifest_updates)} file(s) "
+                    f"({chunks_done} chunks, "
+                    f"{total_bytes / (1024 * 1024):.1f} MB compressed)."
+                )
 
     def parallel_download_all(self, silence=True, only=None, preserve_modified=False):
         """Download all files using block-level parallelism.
@@ -2726,12 +2844,15 @@ class S3LFS:
 
         print("Starting block-level parallel download of all tracked files...")
 
+        # One cache-aware pass over the whole slice: a stat() per unchanged
+        # file instead of a full re-read of every byte of the working copy.
+        current_hashes = self.disk_hashes(dict(items))
+
         files_to_download = []
         modified = []
         for manifest_key, file_hash in items:
-            filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
-            if filesystem_path.exists():
-                current_hash = self.hash_file(filesystem_path)
+            current_hash = current_hashes.get(manifest_key)
+            if current_hash is not None:
                 if current_hash == file_hash:
                     if not silence:
                         print(f"  Skipping {manifest_key} (up-to-date)")
@@ -2833,36 +2954,53 @@ class S3LFS:
             compressed_path = chunk_paths[0]
 
         os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
+        # Finalize into a temp file in the destination directory and swap it
+        # in only after everything has succeeded. decompress_file opens its
+        # output path itself, so a failure mid-decompress left a truncated
+        # destination behind, destroying whatever was there before. With a
+        # staging file, any failure leaves a pre-existing destination
+        # untouched and no 0-byte file behind.
+        staging_path = filesystem_path.with_name(
+            f"{filesystem_path.name}.{uuid4().hex}.s3lfs-tmp"
+        )
         try:
-            if compressed:
-                self.decompress_file(compressed_path, filesystem_path)
-            else:
-                shutil.move(str(compressed_path), str(filesystem_path))
-        finally:
             try:
-                os.remove(compressed_path)
-            except OSError:
-                pass
-
-        if expected_hash is not None:
-            # stream_hash was computed while the bytes were written; a
-            # re-read of the finished file tells us nothing it does not.
-            actual_hash = (
-                stream_hash
-                if stream_hash is not None
-                else self.hash_file(filesystem_path)
-            )
-            if actual_hash != expected_hash:
-                # Remove the bad output rather than leave it looking valid.
+                if compressed:
+                    self.decompress_file(compressed_path, staging_path)
+                else:
+                    shutil.move(str(compressed_path), str(staging_path))
+            finally:
+                # The raw path moves the temp file into the staging name, so
+                # it is already gone by here.
                 try:
-                    os.remove(filesystem_path)
+                    os.remove(compressed_path)
                 except OSError:
                     pass
-                raise RuntimeError(
-                    f"Checksum mismatch for {manifest_key}: "
-                    f"expected {expected_hash}, got {actual_hash}. "
-                    f"The stored object is incomplete or corrupt."
+
+            if expected_hash is not None:
+                # stream_hash was computed while the bytes were written; a
+                # re-read of the finished file tells us nothing it does not.
+                actual_hash = (
+                    stream_hash
+                    if stream_hash is not None
+                    else self.hash_file(staging_path)
                 )
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        f"Checksum mismatch for {manifest_key}: "
+                        f"expected {expected_hash}, got {actual_hash}. "
+                        f"The stored object is incomplete or corrupt."
+                    )
+
+            os.replace(staging_path, filesystem_path)
+        except Exception:
+            # Remove the partial staging file; the destination, if there was
+            # one, was never touched.
+            try:
+                os.remove(staging_path)
+            except OSError:
+                pass
+            raise
 
     def parallel_download_chunked(self, file_items, silence=True):
         """Download files with block-level parallelism.
@@ -3805,15 +3943,20 @@ class S3LFS:
             print("\nProcessing interrupted by user.")
             return
 
-        # Phase 3: Update manifest with all changes
-        if files_uploaded:
-            print(f"Updating manifest with {len(files_uploaded)} uploaded files...")
-            with self._lock_context():
-                self.load_manifest()
-                for file_path, file_hash in files_uploaded:
-                    manifest_key = self._get_manifest_key(file_path)
-                    self.manifest["files"][manifest_key] = file_hash
-                self.save_manifest()
+        finally:
+            # Phase 3: Update manifest with all changes. Inside `finally`
+            # (same shape as parallel_upload_chunked) so the shutdown return,
+            # a per-file failure and Ctrl-C all still record the uploads that
+            # landed in S3; discarding them leaves the objects unreferenced
+            # (cleanup will delete them) and forces a full re-upload.
+            if files_uploaded:
+                print(f"Updating manifest with {len(files_uploaded)} uploaded files...")
+                with self._lock_context():
+                    self.load_manifest()
+                    for file_path, file_hash in files_uploaded:
+                        manifest_key = self._get_manifest_key(file_path)
+                        self.manifest["files"][manifest_key] = file_hash
+                    self.save_manifest()
 
         print(
             f"Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."
@@ -3996,8 +4139,6 @@ class S3LFS:
             return None
 
         # If the file exists, check its hash
-        if not silence:
-            print(f"file_path exists?: {filesystem_path.exists()}")
         if filesystem_path.exists():
             current_hash = self.hash_file(filesystem_path)
             if not silence:
@@ -4031,8 +4172,8 @@ class S3LFS:
                 pass
 
         for idx, key in enumerate(keys):
+            target_path = self.temp_dir / f"{uuid4()}.part"
             try:
-                target_path = self.temp_dir / f"{uuid4()}.part"
                 target_paths.append(target_path)
                 file_size = key_sizes[key]
 
@@ -4078,7 +4219,15 @@ class S3LFS:
                             )
                             stream_digests.append(writer.hexdigest())
             except Exception as e:
+                # A failed transfer must abort the download, not be
+                # swallowed: the temp file it left is 0 bytes, and
+                # finalizing from it would destroy the destination.
+                if target_path in target_paths:
+                    target_paths.remove(target_path)
+                with contextlib.suppress(OSError):
+                    target_path.unlink()
                 print(f"Error downloading {key}: {e}")
+                raise
 
         if is_chunked and len(target_paths) > 1:
             compressed_path = self.merge_files(compressed_path, target_paths)
@@ -4089,17 +4238,30 @@ class S3LFS:
 
         if os.path.dirname(filesystem_path):
             os.makedirs(os.path.dirname(filesystem_path), exist_ok=True)
+        # Atomic finalization, same as _finalize_file: write to a temp
+        # file in the destination directory and swap it in only on
+        # success, so a mid-decompress failure cannot truncate a
+        # previously-good copy.
+        staging_path = filesystem_path.with_name(
+            f"{filesystem_path.name}.{uuid4().hex}.s3lfs-tmp"
+        )
         try:
-            if compressed:
-                with metrics.track("decompression", str(filesystem_path)):
-                    self.decompress_file(compressed_path, filesystem_path)
-            else:
-                shutil.move(str(compressed_path), str(filesystem_path))
-        except Exception as e:
-            print(f"Error finalizing {compressed_path} for key {keys}: {e}")
+            try:
+                if compressed:
+                    with metrics.track("decompression", str(filesystem_path)):
+                        self.decompress_file(compressed_path, staging_path)
+                else:
+                    shutil.move(str(compressed_path), str(staging_path))
+            finally:
+                # The raw path moves the temp file into the staging name,
+                # so it is already gone by here.
+                Path(compressed_path).unlink(missing_ok=True)
+
+            os.replace(staging_path, filesystem_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.remove(staging_path)
             raise
-        # The raw path moves the temp file into place, so it is already gone.
-        Path(compressed_path).unlink(missing_ok=True)
 
         # End-to-end verification, same as the parallel path: transport
         # checksums are off, so this is the check that the bytes on disk
@@ -4116,10 +4278,8 @@ class S3LFS:
         else:
             actual_hash = self.hash_file(filesystem_path)
         if actual_hash != expected_hash:
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(filesystem_path)
-            except OSError:
-                pass
             raise RuntimeError(
                 f"Checksum mismatch for {manifest_key}: expected "
                 f"{expected_hash}, got {actual_hash}. The stored object is "
@@ -4143,42 +4303,14 @@ class S3LFS:
         :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         # Resolve manifest paths using the same logic as checkout
-        files_to_list = self._resolve_manifest_paths(path)
-
-        if not files_to_list:
-            if verbose:
-                print(f"No tracked files found for '{path}'.")
-            return
-
-        if verbose:
-            print(f"Found {len(files_to_list)} tracked file(s) for '{path}':")
-            print()
-
-        # Sort files for consistent output
-        sorted_files = sorted(files_to_list.items())
-
-        for file_path, file_hash in sorted_files:
-            # Strip prefix if provided
-            display_path = file_path
-            if strip_prefix and file_path.startswith(strip_prefix + "/"):
-                display_path = file_path[len(strip_prefix + "/") :]
-
-            if verbose:
-                # Get file status if it exists locally
-                file_status = self.get_file_status(file_path)
-                if file_status["exists"]:
-                    size_str = f"{file_status['size']:,} bytes"
-                    status = "" if file_status["cache_valid"] else ""
-                else:
-                    size_str = "missing"
-                    status = ""
-
-                print(f"{status} {display_path}")
-                print(f"    Hash: {file_hash}")
-                print(f"    Size: {size_str}")
-                print()
-            else:
-                print(display_path)
+        files = self._resolve_manifest_paths(path)
+        self._print_tracked_files(
+            files,
+            f"No tracked files found for '{path}'.",
+            f"Found {len(files)} tracked file(s) for '{path}':",
+            verbose,
+            strip_prefix,
+        )
 
     def list_all_files(self, verbose=False, strip_prefix=None):
         """
@@ -4188,37 +4320,42 @@ class S3LFS:
         :param strip_prefix: If provided, strip this prefix from displayed paths.
         """
         with self._lock_context():
-            all_files = dict(self.manifest["files"])
+            files = dict(self.manifest["files"])
+        self._print_tracked_files(
+            files,
+            "No files are currently tracked.",
+            f"All tracked files ({len(files)} total):",
+            verbose,
+            strip_prefix,
+        )
 
-        if not all_files:
+    def _print_tracked_files(self, files, empty_msg, header, verbose, strip_prefix):
+        """Print one tracked-file listing shared by list_files/list_all_files."""
+        if not files:
             if verbose:
-                print("No files are currently tracked.")
+                print(empty_msg)
             return
 
         if verbose:
-            print(f"All tracked files ({len(all_files)} total):")
+            print(header)
             print()
 
-        # Sort files for consistent output
-        sorted_files = sorted(all_files.items())
-
-        for file_path, file_hash in sorted_files:
+        for file_path, file_hash in sorted(files.items()):
             # Strip prefix if provided
             display_path = file_path
             if strip_prefix and file_path.startswith(strip_prefix + "/"):
                 display_path = file_path[len(strip_prefix + "/") :]
 
             if verbose:
-                # Get file status if it exists locally
+                # A stat, not a hash: listing must not read the working copy.
                 file_status = self.get_file_status(file_path)
-                if file_status["exists"]:
-                    size_str = f"{file_status['size']:,} bytes"
-                    status = "" if file_status["cache_valid"] else ""
-                else:
-                    size_str = "missing"
-                    status = ""
+                size_str = (
+                    f"{file_status['size']:,} bytes"
+                    if file_status["exists"]
+                    else "missing"
+                )
 
-                print(f"{status} {display_path}")
+                print(display_path)
                 print(f"    Hash: {file_hash}")
                 print(f"    Size: {size_str}")
                 print()
