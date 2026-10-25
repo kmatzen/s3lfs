@@ -5,9 +5,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from concurrent.futures import CancelledError
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -245,8 +247,11 @@ class TestS3LFS(unittest.TestCase):
         del self.versioner.manifest["files"][self.test_file]
         self.versioner.save_manifest()
 
-        # Cleanup should remove it from S3
-        self.versioner.cleanup_s3(force=True)
+        # Cleanup should remove it from S3. The object was uploaded moments
+        # ago, so it sits inside the 24h upload grace period that protects
+        # in-flight uploads; zero the grace period to exercise the GC itself.
+        with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+            self.versioner.cleanup_s3(force=True)
 
         s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
         response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
@@ -269,8 +274,10 @@ class TestS3LFS(unittest.TestCase):
             del self.versioner.manifest["files"][self.test_file]
             self.versioner.save_manifest()
 
-            # Cleanup should remove it from S3
-            self.versioner.cleanup_s3(force=True)
+            # Cleanup should remove it from S3 (grace period zeroed: the
+            # chunks were uploaded moments ago, see test_cleanup_s3).
+            with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+                self.versioner.cleanup_s3(force=True)
 
             s3_key = f"s3lfs/assets/{file_hash}/{self.test_file}"
             response = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=s3_key)
@@ -1040,6 +1047,88 @@ class TestS3LFS(unittest.TestCase):
                     os.remove(fname)
                 except OSError:
                     pass
+
+    def test_track_interleaved_failure_keeps_completed_uploads(self):
+        """A per-file upload failure must not throw away the manifest entries
+        for uploads that already completed; only the failed file stays out."""
+        good = "itr_fail_good.txt"
+        bad = "itr_fail_bad.txt"
+        for fname in (good, bad):
+            with open(fname, "w") as f:
+                f.write(f"content for {fname}")
+
+        versioner = S3LFS(bucket_name=self.bucket_name, workers=2)
+        real_upload = S3LFS.upload
+        good_done = threading.Event()
+
+        def flaky_upload(s3lfs_self, file_path, *args, **kwargs):
+            if str(file_path).endswith(bad):
+                # Fail only after the good upload has fully completed, so the
+                # good file's result is processed before the raise.
+                self.assertTrue(good_done.wait(timeout=30))
+                raise RuntimeError("simulated upload failure")
+            result = real_upload(s3lfs_self, file_path, *args, **kwargs)
+            good_done.set()
+            return result
+
+        try:
+            with patch.object(
+                S3LFS, "upload", autospec=True, side_effect=flaky_upload
+            ):
+                with self.assertRaises(RuntimeError):
+                    versioner.track_interleaved("itr_fail_*.txt")
+
+            versioner.load_manifest()
+            self.assertIn(
+                good,
+                versioner.manifest["files"],
+                "completed upload was not recorded after a per-file failure",
+            )
+            self.assertNotIn(bad, versioner.manifest["files"])
+        finally:
+            for fname in (good, bad):
+                if os.path.exists(fname):
+                    os.remove(fname)
+
+    def test_track_interleaved_shutdown_keeps_completed_uploads(self):
+        """The shutdown return path (Ctrl-C) must still record the uploads
+        that finished before the flag was set."""
+        good = "itr_shutdown_good.txt"
+        slow = "itr_shutdown_slow.txt"
+        for fname in (good, slow):
+            with open(fname, "w") as f:
+                f.write(f"content for {fname}")
+
+        versioner = S3LFS(bucket_name=self.bucket_name, workers=2)
+        real_upload = S3LFS.upload
+
+        def slow_then_shutdown(s3lfs_self, file_path, *args, **kwargs):
+            if str(file_path).endswith(slow):
+                # Set the shutdown flag while the main loop is waiting for
+                # more results; the good upload completed long before this.
+                time.sleep(1.0)
+                versioner._shutdown_requested = True
+            return real_upload(s3lfs_self, file_path, *args, **kwargs)
+
+        try:
+            with patch.object(
+                S3LFS, "upload", autospec=True, side_effect=slow_then_shutdown
+            ):
+                # The shutdown path returns; it does not raise.
+                versioner.track_interleaved("itr_shutdown_*.txt")
+
+            versioner.load_manifest()
+            self.assertIn(
+                good,
+                versioner.manifest["files"],
+                "completed upload was discarded by the shutdown return",
+            )
+            # The result that landed after the flag was set is not processed.
+            self.assertNotIn(slow, versioner.manifest["files"])
+        finally:
+            for fname in (good, slow):
+                if os.path.exists(fname):
+                    os.remove(fname)
 
     def test_checkout_interleaved(self):
         """Test that interleaved checkout works correctly."""

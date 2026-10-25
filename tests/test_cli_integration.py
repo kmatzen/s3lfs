@@ -386,6 +386,23 @@ class TestS3LFSCLIInProcess(unittest.TestCase):
         result = runner.invoke(s3lfs_main, ["cleanup", "--force"])
         self.assertEqual(result.exit_code, 0, "Cleanup command failed")
 
+    def test_track_command_manifest_write_failure_exits_nonzero(self):
+        """A failed manifest write during track must fail the command. The old
+        code printed the error and returned, exiting 0 with the bytes in S3
+        and the index unchanged."""
+        runner = CliRunner()
+        runner.invoke(s3lfs_main, ["init", TEST_BUCKET, "test_prefix"])
+
+        # Fail the real save_manifest at its I/O layer, not by replacing it.
+        with patch(
+            "s3lfs.core.yaml_dump", side_effect=OSError(28, "No space left on device")
+        ):
+            result = runner.invoke(s3lfs_main, ["track", self.test_file])
+
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIsInstance(result.exception, RuntimeError)
+        self.assertIn("Failed to save manifest", str(result.exception))
+
     def test_cleanup_with_no_sign_request(self):
         """Test cleanup command with --no-sign-request."""
         runner = CliRunner()

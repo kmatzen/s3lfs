@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -394,6 +395,65 @@ class TestCoreCoverageImprovements(unittest.TestCase):
 
         resp = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=key)
         self.assertEqual(resp.get("KeyCount", 0), 1)
+
+    # ------------------------------------------------------------------
+    # cleanup_s3 grace period: an unreferenced object that is newer than
+    # CLEANUP_GRACE_PERIOD must NOT be deleted. The lock file and inflight
+    # registry live in the local working copy, so they cannot protect a
+    # collaborator's in-progress upload (chunks land first, manifest entry
+    # last) from a cleanup run on another machine.
+    # ------------------------------------------------------------------
+    def test_cleanup_s3_grace_period_spares_recent_object(self):
+        s3lfs = self._make_s3lfs()
+        s3lfs.load_manifest()
+        s3lfs.save_manifest()
+
+        key = f"{s3lfs.repo_prefix}/assets/fresh_hash/recent.bin.gz"
+        self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=b"data")
+
+        with patch("builtins.print") as mock_print:
+            s3lfs.cleanup_s3(force=True)
+
+        resp = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=key)
+        self.assertEqual(resp.get("KeyCount", 0), 1, "recent object was deleted")
+        self.assertTrue(
+            any("grace" in str(c) for c in mock_print.call_args_list),
+            "the count of age-skipped objects was not reported",
+        )
+
+    def test_cleanup_s3_deletes_object_older_than_grace_period(self):
+        s3lfs = self._make_s3lfs()
+        s3lfs.load_manifest()
+        s3lfs.save_manifest()
+
+        key = f"{s3lfs.repo_prefix}/assets/stale_hash/old.bin.gz"
+        self.s3.put_object(Bucket=self.bucket_name, Key=key, Body=b"data")
+
+        # moto stamps LastModified with the current time and it cannot be
+        # aged, so patch the listing to report the object as 2 days old.
+        real_client = s3lfs._get_s3_client()
+        real_paginator = real_client.get_paginator("list_objects_v2")
+        old = datetime.now(timezone.utc) - timedelta(days=2)
+
+        class _AgedPaginator:
+            def paginate(self, **kwargs):
+                for page in real_paginator.paginate(**kwargs):
+                    contents = [
+                        dict(c, LastModified=old) for c in page.get("Contents", [])
+                    ]
+                    yield dict(page, Contents=contents)
+
+        fake_client = Mock()
+        fake_client.get_paginator.return_value = _AgedPaginator()
+        fake_client.delete_object.side_effect = lambda **kw: real_client.delete_object(
+            **kw
+        )
+
+        with patch.object(s3lfs, "_get_s3_client", return_value=fake_client):
+            s3lfs.cleanup_s3(force=True)
+
+        resp = self.s3.list_objects_v2(Bucket=self.bucket_name, Prefix=key)
+        self.assertEqual(resp.get("KeyCount", 0), 0, "aged object was not deleted")
 
     # ------------------------------------------------------------------
     # lines 1631-1632: track_modified_files reports missing file

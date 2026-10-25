@@ -18,6 +18,7 @@ import time
 from collections.abc import MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional, Union
 from uuid import uuid4
@@ -43,6 +44,14 @@ DEFAULT_BUFFER_SIZE = 1024 * 1024  # 1 MB
 DEFAULT_THREAD_POOL_SIZE = 8  # Fallback when os.cpu_count() is unavailable
 DEFAULT_MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5 GB
 DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
+
+# cleanup_s3 leaves unreferenced objects alone while their LastModified is
+# within this window. The lock file and the in-flight registry live in the
+# local working copy, so they give no protection against a cleanup run on
+# another machine, and a collaborator's chunked upload is unreferenced (the
+# manifest entry is published last) for as long as the transfer takes. Age
+# is the only cross-machine signal that a large object may still be landing.
+CLEANUP_GRACE_PERIOD = timedelta(hours=24)
 
 # Sharded manifests keep entries in per-directory files under this directory,
 # beside the root manifest.
@@ -1164,7 +1173,11 @@ class S3LFS:
                 yaml_dump(data, f, default_flow_style=False, sort_keys=True)
             temp_file.replace(path)
         except Exception as e:
-            print(f"Failed to write {path}: {e}")
+            # Propagate: a manifest/shard write that silently failed leaves
+            # S3 and the index out of sync (the objects become unreferenced
+            # garbage to the next cleanup, and the command exits 0).
+            raise RuntimeError(f"Failed to write {path}: {e}") from e
+        finally:
             if temp_file.exists():
                 temp_file.unlink()
 
@@ -1249,7 +1262,10 @@ class S3LFS:
             # Atomically move the temporary file to the target location
             temp_file.replace(self.manifest_file)
         except Exception as e:
-            print(f"Failed to save manifest: {e}")
+            # Propagate: the caller (track, checkout, ...) must not exit 0
+            # with bytes in S3 and an unchanged index. See _write_atomic.
+            raise RuntimeError(f"Failed to save manifest: {e}") from e
+        finally:
             if temp_file.exists():
                 temp_file.unlink()  # Clean up the temporary file
 
@@ -2474,6 +2490,8 @@ class S3LFS:
         )
 
         unreferenced_files = []
+        grace_skipped = 0
+        cutoff = datetime.now(timezone.utc) - CLEANUP_GRACE_PERIOD
 
         for page in pages:
             if "Contents" in page:
@@ -2484,7 +2502,21 @@ class S3LFS:
 
                     # Collect unreferenced files
                     if not self._key_covered_by(key, live_keys):
+                        last_modified = obj.get("LastModified")
+                        if last_modified is not None and last_modified > cutoff:
+                            # Recent objects may be a collaborator's
+                            # in-progress upload; the local lock and registry
+                            # cannot see it. See CLEANUP_GRACE_PERIOD.
+                            grace_skipped += 1
+                            continue
                         unreferenced_files.append(key)
+
+        if grace_skipped:
+            hours = CLEANUP_GRACE_PERIOD.total_seconds() / 3600
+            print(
+                f"Skipped {grace_skipped} unreferenced object(s) modified in "
+                f"the last {hours:g}h (upload grace period)."
+            )
 
         if not unreferenced_files:
             print("No unreferenced files found in S3.")
@@ -2499,24 +2531,23 @@ class S3LFS:
                 print("Cleanup aborted. No files were deleted.")
                 return
 
-        # Re-check under the lock immediately before deleting. Listing S3 and
-        # waiting for confirmation both take unbounded time, during which an
-        # upload may have claimed or published any of these keys.
+        # Re-check under the lock immediately before deleting, and delete
+        # while STILL holding it. Releasing between the re-check and the
+        # delete loop would let a local upload claim or publish a key in the
+        # gap and have it deleted anyway. (Collaborator uploads on other
+        # machines are covered by the grace period above; the lock is only
+        # per working copy.)
         with self._lock_context():
             self.load_manifest()
             live_now = self._live_asset_keys() | self._live_inflight_keys()
-
-        to_delete = []
-        for key in unreferenced_files:
-            if self._key_covered_by(key, live_now):
-                print(f"Skipping {key} (became referenced during cleanup)")
-                continue
-            to_delete.append(key)
-
-        # Proceed with deletion
-        for key in to_delete:
-            self._get_s3_client().delete_object(Bucket=self.bucket_name, Key=key)
-            print(f"Deleted {key}")
+            for key in unreferenced_files:
+                if self._key_covered_by(key, live_now):
+                    print(f"Skipping {key} (became referenced during cleanup)")
+                    continue
+                self._get_s3_client().delete_object(
+                    Bucket=self.bucket_name, Key=key
+                )
+                print(f"Deleted {key}")
 
         print("S3 cleanup completed.")
 
@@ -3973,15 +4004,22 @@ class S3LFS:
             print("\nProcessing interrupted by user.")
             return
 
-        # Phase 3: Update manifest with all changes
-        if files_uploaded:
-            print(f"Updating manifest with {len(files_uploaded)} uploaded files...")
-            with self._lock_context():
-                self.load_manifest()
-                for file_path, file_hash in files_uploaded:
-                    manifest_key = self._get_manifest_key(file_path)
-                    self.manifest["files"][manifest_key] = file_hash
-                self.save_manifest()
+        finally:
+            # Phase 3: Update manifest with all changes. Inside `finally`
+            # (same shape as parallel_upload_chunked) so the shutdown return,
+            # a per-file failure and Ctrl-C all still record the uploads that
+            # landed in S3; discarding them leaves the objects unreferenced
+            # (cleanup will delete them) and forces a full re-upload.
+            if files_uploaded:
+                print(
+                    f"Updating manifest with {len(files_uploaded)} uploaded files..."
+                )
+                with self._lock_context():
+                    self.load_manifest()
+                    for file_path, file_hash in files_uploaded:
+                        manifest_key = self._get_manifest_key(file_path)
+                        self.manifest["files"][manifest_key] = file_hash
+                    self.save_manifest()
 
         print(
             f"Successfully processed {files_processed} files ({len(files_uploaded)} uploaded) for '{path}'."

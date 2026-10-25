@@ -9,7 +9,9 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import boto3
 import yaml
@@ -1155,7 +1157,10 @@ class TestSyncNeverRemovesUnrecoverableContent(GitRepoTestCase):
 
         self.runner.invoke(cli, ["remove", "data/a.bin"])
         self._commit_all("untrack a")
-        cleanup = self.runner.invoke(cli, ["cleanup", "--force"])
+        # Grace period zeroed: cleanup would skip the freshly-uploaded
+        # object (upload grace window), and the test needs it collected.
+        with patch("s3lfs.core.CLEANUP_GRACE_PERIOD", timedelta(0)):
+            cleanup = self.runner.invoke(cli, ["cleanup", "--force"])
         self.assertEqual(cleanup.exit_code, 0, msg=cleanup.output)
 
         result = self.runner.invoke(cli, ["sync", "--from", "HEAD~1"])
