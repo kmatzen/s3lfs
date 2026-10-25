@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -274,6 +275,62 @@ class TestRestoreRequest(_RepoTestCase):
 
         self.assertEqual(failed, 1)
         client.restore_object.assert_called_once()
+
+    def test_restore_scales_to_thousands_of_objects(self):
+        """restore() over a large set completes fast and reports counts.
+
+        Regression test for the quadratic bookkeeping (list.remove /
+        `mk not in missing` scans per resolved object, per poll). With
+        dict/set bookkeeping this is linear; the old code did O(n^2)
+        comparisons per pass, which at Deep-Archive object counts meant
+        minutes of pure scanning every poll interval.
+        """
+        n = 2000
+        n_missing = 100
+        files = {}
+        objects = {}
+        missing_keys = set()
+        for i in range(n):
+            digest = hashlib.sha256(f"payload-{i}".encode()).hexdigest()
+            key = f"data/file{i:05d}.bin"
+            files[key] = digest
+            base = f"test-prefix/assets/{digest}/{key}"
+            objects[base] = 1024
+            if i < n_missing:
+                missing_keys.add(base)
+
+        with open(self.manifest_path, "w") as f:
+            yaml.safe_dump(
+                {
+                    "bucket_name": "test-bucket",
+                    "repo_prefix": "test-prefix",
+                    "files": files,
+                },
+                f,
+            )
+
+        client = self._list_client(objects)
+        state = {"restored": set()}
+
+        def get_object(Bucket=None, Key=None, Range=None, **kwargs):
+            if Key in missing_keys:
+                raise _client_error("NoSuchKey")
+            if Key not in state["restored"]:
+                raise _client_error("InvalidObjectState")
+            return {"Body": Mock(read=lambda n: b"")}
+
+        client.get_object.side_effect = get_object
+        client.restore_object.side_effect = lambda **kw: state["restored"].add(kw["Key"])
+        s3lfs = self._s3lfs(client)
+
+        start = time.monotonic()
+        failed = s3lfs.restore(files, timeout=10, interval=0)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(failed, n_missing)
+        self.assertEqual(client.restore_object.call_count, n - n_missing)
+        self.assertEqual(state["restored"], set(objects) - missing_keys)
+        self.assertLess(elapsed, 60, f"restore of {n} objects took {elapsed:.1f}s")
 
 
 class TestAtomicFinalize(_RepoTestCase):

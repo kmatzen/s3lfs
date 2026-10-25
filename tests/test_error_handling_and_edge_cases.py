@@ -16,6 +16,7 @@ difficult to test in normal usage scenarios.
 
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -249,22 +250,23 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
     @patch("sys.platform", "linux")
     @patch("shutil.which")
     def test_decompress_file_cli_method_error(self, mock_which):
-        """Test decompression CLI method error handling."""
+        """Test decompression CLI method error handling.
+
+        The unreachable `returncode != 0` branch behind `check=True` was
+        removed; the real contract is that the CLI's CalledProcessError
+        propagates to the caller.
+        """
         mock_which.return_value = "/usr/bin/gzip"
         compressed_file = self.test_dir / "test.gz"
         compressed_file.touch()
 
         try:
             with patch("subprocess.run") as mock_run:
-                mock_run.return_value.returncode = 1
+                mock_run.side_effect = subprocess.CalledProcessError(1, ["gzip"])
 
                 with patch("builtins.open", mock_open()):
-                    with self.assertRaises(RuntimeError) as cm:
+                    with self.assertRaises(subprocess.CalledProcessError):
                         self.versioner.decompress_file(compressed_file, method="cli")
-
-                    self.assertIn(
-                        "Failed to decompress file using gzip CLI", str(cm.exception)
-                    )
         finally:
             if compressed_file.exists():
                 compressed_file.unlink()
