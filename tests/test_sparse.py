@@ -400,6 +400,44 @@ class TestSparsePruneDoesNotUntrack(SparseRepoTestCase):
         self.assertEqual(self._tracked(), ["drop/out.bin"])
 
 
+class TestNonAsciiShardDirsInCone(SparseRepoTestCase):
+    """A top-level directory with a non-ASCII name (en dash here) must
+    keep its tracked entries visible in a cone sparse checkout. The
+    hand-rolled shard-name codec mangled such names on decode, so the
+    intersection of shard_names() with the cone dropped the shard and
+    every entry under that directory vanished silently."""
+
+    def test_cone_sparse_keeps_entries_of_non_ascii_directory(self):
+        self._write("keep/g.bin", "g")
+        self._write("report\u2013q3/f.bin", "f")
+        for p in ("keep/g.bin", "report\u2013q3/f.bin"):
+            result = self.runner.invoke(cli, ["track", p])
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+        self.runner.invoke(cli, ["shard", "--force"])
+        self._commit_all("track and shard")
+
+        self._enable_sparse("report\u2013q3")
+
+        # `status` is the command that takes the shard_names() x cone
+        # intersection: an unresolvable shard name drops the directory's
+        # entries from the expected set, exactly as `ls`, `checkout
+        # --all` and the pre-commit scan do through _manifest_files.
+        out = self.runner.invoke(
+            cli, ["status", "--all", "--porcelain"]
+        ).output
+        self.assertIn("report\u2013q3/f.bin", out)
+        self.assertNotIn("keep/g.bin", out)
+
+        from s3lfs.core import S3LFS
+
+        s3lfs = S3LFS(
+            bucket_name=TEST_BUCKET,
+            manifest_file=".s3_manifest.yaml",
+            s3_factory=lambda no_sign: None,
+        )
+        self.assertIn("report\u2013q3", set(s3lfs.shard_names()))
+
+
 class TestShardsStayVisible(SparseRepoTestCase):
     """Manifest shards are git-tracked files under a directory, so enabling
     a sparse checkout removes them from the working copy unless that

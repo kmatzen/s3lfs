@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional, Union
 from uuid import uuid4
+from urllib.parse import quote, unquote
 
 import portalocker
 import yaml
@@ -47,6 +48,24 @@ DEFAULT_MAX_CONCURRENCY = 15  # Balanced for bandwidth-limited downloads
 # beside the root manifest.
 MANIFEST_SHARD_DIR = ".s3lfs_manifest"
 MANIFEST_ROOT_SHARD = "_root"
+
+# Characters S3LFS._shard_path leaves literal in a shard file name:
+# everything str.isalnum() (the set the original codec kept literal, so
+# shard files already on disk keep their names) plus "-_.". Used as
+# quote()'s safe set for names with code points above U+00FF; "~" is
+# not in the set -- the original codec escaped it -- and is re-escaped
+# by hand because quote() treats it as always-safe.
+_SHARD_NAME_SAFE = "-_." + "".join(
+    ch for ch in map(chr, range(0x30000)) if ch.isalnum()
+)
+# Characters the original codec escaped in a name encodable as latin-1:
+# everything that is not alphanumeric (\w is isalnum plus "_") and not
+# one of "-" or ".".
+_SHARD_LEGACY_ESCAPE = re.compile(r"[^\w\-.]")
+# quote() emits UTF-8 percent-escapes in uppercase hex; the latin-1
+# encoding used for names <= U+00FF is emitted lowercase, so one
+# uppercase escape is enough to identify a UTF-8 encoded shard name.
+_SHARD_UTF8_ESCAPE = re.compile(r"%(?:[A-F][0-9A-F]|[0-9A-F][A-F])")
 
 # Bulk-absence guard for deletion detection: more than this many missing
 # files, and more than this fraction of those checked, reads as a wiped
@@ -1063,10 +1082,25 @@ class S3LFS:
         # Shard names come from path components, so they can contain
         # anything a directory name can. Percent-encode everything outside
         # a conservative set rather than trusting them as filenames.
-        safe = "".join(
-            ch if ch.isalnum() or ch in "-_." else f"%{ord(ch):02x}" for ch in shard
-        )
-        return self.shard_dir / f"{safe}.yaml"
+        #
+        # Names encodable as latin-1 keep the original codec's exact
+        # bytes: every escaped character is '%' + the lowercase hex of
+        # its code point, one byte for code points <= U+00FF, so shard
+        # files already on disk for ASCII and Latin-1 directories keep
+        # the name they have always had. A name with a code point above
+        # U+00FF -- which that codec truncated to two hex digits,
+        # corrupting the name it encoded -- is percent-encoded as UTF-8
+        # instead; quote() emits those escapes in uppercase, which is
+        # how shard_names() tells the two encodings apart.
+        try:
+            shard.encode("latin-1")
+        except UnicodeEncodeError:
+            stem = quote(shard, safe=_SHARD_NAME_SAFE).replace("~", "%7e")
+        else:
+            stem = _SHARD_LEGACY_ESCAPE.sub(
+                lambda m: f"%{ord(m.group(0)):02x}", shard
+            )
+        return self.shard_dir / f"{stem}.yaml"
 
     def _load_shards(self):
         """Merge every shard into one files mapping (eager; tests use it)."""
@@ -1105,19 +1139,15 @@ class S3LFS:
         names = []
         for path in sorted(self.shard_dir.glob("*.yaml")):
             stem = path.stem
-            # Reverse the percent-encoding applied by _shard_path.
-            out, i = [], 0
-            while i < len(stem):
-                if stem[i] == "%" and i + 2 < len(stem) + 1:
-                    try:
-                        out.append(chr(int(stem[i + 1 : i + 3], 16)))
-                        i += 3
-                        continue
-                    except ValueError:
-                        pass
-                out.append(stem[i])
-                i += 1
-            names.append("".join(out))
+            # Reverse the percent-encoding applied by _shard_path. An
+            # uppercase-hex escape marks the UTF-8 encoding used for code
+            # points above U+00FF; every other stem -- including every
+            # name the original codec wrote -- is latin-1 code-point
+            # escapes, and decodes to the name it has always decoded to.
+            if _SHARD_UTF8_ESCAPE.search(stem):
+                names.append(unquote(stem))
+            else:
+                names.append(unquote(stem, encoding="latin-1"))
         return names
 
     def files_in_shards(self, shards):
