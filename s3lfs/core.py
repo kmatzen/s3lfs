@@ -1424,6 +1424,21 @@ class S3LFS:
             return True
         return (written_at - mtime) < self.MTIME_GRANULARITY_SECONDS
 
+    def _cache_key(self, file_path: Union[str, Path]) -> str:
+        """Canonical hash-cache key for a file path.
+
+        Every producer and consumer of the hash cache speaks manifest keys;
+        keying some entries by filesystem path made every cross-command
+        lookup miss (a checkout-style writer stored /abs/repo/data.txt,
+        a status-style reader looked up data.txt) and stored the same file
+        under two keys forever. Paths outside the repository have no
+        manifest key and keep their posix path.
+        """
+        try:
+            return self._get_manifest_key(file_path)
+        except ValueError:
+            return str(Path(file_path).as_posix())
+
     def hash_file_cached(
         self, file_path: Union[str, Path], method: str = "auto"
     ) -> str:
@@ -1437,7 +1452,7 @@ class S3LFS:
         :return: The computed SHA-256 hash as a hexadecimal string.
         """
         file_path = Path(file_path)
-        file_path_str = str(file_path.as_posix())
+        file_path_str = self._cache_key(file_path)
 
         # Ensure the file exists
         if not file_path.exists():
@@ -1526,7 +1541,7 @@ class S3LFS:
         :return: Dictionary with file status information.
         """
         file_path = Path(file_path)
-        file_path_str = str(file_path.as_posix())
+        file_path_str = self._cache_key(file_path)
 
         if not file_path.exists():
             return {"exists": False, "cached": False}
@@ -1582,7 +1597,7 @@ class S3LFS:
                 print("Cleared all hash cache entries.")
             else:
                 # Clear cache for specific file
-                file_path_str = str(Path(file_path).as_posix())
+                file_path_str = self._cache_key(file_path)
                 if file_path_str in self.hash_cache:
                     del self.hash_cache[file_path_str]
                     self._cache_dirty = True
@@ -1596,6 +1611,7 @@ class S3LFS:
         This method is multi-process safe using file-based locking.
 
         :param max_age_days: Remove cache entries older than this many days.
+        :return: Number of entries dropped.
         """
         with self._lock_context():
             self.load_cache()  # Get latest state
@@ -1606,8 +1622,16 @@ class S3LFS:
             stale_entries = []
 
             for file_path_str, cached_data in self.hash_cache.items():
-                # Check if file still exists
-                if not Path(file_path_str).exists():
+                # Entries are manifest keys (repo-relative), so resolve
+                # them through the path resolver; Path(key).exists() would
+                # judge every entry missing when run from a subdirectory
+                # and wipe the cache.
+                try:
+                    fs_path = self.path_resolver.to_filesystem_path(file_path_str)
+                except ValueError:
+                    # Legacy entry keyed by an absolute filesystem path.
+                    fs_path = Path(file_path_str)
+                if not fs_path.exists():
                     stale_entries.append(file_path_str)
                     continue
 
@@ -1624,6 +1648,8 @@ class S3LFS:
             if stale_entries:
                 print(f"Cleaned up {len(stale_entries)} stale cache entries.")
                 self.save_cache()
+
+            return len(stale_entries)
 
     def _check_cache_hit(self, file_path_str, current_metadata):
         """Check if the in-memory cache has a valid entry for this file.
@@ -2908,12 +2934,15 @@ class S3LFS:
 
         print("Starting block-level parallel download of all tracked files...")
 
+        # One cache-aware pass over the whole slice: a stat() per unchanged
+        # file instead of a full re-read of every byte of the working copy.
+        current_hashes = self.disk_hashes(dict(items))
+
         files_to_download = []
         modified = []
         for manifest_key, file_hash in items:
-            filesystem_path = self.path_resolver.to_filesystem_path(manifest_key)
-            if filesystem_path.exists():
-                current_hash = self.hash_file(filesystem_path)
+            current_hash = current_hashes.get(manifest_key)
+            if current_hash is not None:
                 if current_hash == file_hash:
                     if not silence:
                         print(f"  Skipping {manifest_key} (up-to-date)")
