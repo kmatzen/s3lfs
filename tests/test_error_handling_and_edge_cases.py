@@ -112,11 +112,29 @@ class TestS3LFSErrorHandlingAndEdgeCases(unittest.TestCase):
 
     # Error Handling Tests
     def test_save_manifest_error_handling(self):
-        """Test save_manifest error handling and cleanup."""
+        """Test save_manifest raises on write failure and cleans up its temp file."""
         with patch("json.dump", side_effect=Exception("JSON error")):
-            with patch("builtins.print") as mock_print:
+            with self.assertRaises(RuntimeError) as ctx:
                 self.versioner.save_manifest()
-                mock_print.assert_any_call("Failed to save manifest: JSON error")
+        self.assertIn("Failed to save manifest: JSON error", str(ctx.exception))
+        leftovers = list(
+            self.versioner.manifest_file.parent.glob(
+                self.versioner.manifest_file.name + ".*.tmp"
+            )
+        )
+        self.assertEqual(leftovers, [], "temp file was not cleaned up")
+
+    def test_save_manifest_replace_failure_raises(self):
+        """A failed atomic replace (e.g. disk full) must propagate: printing a
+        warning and returning leaves S3 and the index out of sync with exit
+        code 0, which is a data-loss path."""
+        self.versioner.load_manifest()
+        with patch.object(
+            Path, "replace", side_effect=OSError(28, "No space left on device")
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.versioner.save_manifest()
+        self.assertIn("Failed to save manifest", str(ctx.exception))
 
     def test_save_cache_error_handling(self):
         """Test save_cache error handling and cleanup."""
