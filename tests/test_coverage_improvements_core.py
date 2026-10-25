@@ -198,7 +198,7 @@ class TestCoreCoverageImprovements(unittest.TestCase):
             "mtime": stat.st_mtime,
             "inode": getattr(stat, "st_ino", None),
         }
-        file_path_str = str(test_file.as_posix())
+        file_path_str = s3lfs._cache_key(test_file)  # canonical cache key
 
         real_load_cache = s3lfs.load_cache
         call_count = {"n": 0}

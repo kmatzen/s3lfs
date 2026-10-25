@@ -1056,7 +1056,7 @@ def remove(path, purge_from_s3, no_sign_request, use_acceleration, endpoint_url)
     help="Number of parallel workers (default: auto-detected from CPU count)",
 )
 def cleanup(force, no_sign_request, use_acceleration, endpoint_url, workers):
-    """Clean up unreferenced files from S3."""
+    """Clean up unreferenced files from S3 and stale hash cache entries."""
     # Find git root
     git_root = find_git_root()
     if not git_root:
@@ -1077,6 +1077,11 @@ def cleanup(force, no_sign_request, use_acceleration, endpoint_url, workers):
         workers=workers,
     )
     versioner.cleanup_s3(force=force)
+
+    # The hash cache only ever grows: renames and deletions leave entries
+    # behind for good, and every command pays the YAML parse. Prune it as
+    # part of the one command that exists to clean up.
+    versioner.cleanup_stale_cache()
 
 
 @cli.command()
