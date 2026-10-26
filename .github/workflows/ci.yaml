@@ -7,6 +7,11 @@ on:
     # Any base branch, so stacked PRs are checked before their base merges.
     branches: ["**"]
 
+env:
+  # minio/minio is deleted from Docker Hub and dl.min.io 410s mc, so CI uses
+  # Bitnami's repackaged MinIO, pinned by digest, with boto3 for bucket setup.
+  MINIO_IMAGE: docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
+
 jobs:
   lint:
     name: Lint Code
@@ -115,15 +120,22 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            "$MINIO_IMAGE"
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && break
             sleep 1
           done
-          curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
-          chmod +x /tmp/mc
-          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
-          /tmp/mc mb local/bench
+          curl -sf http://localhost:9000/minio/health/live \
+            || { docker logs minio; exit 1; }
+
+      - name: Create bench bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: |
+          uv run python -c "import boto3; boto3.client('s3', \
+            endpoint_url='http://localhost:9000').create_bucket(Bucket='bench')"
 
       - name: Install s5cmd
         run: |
@@ -180,18 +192,22 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            "$MINIO_IMAGE"
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && break
             sleep 1
           done
+          curl -sf http://localhost:9000/minio/health/live \
+            || { docker logs minio; exit 1; }
 
       - name: Create test bucket
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
         run: |
-          curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
-          chmod +x /tmp/mc
-          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
-          /tmp/mc mb local/integration-test
+          uv run python -c "import boto3; boto3.client('s3', \
+            endpoint_url='http://localhost:9000').create_bucket(Bucket='integration-test')"
 
       - name: Run integration tests
         env:
