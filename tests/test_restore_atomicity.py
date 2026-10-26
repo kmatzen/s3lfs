@@ -333,7 +333,7 @@ class TestRestoreRequest(_RepoTestCase):
             )
 
         client = self._list_client(objects)
-        state: dict = {"restored": set()}
+        state: dict = {"restored": set(), "requested": []}
 
         def get_object(Bucket=None, Key=None, Range=None, **kwargs):
             if Key in missing_keys:
@@ -342,16 +342,22 @@ class TestRestoreRequest(_RepoTestCase):
                 raise _client_error("InvalidObjectState")
             return {"Body": Mock(read=lambda n: b"")}
 
+        def restore_object(**kw):
+            state["restored"].add(kw["Key"])
+            state["requested"].append(kw["Key"])
+
         client.get_object.side_effect = get_object
-        client.restore_object.side_effect = lambda **kw: state["restored"].add(
-            kw["Key"]
-        )
+        client.restore_object.side_effect = restore_object
         s3lfs = self._s3lfs(client)
 
-        failed = s3lfs.restore(files, timeout=3600, interval=0)
+        # The timeout guards a hang, not a slow run: the fake resolves
+        # instantly, so reaching 60s means an object was lost.
+        failed = s3lfs.restore(files, timeout=60, interval=0)
 
         self.assertEqual(failed, n_missing)
-        self.assertEqual(client.restore_object.call_count, n - n_missing)
+        # Not call_count: a concurrent task may restore the object first, and
+        # _request_restore then skips the call (CI: 1900 logged, count 1524).
+        self.assertLessEqual(set(state["requested"]), set(objects) - missing_keys)
         self.assertEqual(state["restored"], set(objects) - missing_keys)
 
     def test_restore_bookkeeping_is_linear_in_object_count(self):
